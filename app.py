@@ -217,7 +217,7 @@ def analyze_consist(hist, fr_sign):
     # Standard deviation — lower = more stable/uniform
     variance = sum((r - avg) ** 2 for r in hist) / len(hist)
     stddev = math.sqrt(variance)
-    return {"avg": avg, "pct": pct, "streak": streak, "ok": pct >= 70 and streak >= 3, "stddev": stddev}
+    return {"avg": avg, "pct": pct, "streak": streak, "ok": pct >= 70 and streak >= 3, "stddev": stddev, "_rates": hist}
 
 def est_slippage(vol, size):
     if vol <= 0: return 0.5
@@ -254,56 +254,105 @@ def calc_returns(token, capital):
 
 def risk_score(token, hist, is_aggressive=False):
     """
-    v5 scoring:
-    - Frequency: 30pts — 1h=30, 4h=22, 8h=14
-    - Stability: 20pts — menor stddev = más uniforme
-    - Consistency: 20pts — % favorable intervals
-    - Magnitude: 15pts — rate más alto
-    - Volume: 15pts
+    v6.1 scoring — optimizado con datos de investigación:
+    - Yield Diario:     30pts — freq × magnitud (ganancia REAL/día), penaliza extremos
+    - Estabilidad:      25pts — CV + rate mínimo + uniformidad 
+    - Consistencia:     15pts — streak actual + % favorable
+    - Liquidez:         15pts — volumen 24h
+    - Tendencia:        10pts — rate subiendo/estable/bajando
+    - Breakeven speed:   5pts — días para recuperar costos
     """
     sc = 0
-
-    # 1. FREQUENCY (30pts) — 1h es rey
-    ipd = token.get("ipd", 3)
-    if ipd >= 24:   sc += 30   # cada 1h
-    elif ipd >= 6:  sc += 22   # cada 4h
-    elif ipd >= 3:  sc += 14   # cada 8h
-    else:           sc += 5
-
-    # 2. STABILITY (20pts) — menor stddev = más uniforme
-    stddev = hist.get("stddev", 999)
     afr = abs(token["fr"])
-    if afr > 0:
-        cv = stddev / afr  # coefficient of variation
-        if cv < 0.3:    sc += 20   # muy estable
-        elif cv < 0.5:  sc += 16
-        elif cv < 0.8:  sc += 12
-        elif cv < 1.2:  sc += 7
-        else:           sc += 2    # muy variable
+    ipd = token.get("ipd", 3)
+
+    # 1. YIELD DIARIO EFECTIVO (30pts) — freq × magnitud
+    # Penaliza rates extremos (>0.15% por intervalo) porque revierten rápido
+    yield_day_pct = afr * ipd * 100  # % del futuro que ganas por día
+    rate_per_iv = afr * 100  # % por intervalo individual
+
+    if rate_per_iv > 0.15:
+        # Rate extremo: probablemente temporal, penalizar
+        if yield_day_pct >= 0.15:   sc += 22  # bueno pero temporal
+        elif yield_day_pct >= 0.10: sc += 18
+        else:                       sc += 12
     else:
-        sc += 0
+        # Rate en rango sostenible
+        if yield_day_pct >= 0.15:    sc += 30   # ~55% APR, sostenible
+        elif yield_day_pct >= 0.10:  sc += 27   # ~36% APR
+        elif yield_day_pct >= 0.06:  sc += 23   # ~22% APR
+        elif yield_day_pct >= 0.03:  sc += 17   # ~11% APR
+        elif yield_day_pct >= 0.01:  sc += 10   # ~3.6% APR
+        else:                        sc += 3
 
-    # 3. CONSISTENCY (20pts) — % de intervalos con funding favorable
-    if hist["ok"]:         sc += 20
-    elif hist["pct"] > 80: sc += 17
-    elif hist["pct"] > 60: sc += 13
-    elif hist["pct"] > 40: sc += 8
-    else:                  sc += 2
+    # 2. ESTABILIDAD (25pts) — CV + tasa mínima del historial
+    stddev = hist.get("stddev", 999)
+    avg = abs(hist.get("avg", 0))
+    rates = hist.get("_rates", [])
 
-    # 4. MAGNITUDE (15pts)
-    afr_pct = afr * 100
-    if afr_pct > 0.10:   sc += 15
-    elif afr_pct > 0.05: sc += 12
-    elif afr_pct > 0.02: sc += 9
-    elif afr_pct > 0.01: sc += 6
-    else:                sc += 2
+    if avg > 0 and rates:
+        cv = stddev / avg  # coeficiente de variación
+        # Tasa mínima: ¿cuál fue el peor cobro?
+        favorable = [abs(r) for r in rates if (token["fr"] > 0 and r > 0) or (token["fr"] < 0 and r < 0)]
+        min_rate_ratio = min(favorable) / avg if favorable and avg > 0 else 0
 
-    # 5. VOLUME (15pts)
-    if token["vol24h"] > 100e6:  sc += 15
-    elif token["vol24h"] > 50e6: sc += 12
-    elif token["vol24h"] > 20e6: sc += 10
-    elif token["vol24h"] > 5e6:  sc += 6
-    else:                        sc += 2
+        # CV bajo + min_rate alto = muy predecible
+        if cv < 0.2 and min_rate_ratio > 0.5:   sc += 25  # excelente
+        elif cv < 0.3 and min_rate_ratio > 0.3:  sc += 22
+        elif cv < 0.3:                            sc += 19
+        elif cv < 0.5:                            sc += 15
+        elif cv < 0.8:                            sc += 10
+        elif cv < 1.2:                            sc += 5
+        else:                                     sc += 1
+    else:
+        sc += 1
+
+    # 3. CONSISTENCIA (15pts) — streak > % total
+    streak = hist.get("streak", 0)
+    pct = hist.get("pct", 0)
+
+    if streak >= 12:         sc += 15   # 12+ seguidos = perfecto
+    elif streak >= 8:        sc += 13
+    elif streak >= 5 and pct > 80: sc += 11
+    elif streak >= 3 and pct > 70: sc += 9
+    elif pct > 60:           sc += 6
+    else:                    sc += 2
+
+    # 4. LIQUIDEZ (15pts)
+    vol = token["vol24h"]
+    if vol >= 100e6:  sc += 15
+    elif vol >= 50e6: sc += 12
+    elif vol >= 20e6: sc += 10
+    elif vol >= 10e6: sc += 7
+    elif vol >= 5e6:  sc += 4
+    else:             sc += 1
+
+    # 5. TENDENCIA (10pts) — rate subiendo/estable vs bajando
+    if len(rates) >= 8:
+        recent = rates[:4]
+        older = rates[4:8]
+        avg_rec = sum(abs(r) for r in recent) / len(recent)
+        avg_old = sum(abs(r) for r in older) / len(older)
+        if avg_old > 0:
+            trend = avg_rec / avg_old
+            if trend >= 1.3:    sc += 10  # subiendo fuerte
+            elif trend >= 1.0:  sc += 8   # estable o subiendo
+            elif trend >= 0.7:  sc += 4   # bajando un poco
+            else:               sc += 1   # bajando fuerte
+        else:
+            sc += 5
+    else:
+        sc += 5
+
+    # 6. BREAKEVEN SPEED (5pts)
+    capital_ref = 100
+    c = calc_returns(token, capital_ref)
+    be = c.get("be", 999)
+    if be <= 1:    sc += 5
+    elif be <= 2:  sc += 4
+    elif be <= 3:  sc += 3
+    elif be <= 5:  sc += 2
+    else:          sc += 0
 
     return min(sc, 100)
 
@@ -473,7 +522,7 @@ def run_scan():
             rsi = fetch_rsi(t["symbol"], t["exchange"])
             time.sleep(0.08)
             if rsi < 0: continue
-            if rsi > 40: continue
+            if rsi > 30: continue
             sc = risk_score(t, h, is_aggressive=True)
             scored.append({"token": t, "hist": h, "score": sc, "rsi": rsi})
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -725,8 +774,8 @@ body{font-family:'JetBrains Mono',monospace;background:#0a0b0d;color:#c8ccd0;min
 @media(max-width:600px){.cap{grid-template-columns:1fr}.tr{grid-template-columns:1fr}.pg{grid-template-columns:1fr 1fr}}
 </style></head><body>
 <div class="c">
-<div class="hdr"><h1>💰 Funding Bot v5.0</h1>
-<div class="s">Frecuencia + Estabilidad │ RSI filtro │ Auto SL</div></div>
+<div class="hdr"><h1>💰 Funding Bot v6.0</h1>
+<div class="s">Yield Diario + Consistencia + Tendencia │ RSI │ Auto SL</div></div>
 <div id="ct"><div class="ld"><div class="sp"></div><br>Esperando scan...<br><span style="font-size:.8em">~15 segundos</span></div></div>
 </div>
 <script>
@@ -853,7 +902,7 @@ load_state()
 if STATE["scan_count"] == 0:
     STATE["total_capital"] = CAPITAL; STATE["scan_interval"] = SCAN_MIN * 60
     STATE["min_volume"] = MIN_VOL; STATE["safe_pct"] = SAFE_PCT; STATE["aggr_pct"] = AGGR_PCT
-log.info(f"Bot v5.0: ${STATE['total_capital']:,.0f} │ {STATE['safe_pct']}/{STATE['aggr_pct']} │ {STATE['scan_interval']//60}min │ {DATA_DIR}")
+log.info(f"Bot v6.0: ${STATE['total_capital']:,.0f} │ {STATE['safe_pct']}/{STATE['aggr_pct']} │ {STATE['scan_interval']//60}min │ {DATA_DIR}")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
