@@ -3,7 +3,7 @@
 Funding Rate Portfolio Manager v5.0 — Railway Edition
 Changes:
   - Scoring: heavier weight on payment frequency + rate stability (low stddev)
-  - Aggressive: RSI-14 daily <= 30 filter + auto SL = max 24h funding %
+  - Aggressive: RSI-14 daily <= 40 filter + auto SL = max 24h funding %
   - Manual close button on all active positions
 """
 
@@ -522,7 +522,7 @@ def run_scan():
             rsi = fetch_rsi(t["symbol"], t["exchange"])
             time.sleep(0.08)
             if rsi < 0: continue
-            if rsi > 30: continue
+            if rsi > 40: continue
             sc = risk_score(t, h, is_aggressive=True)
             scored.append({"token": t, "hist": h, "score": sc, "rsi": rsi})
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -540,7 +540,7 @@ def run_scan():
         STATE["last_scan_time"] = datetime.now().strftime("%H:%M:%S")
         STATE["actions"] = gen_actions()
         n_rsi = len(aggr)
-        STATE["status"] = f"OK — {len(bn)}BN+{len(bb)}BB │ {len(pos_l)}pos {len(neg_l)}neg │ {n_rsi} aggr RSI≤30"
+        STATE["status"] = f"OK — {len(bn)}BN+{len(bb)}BB │ {len(pos_l)}pos {len(neg_l)}neg │ {n_rsi} aggr RSI≤40"
         STATE["last_error"] = ""; save_state()
     log.info(f"Scan #{STATE['scan_count']}: {len(pos_l)}pos {len(neg_l)}neg {n_rsi}aggr_rsi")
 
@@ -840,7 +840,7 @@ if(s.safe_top.length){h+='<div><div style="font-size:.62em;color:#34d399;margin-
 s.safe_top.forEach(o=>{const t=o.token;
 h+=`<div class="om"><span class="os">${t.symbol}</span> <span class="badge ${t.exchange==='Binance'?'bbn':'bbb'}">${t.exchange}</span>
 <span class="of">+${(t.fr*100).toFixed(4)}%/${t.ih}h</span> <span style="color:#666">S:${o.score} APR:${o.calc.apr.toFixed(1)}%</span></div>`});h+='</div>'}
-if(s.aggr_top.length){h+='<div><div style="font-size:.62em;color:#fbbf24;margin-bottom:3px">⚡ Agresivas (RSI≤30)</div>';
+if(s.aggr_top.length){h+='<div><div style="font-size:.62em;color:#fbbf24;margin-bottom:3px">⚡ Agresivas (RSI≤40)</div>';
 s.aggr_top.forEach(o=>{const t=o.token;const rsi=o.rsi>=0?` RSI:${o.rsi.toFixed(0)}`:'';
 h+=`<div class="om"><span class="os">${t.symbol}</span> <span class="badge ${t.exchange==='Binance'?'bbn':'bbb'}">${t.exchange}</span>
 <span class="of n">${(t.fr*100).toFixed(4)}%/${t.ih}h</span> <span style="color:#666">S:${o.score} APR:${o.calc.apr.toFixed(1)}%${rsi}</span></div>`});h+='</div>'}
