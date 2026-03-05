@@ -231,8 +231,9 @@ def est_slippage(vol, size):
 def calc_returns(token, capital):
     is_pos = token["fr"] > 0
     ih = token.get("ih", 8); ipd = token.get("ipd", 24 / ih)
-    reserve = capital * 0.10; working = capital - reserve
-    spot = working / 2 if is_pos else 0; fut = working / 2
+    # Sin reserva: 50/50 para seguras, 100% futuros para agresivas
+    spot = capital / 2 if is_pos else 0
+    fut = capital / 2 if is_pos else capital
     fi = FEES.get(token["exchange"], FEES["Binance"])
     fee_in = spot * (fi["spot"] / 100) + fut * (fi["fut"] / 100)
     total_fees = fee_in * 2
@@ -244,9 +245,8 @@ def calc_returns(token, capital):
     be = total_cost / fd if fd > 0 else 999
     carry = "Positive" if is_pos else "Reverse"
     mdp = (fd / fut * 100) if (not is_pos and fut > 0) else 0
-    # SL para agresivas: max ganancia en 24h de funding
     sl_pct = (fd / capital * 100) if capital > 0 else 0
-    return {"spot": spot, "fut": fut, "reserve": reserve,
+    return {"spot": spot, "fut": fut,
         "total_fees": total_fees, "slip_cost": slip_cost, "total_cost": total_cost,
         "slip_pct": slip, "fpi": fpi, "fd": fd, "apr": apr, "be": be,
         "carry": carry, "ih": ih, "ipd": ipd, "mdp": mdp, "sl_pct": sl_pct,
@@ -255,19 +255,19 @@ def calc_returns(token, capital):
 def risk_score(token, hist, is_aggressive=False):
     """
     v5 scoring:
-    - Frequency: 25pts — 1h=25, 4h=18, 8h=12
+    - Frequency: 30pts — 1h=30, 4h=22, 8h=14
     - Stability: 20pts — menor stddev = más uniforme
     - Consistency: 20pts — % favorable intervals
-    - Magnitude: 20pts — rate más alto = más ganancia
+    - Magnitude: 15pts — rate más alto
     - Volume: 15pts
     """
     sc = 0
 
-    # 1. FREQUENCY (25pts) — 1h es rey
+    # 1. FREQUENCY (30pts) — 1h es rey
     ipd = token.get("ipd", 3)
-    if ipd >= 24:   sc += 25   # cada 1h
-    elif ipd >= 6:  sc += 18   # cada 4h
-    elif ipd >= 3:  sc += 12   # cada 8h
+    if ipd >= 24:   sc += 30   # cada 1h
+    elif ipd >= 6:  sc += 22   # cada 4h
+    elif ipd >= 3:  sc += 14   # cada 8h
     else:           sc += 5
 
     # 2. STABILITY (20pts) — menor stddev = más uniforme
@@ -290,13 +290,13 @@ def risk_score(token, hist, is_aggressive=False):
     elif hist["pct"] > 40: sc += 8
     else:                  sc += 2
 
-    # 4. MAGNITUDE (20pts) — rate más alto = más ganancia por cobro
+    # 4. MAGNITUDE (15pts)
     afr_pct = afr * 100
-    if afr_pct > 0.10:   sc += 20
-    elif afr_pct > 0.05: sc += 17
-    elif afr_pct > 0.02: sc += 13
-    elif afr_pct > 0.01: sc += 8
-    else:                sc += 3
+    if afr_pct > 0.10:   sc += 15
+    elif afr_pct > 0.05: sc += 12
+    elif afr_pct > 0.02: sc += 9
+    elif afr_pct > 0.01: sc += 6
+    else:                sc += 2
 
     # 5. VOLUME (15pts)
     if token["vol24h"] > 100e6:  sc += 15
@@ -375,12 +375,11 @@ def gen_actions():
             if c["carry"] == "Positive":
                 steps = [f"1. COMPRA {t['symbol']} en SPOT por ${c['spot']:.2f}",
                     f"2. Abre SHORT {t['symbol']}USDT PERPETUO por ${c['fut']:.2f}",
-                    f"   → Leverage: 1x │ Cross Margin", f"3. Reserva: ${c['reserve']:.2f}"]
+                    f"   → Leverage: 1x │ Cross Margin"]
             else:
                 steps = [f"1. Abre LONG {t['symbol']}USDT PERPETUO por ${c['fut']:.2f}",
-                    f"   → Leverage: 1x │ Cross Margin", f"2. NO comprar en spot",
-                    f"3. Mantener ${c['reserve'] + cpp / 2:.2f} como margen",
-                    f"4. STOP LOSS: -{c['sl_pct']:.2f}% (ganancia máx 24h en funding)"]
+                    f"   → Leverage: 1x │ Cross Margin",
+                    f"2. STOP LOSS: -{c['sl_pct']:.2f}% (ganancia máx 24h en funding)"]
             rsi_info = ""
             if carry_label == "aggr":
                 rsi_val = opp.get("rsi", -1)
@@ -409,8 +408,36 @@ def gen_actions():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  SCANNER v5 — with RSI for aggressives
+#  SCANNER v5.1 — real earnings + RSI
 # ═══════════════════════════════════════════════════════════════
+def update_position_earnings(all_data):
+    """Acumula ganancias REALES usando la tasa actual en cada scan."""
+    now = time.time()
+    for pos in STATE["positions"]:
+        cur = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]), None)
+        if not cur: continue
+        ih = pos.get("ih", 8)
+        last_up = pos.get("last_earn_update", pos["entry_time"] / 1000)
+        elapsed_h = (now - last_up) / 3600
+        full_ivs = int(elapsed_h / ih)
+        if full_ivs < 1: continue
+        cfr = cur["fr"]
+        is_pos_carry = pos["carry"] == "Positive"
+        if is_pos_carry and cfr > 0:
+            fut_size = pos["capital_used"] / 2
+            earn_per_iv = fut_size * cfr
+        elif not is_pos_carry and cfr < 0:
+            fut_size = pos["capital_used"]
+            earn_per_iv = fut_size * abs(cfr)
+        else:
+            earn_per_iv = 0
+        earned_now = earn_per_iv * full_ivs
+        pos["earned_real"] = pos.get("earned_real", 0) + earned_now
+        pos["last_earn_update"] = now
+        pos["last_fr_used"] = cfr
+        if earned_now > 0:
+            log.info(f"  +${earned_now:.4f} {pos['symbol']} ({full_ivs}ivs @ {cfr*100:.4f}%)")
+
 def run_scan():
     log.info("Scan starting...")
     with LOCK: STATE["status"] = "Escaneando..."
@@ -443,13 +470,10 @@ def run_scan():
             if t["exchange"] == "Bybit" and tss:
                 t["ih"] = detect_bb_iv(tss); t["ipd"] = 24 / t["ih"]
             h = analyze_consist(rates, t["fr"])
-            # RSI filter: only RSI <= 30
             rsi = fetch_rsi(t["symbol"], t["exchange"])
             time.sleep(0.08)
-            if rsi < 0:
-                continue  # Can't calculate RSI, skip
-            if rsi > 30:
-                continue  # RSI too high, not oversold
+            if rsi < 0: continue
+            if rsi > 40: continue
             sc = risk_score(t, h, is_aggressive=True)
             scored.append({"token": t, "hist": h, "score": sc, "rsi": rsi})
         scored.sort(key=lambda x: x["score"], reverse=True)
@@ -459,7 +483,10 @@ def run_scan():
     aggr = analyze_aggr(neg_l)
 
     with LOCK:
-        STATE["all_data"] = all_data; STATE["safe_top"] = safe; STATE["aggr_top"] = aggr
+        STATE["all_data"] = all_data
+        # Actualizar ganancias reales ANTES de generar acciones
+        update_position_earnings(all_data)
+        STATE["safe_top"] = safe; STATE["aggr_top"] = aggr
         STATE["last_scan"] = time.time(); STATE["scan_count"] += 1
         STATE["last_scan_time"] = datetime.now().strftime("%H:%M:%S")
         STATE["actions"] = gen_actions()
@@ -508,7 +535,8 @@ def api_state():
             el_h = (time.time() - pos["entry_time"] / 1000) / 3600; ivs = int(el_h / ih)
             c = calc_returns({"fr": cfr, "price": cp, "symbol": pos["symbol"],
                 "exchange": pos["exchange"], "vol24h": 0, "ih": ih, "ipd": 24 / ih}, pos["capital_used"])
-            est = c["fpi"] * ivs; pp = c["fut"] * (pc / 100) if pos["carry"] == "Reverse" else 0
+            est = pos.get("earned_real", 0)  # Ganancias REALES acumuladas
+            pp = c["fut"] * (pc / 100) if pos["carry"] == "Reverse" else 0
             fr_rev = (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0)
             # SL check for display
             sl_hit = False
@@ -539,16 +567,14 @@ def _close_position(i):
         return False, "Posición inválida"
     pos = STATE["positions"][i]; ih = pos.get("ih", 8)
     el_h = (time.time() - pos["entry_time"] / 1000) / 3600; ivs = int(el_h / ih)
-    c = calc_returns({"fr": pos["entry_fr"], "price": pos["entry_price"], "symbol": pos["symbol"],
-        "exchange": pos["exchange"], "vol24h": 0, "ih": ih, "ipd": 24 / ih}, pos["capital_used"])
-    est = c["fpi"] * ivs
+    est = pos.get("earned_real", 0)  # Ganancias reales acumuladas
     STATE["history"].append({"symbol": pos["symbol"], "exchange": pos["exchange"],
         "carry": pos["carry"], "hours": el_h, "intervals": ivs, "earned": est,
         "time": datetime.now().isoformat()})
     STATE["total_earned"] = STATE.get("total_earned", 0) + est
     sym = pos["symbol"]
     STATE["positions"].pop(i); save_state(); STATE["actions"] = gen_actions()
-    log.info(f"Closed: {sym} earned ${est:.2f}")
+    log.info(f"Closed: {sym} earned ${est:.4f}")
     return True, f"✅ {sym} cerrada. Ganado: ${est:.2f}"
 
 
