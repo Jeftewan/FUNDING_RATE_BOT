@@ -62,11 +62,17 @@ if Config.COINGLASS_API_KEY:
     coinglass_client = CoinglassClient(Config.COINGLASS_API_KEY)
     log.info("Coinglass API configured")
 
+# ── Email Notifications (optional) ────────────────────────────
+from notifications.email import EmailNotifier
+
+email_notifier = EmailNotifier(Config)
+
 # ── Scanner Worker ────────────────────────────────────────────
 from scanner.worker import ScannerWorker
 
 scanner_worker = ScannerWorker(
-    exchange_manager, arb_scanner, state_manager, coinglass_client, Config
+    exchange_manager, arb_scanner, state_manager, coinglass_client, Config,
+    email_notifier=email_notifier,
 )
 
 # ── Flask App ─────────────────────────────────────────────────

@@ -44,6 +44,15 @@ class Config:
     BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "")
     DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 
+    # Email alerts (SMTP)
+    ALERT_EMAIL_ENABLED = os.environ.get("ALERT_EMAIL_ENABLED", "").lower() in ("1", "true", "yes")
+    SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+    SMTP_USER = os.environ.get("SMTP_USER", "")
+    SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+    ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", "")  # Recipient email
+    ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")  # Sender (defaults to SMTP_USER)
+
     # Fee structure per exchange (maker/taker in %)
     FEES = {
         "Binance": {"spot": 0.10, "fut": 0.05},

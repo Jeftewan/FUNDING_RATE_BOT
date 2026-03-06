@@ -115,7 +115,40 @@ def init_routes(app, state_manager, scanner_worker, config):
     @app.route("/api/alerts")
     def api_alerts():
         with state_manager.lock:
-            return jsonify({"alerts": state_manager.get("alerts", [])})
+            email_status = "disabled"
+            if hasattr(scanner_worker, 'email_notifier') and scanner_worker.email_notifier:
+                email_status = "enabled" if scanner_worker.email_notifier.enabled else "disabled"
+            return jsonify({
+                "alerts": state_manager.get("alerts", []),
+                "email_notifications": email_status,
+            })
+
+    @app.route("/api/alerts/test_email", methods=["POST"])
+    def api_test_email():
+        """Send a test alert email to verify SMTP configuration."""
+        if not hasattr(scanner_worker, 'email_notifier') or not scanner_worker.email_notifier:
+            return jsonify({"ok": False, "msg": "Email notifier not configured"})
+        notifier = scanner_worker.email_notifier
+        if not notifier.enabled:
+            return jsonify({"ok": False, "msg": "Email alerts not enabled. Set ALERT_EMAIL_ENABLED=true"})
+
+        # Test connection first
+        conn_test = notifier.test_connection()
+        if not conn_test["ok"]:
+            return jsonify({"ok": False, "msg": f"SMTP connection failed: {conn_test['error']}"})
+
+        # Send test alert
+        test_alert = {
+            "type": "TEST",
+            "severity": "CRITICAL",
+            "symbol": "BTC",
+            "exchange": "Test",
+            "message": "Este es un email de prueba del Funding Bot v7.0",
+        }
+        sent = notifier.send_alert(test_alert)
+        if sent:
+            return jsonify({"ok": True, "msg": f"✅ Email de prueba enviado a {notifier.email_to}"})
+        return jsonify({"ok": False, "msg": "Email no enviado (posible cooldown o error)"})
 
     @app.route("/api/exchanges/status")
     def api_exchanges_status():

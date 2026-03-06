@@ -14,12 +14,13 @@ log = logging.getLogger("bot")
 
 class ScannerWorker:
     def __init__(self, exchange_manager, arbitrage_scanner, state_manager,
-                 coinglass_client, config):
+                 coinglass_client, config, email_notifier=None):
         self.exchange_manager = exchange_manager
         self.arb_scanner = arbitrage_scanner
         self.state_manager = state_manager
         self.coinglass = coinglass_client
         self.config = config
+        self.email_notifier = email_notifier
         self._started = False
 
     def start(self):
@@ -58,6 +59,15 @@ class ScannerWorker:
                         alerts = generate_alerts(s["positions"], all_data)
                         s["alerts"] = alerts
                         self.state_manager.save()
+
+                # Send email alerts outside the lock (network I/O)
+                if alerts and self.email_notifier:
+                    try:
+                        sent = self.email_notifier.send_alerts(alerts)
+                        if sent:
+                            log.info(f"Sent {sent} alert email(s)")
+                    except Exception as e:
+                        log.error(f"Email notification error: {e}")
             except Exception as e:
                 log.exception(f"Monitor error: {e}")
             time.sleep(60)
