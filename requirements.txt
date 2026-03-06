@@ -1,3 +1,4 @@
 flask
-requests
 gunicorn
+requests
+ccxt>=4.0
