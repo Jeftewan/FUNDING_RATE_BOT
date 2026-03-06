@@ -41,7 +41,7 @@ _scanner_started = False
 STATE = {
     "total_capital": CAPITAL, "scan_interval": SCAN_MIN * 60,
     "min_volume": MIN_VOL, "safe_pct": SAFE_PCT, "aggr_pct": AGGR_PCT,
-    "reserve_pct": 10, "max_pos_safe": 2, "max_pos_aggr": 1,
+    "reserve_pct": 10, "max_pos_safe": 1, "max_pos_aggr": 1,
     "min_apr_safe": 5, "min_apr_aggr": 15, "min_score": 40,
     "positions": [], "history": [], "total_earned": 0,
     "last_scan": 0, "scan_count": 0,
@@ -161,6 +161,37 @@ def detect_bb_iv(tss):
     for iv in [1, 2, 4, 8]:
         if abs(avg - iv) < 1: return iv
     return 8
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SPOT AVAILABILITY CHECK — for safe positions
+# ═══════════════════════════════════════════════════════════════
+_bn_spot_pairs = set()
+
+def fetch_bn_spot_pairs():
+    """Carga los pares SPOT disponibles en Binance centralizado."""
+    global _bn_spot_pairs
+    if _bn_spot_pairs:
+        return _bn_spot_pairs
+    d = _get("https://api.binance.com/api/v3/exchangeInfo", retries=1)
+    if d:
+        for s in d.get("symbols", []):
+            if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+                _bn_spot_pairs.add(s.get("baseAsset", ""))
+        log.info(f"Binance spot pairs: {len(_bn_spot_pairs)}")
+    return _bn_spot_pairs
+
+def has_spot_pair(sym, exch):
+    """
+    Verifica si el token se puede comprar en SPOT centralizado.
+    Si no tiene par spot en Binance, necesita Web3 (BNB Chain/SOL/etc).
+    Para seguras SOLO recomendamos tokens con spot disponible en CEX.
+    """
+    if exch == "Binance":
+        pairs = fetch_bn_spot_pairs()
+        return sym in pairs
+    # Bybit: asumir que si tiene perp probablemente tiene spot
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -498,9 +529,12 @@ def run_scan():
     pos_l = sorted([t for t in all_data if t["fr"] > 0.0001 and t["vol24h"] >= mv], key=lambda x: x["fr"], reverse=True)
     neg_l = sorted([t for t in all_data if t["fr"] < -0.0001 and t["vol24h"] >= mv], key=lambda x: x["fr"])
 
-    def analyze_safe(tokens, lim=8):
+    def analyze_safe(tokens, lim=12):
         scored = []
         for t in tokens[:lim]:
+            # FILTRO: solo tokens con par SPOT en CEX (no necesita Web3)
+            if not has_spot_pair(t["symbol"], t["exchange"]):
+                continue
             rates, tss = fetch_hist(t["symbol"], t["exchange"])
             time.sleep(0.08)
             if t["exchange"] == "Bybit" and tss:
@@ -836,7 +870,7 @@ h+='</div>'})}
 // TOP
 if(s.safe_top.length||s.aggr_top.length){
 h+='<div class="st">📈 Top Mercado</div><div class="tr">';
-if(s.safe_top.length){h+='<div><div style="font-size:.62em;color:#34d399;margin-bottom:3px">🛡️ Seguras (frec+estab)</div>';
+if(s.safe_top.length){h+='<div><div style="font-size:.62em;color:#34d399;margin-bottom:3px">🛡️ Seguras (spot CEX)</div>';
 s.safe_top.forEach(o=>{const t=o.token;
 h+=`<div class="om"><span class="os">${t.symbol}</span> <span class="badge ${t.exchange==='Binance'?'bbn':'bbb'}">${t.exchange}</span>
 <span class="of">+${(t.fr*100).toFixed(4)}%/${t.ih}h</span> <span style="color:#666">S:${o.score} APR:${o.calc.apr.toFixed(1)}%</span></div>`});h+='</div>'}
