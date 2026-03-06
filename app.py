@@ -44,6 +44,7 @@ STATE = {
     "reserve_pct": 10, "max_pos_safe": 1, "max_pos_aggr": 1,
     "min_apr_safe": 5, "min_apr_aggr": 15, "min_score": 40,
     "positions": [], "history": [], "total_earned": 0,
+    "skipped_tokens": [],  # tokens descartados por el operador (se limpia en cada scan)
     "last_scan": 0, "scan_count": 0,
     "safe_top": [], "aggr_top": [], "all_data": [],
     "actions": [], "last_scan_time": "—",
@@ -285,38 +286,43 @@ def calc_returns(token, capital):
 
 def risk_score(token, hist, is_aggressive=False):
     """
-    v6.1 scoring — optimizado con datos de investigación:
-    - Yield Diario:     30pts — freq × magnitud (ganancia REAL/día), penaliza extremos
-    - Estabilidad:      25pts — CV + rate mínimo + uniformidad 
-    - Consistencia:     15pts — streak actual + % favorable
-    - Liquidez:         15pts — volumen 24h
+    v6.2 scoring — frecuencia es rey:
+    - Frecuencia:       25pts — cada 1h >> 4h >> 8h (factor independiente)
+    - Yield Diario:     20pts — freq × magnitud combinado
+    - Estabilidad:      20pts — CV + rate mínimo
+    - Consistencia:     15pts — streak + % favorable
+    - Liquidez:         10pts — volumen 24h
     - Tendencia:        10pts — rate subiendo/estable/bajando
-    - Breakeven speed:   5pts — días para recuperar costos
     """
     sc = 0
     afr = abs(token["fr"])
     ipd = token.get("ipd", 3)
 
-    # 1. YIELD DIARIO EFECTIVO (30pts) — freq × magnitud
-    # Penaliza rates extremos (>0.15% por intervalo) porque revierten rápido
-    yield_day_pct = afr * ipd * 100  # % del futuro que ganas por día
-    rate_per_iv = afr * 100  # % por intervalo individual
+    # 1. FRECUENCIA DE PAGO (25pts) — 1h es rey absoluto
+    if ipd >= 24:    sc += 25   # cada 1h = 24 cobros/día
+    elif ipd >= 12:  sc += 20   # cada 2h
+    elif ipd >= 6:   sc += 14   # cada 4h
+    elif ipd >= 3:   sc += 7    # cada 8h (estándar)
+    else:            sc += 2
+
+    # 2. YIELD DIARIO (20pts) — cuánto genera por día
+    yield_day_pct = afr * ipd * 100
+    rate_per_iv = afr * 100
 
     if rate_per_iv > 0.15:
-        # Rate extremo: probablemente temporal, penalizar
-        if yield_day_pct >= 0.15:   sc += 22  # bueno pero temporal
-        elif yield_day_pct >= 0.10: sc += 18
-        else:                       sc += 12
+        # Rate extremo: penalizar
+        if yield_day_pct >= 0.15:   sc += 14
+        elif yield_day_pct >= 0.10: sc += 11
+        else:                       sc += 7
     else:
-        # Rate en rango sostenible
-        if yield_day_pct >= 0.15:    sc += 30   # ~55% APR, sostenible
-        elif yield_day_pct >= 0.10:  sc += 27   # ~36% APR
-        elif yield_day_pct >= 0.06:  sc += 23   # ~22% APR
-        elif yield_day_pct >= 0.03:  sc += 17   # ~11% APR
-        elif yield_day_pct >= 0.01:  sc += 10   # ~3.6% APR
-        else:                        sc += 3
+        if yield_day_pct >= 0.15:    sc += 20
+        elif yield_day_pct >= 0.10:  sc += 17
+        elif yield_day_pct >= 0.06:  sc += 14
+        elif yield_day_pct >= 0.03:  sc += 10
+        elif yield_day_pct >= 0.01:  sc += 6
+        else:                        sc += 2
 
-    # 2. ESTABILIDAD (25pts) — CV + tasa mínima del historial
+    # 3. ESTABILIDAD (20pts) — CV + tasa mínima
     stddev = hist.get("stddev", 999)
     avg = abs(hist.get("avg", 0))
     rates = hist.get("_rates", [])
@@ -328,37 +334,37 @@ def risk_score(token, hist, is_aggressive=False):
         min_rate_ratio = min(favorable) / avg if favorable and avg > 0 else 0
 
         # CV bajo + min_rate alto = muy predecible
-        if cv < 0.2 and min_rate_ratio > 0.5:   sc += 25  # excelente
-        elif cv < 0.3 and min_rate_ratio > 0.3:  sc += 22
-        elif cv < 0.3:                            sc += 19
-        elif cv < 0.5:                            sc += 15
-        elif cv < 0.8:                            sc += 10
-        elif cv < 1.2:                            sc += 5
+        if cv < 0.2 and min_rate_ratio > 0.5:   sc += 20
+        elif cv < 0.3 and min_rate_ratio > 0.3:  sc += 17
+        elif cv < 0.3:                            sc += 14
+        elif cv < 0.5:                            sc += 10
+        elif cv < 0.8:                            sc += 6
+        elif cv < 1.2:                            sc += 3
         else:                                     sc += 1
     else:
         sc += 1
 
-    # 3. CONSISTENCIA (15pts) — streak > % total
+    # 4. CONSISTENCIA (15pts) — streak > % total
     streak = hist.get("streak", 0)
     pct = hist.get("pct", 0)
 
-    if streak >= 12:         sc += 15   # 12+ seguidos = perfecto
+    if streak >= 12:         sc += 15
     elif streak >= 8:        sc += 13
     elif streak >= 5 and pct > 80: sc += 11
     elif streak >= 3 and pct > 70: sc += 9
     elif pct > 60:           sc += 6
     else:                    sc += 2
 
-    # 4. LIQUIDEZ (15pts)
+    # 5. LIQUIDEZ (10pts)
     vol = token["vol24h"]
-    if vol >= 100e6:  sc += 15
-    elif vol >= 50e6: sc += 12
-    elif vol >= 20e6: sc += 10
-    elif vol >= 10e6: sc += 7
-    elif vol >= 5e6:  sc += 4
+    if vol >= 100e6:  sc += 10
+    elif vol >= 50e6: sc += 8
+    elif vol >= 20e6: sc += 6
+    elif vol >= 10e6: sc += 4
+    elif vol >= 5e6:  sc += 2
     else:             sc += 1
 
-    # 5. TENDENCIA (10pts) — rate subiendo/estable vs bajando
+    # 6. TENDENCIA (10pts) — rate subiendo/estable vs bajando
     if len(rates) >= 8:
         recent = rates[:4]
         older = rates[4:8]
@@ -366,24 +372,14 @@ def risk_score(token, hist, is_aggressive=False):
         avg_old = sum(abs(r) for r in older) / len(older)
         if avg_old > 0:
             trend = avg_rec / avg_old
-            if trend >= 1.3:    sc += 10  # subiendo fuerte
-            elif trend >= 1.0:  sc += 8   # estable o subiendo
-            elif trend >= 0.7:  sc += 4   # bajando un poco
-            else:               sc += 1   # bajando fuerte
+            if trend >= 1.3:    sc += 10
+            elif trend >= 1.0:  sc += 8
+            elif trend >= 0.7:  sc += 4
+            else:               sc += 1
         else:
             sc += 5
     else:
         sc += 5
-
-    # 6. BREAKEVEN SPEED (5pts)
-    capital_ref = 100
-    c = calc_returns(token, capital_ref)
-    be = c.get("be", 999)
-    if be <= 1:    sc += 5
-    elif be <= 2:  sc += 4
-    elif be <= 3:  sc += 3
-    elif be <= 5:  sc += 2
-    else:          sc += 0
 
     return min(sc, 100)
 
@@ -447,11 +443,18 @@ def gen_actions():
     def add_open(pool, slots, cap_avail, carry_label, min_apr, pri):
         if slots <= 0 or cap_avail <= 20: return
         cpp = cap_avail / slots
-        for opp in pool[:slots]:
-            c = calc_returns(opp["token"], cpp)
+        skipped = STATE.get("skipped_tokens", [])
+        added = 0
+        for opp in pool:
+            if added >= slots: break
+            t = opp["token"]
+            # Skip descartados por el operador
+            skip_key = f"{t['symbol']}_{t['exchange']}"
+            if skip_key in skipped: continue
+            c = calc_returns(t, cpp)
             if not c["worthwhile"] or c["apr"] < min_apr or opp["score"] < STATE["min_score"]: continue
-            if any(p["symbol"] == opp["token"]["symbol"] and p["exchange"] == opp["token"]["exchange"] for p in positions): continue
-            t = opp["token"]; emoji = "🛡️" if carry_label == "safe" else "⚡"
+            if any(p["symbol"] == t["symbol"] and p["exchange"] == t["exchange"] for p in positions): continue
+            emoji = "🛡️" if carry_label == "safe" else "⚡"
             if c["carry"] == "Positive":
                 steps = [f"1. COMPRA {t['symbol']} en SPOT por ${c['spot']:.2f}",
                     f"2. Abre SHORT {t['symbol']}USDT PERPETUO por ${c['fut']:.2f}",
@@ -474,6 +477,7 @@ def gen_actions():
                 "symbol": t["symbol"], "exchange": t["exchange"],
                 "capital": cpp, "fr": t["fr"], "price": t["price"],
                 "ih": c["ih"], "carry_type": c["carry"], "sl_pct": c["sl_pct"]})
+            added += 1
 
     add_open(safe_top, STATE["max_pos_safe"] - bd["sc"], bd["sa"], "safe", STATE["min_apr_safe"], 3)
     add_open(aggr_top, STATE["max_pos_aggr"] - bd["ac"], bd["aa"], "aggr", STATE["min_apr_aggr"], 4)
@@ -532,9 +536,6 @@ def run_scan():
     def analyze_safe(tokens, lim=12):
         scored = []
         for t in tokens[:lim]:
-            # FILTRO: solo tokens con par SPOT en CEX (no necesita Web3)
-            if not has_spot_pair(t["symbol"], t["exchange"]):
-                continue
             rates, tss = fetch_hist(t["symbol"], t["exchange"])
             time.sleep(0.08)
             if t["exchange"] == "Bybit" and tss:
@@ -542,8 +543,8 @@ def run_scan():
             h = analyze_consist(rates, t["fr"])
             sc = risk_score(t, h, is_aggressive=False)
             scored.append({"token": t, "hist": h, "score": sc})
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:3]
+        scored.sort(key=lambda x: (x["score"], -x["token"].get("mins_next", 999)), reverse=True)
+        return scored[:5]  # Top 5 para que el operador pueda descartar
 
     def analyze_aggr(tokens, lim=10):
         scored = []
@@ -559,8 +560,8 @@ def run_scan():
             if rsi > 40: continue
             sc = risk_score(t, h, is_aggressive=True)
             scored.append({"token": t, "hist": h, "score": sc, "rsi": rsi})
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:3]
+        scored.sort(key=lambda x: (x["score"], -x["token"].get("mins_next", 999)), reverse=True)
+        return scored[:5]
 
     safe = analyze_safe(pos_l)
     aggr = analyze_aggr(neg_l)
@@ -710,6 +711,38 @@ def api_manual_close():
     with LOCK:
         ok, msg = _close_position(idx)
         return jsonify({"ok": ok, "msg": msg})
+
+
+@app.route("/api/skip", methods=["POST"])
+def api_skip():
+    """Descartar un token — sube la siguiente opción."""
+    data = flask_req.json or {}
+    if BOT_PASSWORD and data.get("password") != BOT_PASSWORD:
+        return jsonify({"ok": False, "msg": "Contraseña incorrecta"})
+    sym = data.get("symbol", "")
+    exch = data.get("exchange", "")
+    if not sym:
+        return jsonify({"ok": False, "msg": "Token no especificado"})
+    skip_key = f"{sym}_{exch}"
+    with LOCK:
+        if "skipped_tokens" not in STATE:
+            STATE["skipped_tokens"] = []
+        if skip_key not in STATE["skipped_tokens"]:
+            STATE["skipped_tokens"].append(skip_key)
+        STATE["actions"] = gen_actions()
+        save_state()
+        log.info(f"Skipped: {skip_key}")
+        return jsonify({"ok": True, "msg": f"⏭ {sym} descartado"})
+
+
+@app.route("/api/clear_skips", methods=["POST"])
+def api_clear_skips():
+    """Limpia la lista de descartados."""
+    with LOCK:
+        STATE["skipped_tokens"] = []
+        STATE["actions"] = gen_actions()
+        save_state()
+        return jsonify({"ok": True, "msg": "✅ Descartados limpiados"})
 
 
 @app.route("/api/config", methods=["GET", "POST"])
@@ -862,7 +895,7 @@ if(a.steps&&a.steps.length)h+=`<div class="as">${a.steps.join('\n')}</div>`;
 if(a.costs)h+=`<div class="acs">${a.costs}</div>`;
 if(a.warning)h+=`<div class="aw">${a.warning}</div>`;
 if(a.countdown)h+=`<div class="acd">${a.countdown}</div>`;
-if(a.type==='OPEN')h+=`<button class="btn bg" onclick="cf(${i})">✅ Ya ejecuté</button>`;
+if(a.type==='OPEN')h+=`<button class="btn bg" onclick="cf(${i})">✅ Ya ejecuté</button> <button class="btn bgy" onclick="sk('${a.symbol}','${a.exchange}')">⏭ No puedo, siguiente</button>`;
 else if(a.type==='EXIT')h+=`<button class="btn br" onclick="cf(${i})">⛔ Ya cerré</button>`;
 else if(a.type==='ROTATE')h+=`<button class="btn by" onclick="cf(${i})">🔄 Ya roté</button>`;
 h+='</div>'})}
@@ -880,7 +913,7 @@ h+=`<div class="om"><span class="os">${t.symbol}</span> <span class="badge ${t.e
 <span class="of n">${(t.fr*100).toFixed(4)}%/${t.ih}h</span> <span style="color:#666">S:${o.score} APR:${o.calc.apr.toFixed(1)}%${rsi}</span></div>`});h+='</div>'}
 h+='</div>'}
 
-h+=`<div class="scr"><button class="btn bgy" onclick="fs()">🔍 Escanear</button> <button class="btn bgy" onclick="showCfg()">⚙️ Config</button></div>`;
+h+=`<div class="scr"><button class="btn bgy" onclick="fs()">🔍 Escanear</button> <button class="btn bgy" onclick="showCfg()">⚙️ Config</button> <button class="btn bgy" onclick="clsk()">🔄 Limpiar descartados</button></div>`;
 h+=`<div id="cfgPanel" style="display:none"></div>`;
 h+=`<div class="sbar">${s.status} │ #${s.scan_count} │ ${s.last_scan} │ Cada ${Math.floor(s.scan_interval/60)}min │ Auto 30s</div>`;
 document.getElementById('ct').innerHTML=h;
@@ -894,6 +927,13 @@ async function mc(i){
 if(!confirm('¿Cerrar esta posición manualmente?'))return;
 try{const r=await fetch('/api/manual_close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_idx:i})});
 const d=await r.json();alert(d.msg);ld()}catch(e){alert('Error: '+e.message)}}
+
+async function sk(sym,exch){
+try{const r=await fetch('/api/skip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,exchange:exch})});
+const d=await r.json();ld()}catch(e){alert('Error: '+e.message)}}
+
+async function clsk(){
+try{await fetch('/api/clear_skips',{method:'POST'});ld()}catch(e){}}
 
 async function fs(){try{await fetch('/api/force_scan',{method:'POST'});document.getElementById('ct').innerHTML='<div class="ld"><div class="sp"></div><br>Escaneando...</div>';setTimeout(ld,6000)}catch(e){}}
 
