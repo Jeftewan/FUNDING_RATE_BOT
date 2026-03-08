@@ -1,38 +1,87 @@
-"""Risk/opportunity scoring — migrated from v6.2 + extended for v7."""
+"""Opportunity scoring v8.0 — prioritizes 3+ day sustainability and high volume."""
 import math
 
 
-def risk_score(token: dict, hist: dict, is_aggressive: bool = False) -> int:
+def risk_score(token: dict, hist: dict) -> int:
     """
-    v7.0 scoring — preserves v6.2 logic:
-    - Frecuencia:       25pts
-    - Yield Diario:     20pts
-    - Estabilidad:      20pts — CV + rate minimo
-    - Consistencia:     15pts — streak + % favorable
-    - Liquidez:         10pts — volumen 24h
+    v8.0 scoring — rebalanced for sustainability:
+    - Estabilidad:      25pts — CV + rate minimo (key for 3-day hold)
+    - Consistencia:     20pts — streak + % favorable
+    - Liquidez:         15pts — volumen 24h (high vol = less volatile)
+    - Yield Diario:     20pts — APR neto despues de fees
+    - Frecuencia:       10pts — pagos por dia
     - Tendencia:        10pts — rate subiendo/estable/bajando
     """
     sc = 0
     afr = abs(token["fr"])
     ipd = token.get("ipd", 3)
 
-    # 1. FRECUENCIA DE PAGO (25pts)
-    if ipd >= 24:
-        sc += 25
-    elif ipd >= 12:
+    # 1. ESTABILIDAD (25pts) — most important for 3-day holds
+    stddev = hist.get("stddev", 999)
+    avg = abs(hist.get("avg", 0))
+    rates = hist.get("_rates", [])
+
+    if avg > 0 and rates:
+        cv = stddev / avg
+        favorable = [abs(r) for r in rates
+                     if (token["fr"] > 0 and r > 0) or (token["fr"] < 0 and r < 0)]
+        min_rate_ratio = min(favorable) / avg if favorable and avg > 0 else 0
+
+        if cv < 0.2 and min_rate_ratio > 0.5:
+            sc += 25
+        elif cv < 0.3 and min_rate_ratio > 0.3:
+            sc += 21
+        elif cv < 0.3:
+            sc += 17
+        elif cv < 0.5:
+            sc += 12
+        elif cv < 0.8:
+            sc += 7
+        elif cv < 1.2:
+            sc += 3
+        else:
+            sc += 1
+    else:
+        sc += 1
+
+    # 2. CONSISTENCIA (20pts) — streak of favorable payments
+    streak = hist.get("streak", 0)
+    pct = hist.get("pct", 0)
+
+    if streak >= 12:
         sc += 20
-    elif ipd >= 6:
+    elif streak >= 8:
+        sc += 17
+    elif streak >= 5 and pct > 80:
         sc += 14
-    elif ipd >= 3:
+    elif streak >= 3 and pct > 70:
+        sc += 11
+    elif pct > 60:
         sc += 7
     else:
         sc += 2
 
-    # 2. YIELD DIARIO (20pts)
+    # 3. LIQUIDEZ / VOLUMEN (15pts) — high volume = more stable rates
+    vol = token["vol24h"]
+    if vol >= 100e6:
+        sc += 15
+    elif vol >= 50e6:
+        sc += 12
+    elif vol >= 20e6:
+        sc += 9
+    elif vol >= 10e6:
+        sc += 6
+    elif vol >= 5e6:
+        sc += 3
+    else:
+        sc += 1
+
+    # 4. YIELD DIARIO (20pts)
     yield_day_pct = afr * ipd * 100
     rate_per_iv = afr * 100
 
     if rate_per_iv > 0.15:
+        # Very high rate — might not be sustainable, cap points
         if yield_day_pct >= 0.15:
             sc += 14
         elif yield_day_pct >= 0.10:
@@ -53,65 +102,17 @@ def risk_score(token: dict, hist: dict, is_aggressive: bool = False) -> int:
         else:
             sc += 2
 
-    # 3. ESTABILIDAD (20pts)
-    stddev = hist.get("stddev", 999)
-    avg = abs(hist.get("avg", 0))
-    rates = hist.get("_rates", [])
-
-    if avg > 0 and rates:
-        cv = stddev / avg
-        favorable = [abs(r) for r in rates
-                     if (token["fr"] > 0 and r > 0) or (token["fr"] < 0 and r < 0)]
-        min_rate_ratio = min(favorable) / avg if favorable and avg > 0 else 0
-
-        if cv < 0.2 and min_rate_ratio > 0.5:
-            sc += 20
-        elif cv < 0.3 and min_rate_ratio > 0.3:
-            sc += 17
-        elif cv < 0.3:
-            sc += 14
-        elif cv < 0.5:
-            sc += 10
-        elif cv < 0.8:
-            sc += 6
-        elif cv < 1.2:
-            sc += 3
-        else:
-            sc += 1
-    else:
-        sc += 1
-
-    # 4. CONSISTENCIA (15pts)
-    streak = hist.get("streak", 0)
-    pct = hist.get("pct", 0)
-
-    if streak >= 12:
-        sc += 15
-    elif streak >= 8:
-        sc += 13
-    elif streak >= 5 and pct > 80:
-        sc += 11
-    elif streak >= 3 and pct > 70:
-        sc += 9
-    elif pct > 60:
-        sc += 6
-    else:
-        sc += 2
-
-    # 5. LIQUIDEZ (10pts)
-    vol = token["vol24h"]
-    if vol >= 100e6:
+    # 5. FRECUENCIA DE PAGO (10pts)
+    if ipd >= 24:
         sc += 10
-    elif vol >= 50e6:
+    elif ipd >= 12:
         sc += 8
-    elif vol >= 20e6:
+    elif ipd >= 6:
         sc += 6
-    elif vol >= 10e6:
+    elif ipd >= 3:
         sc += 4
-    elif vol >= 5e6:
-        sc += 2
     else:
-        sc += 1
+        sc += 2
 
     # 6. TENDENCIA (10pts)
     if len(rates) >= 8:
@@ -137,15 +138,51 @@ def risk_score(token: dict, hist: dict, is_aggressive: bool = False) -> int:
     return min(sc, 100)
 
 
+def stability_grade(score: int) -> str:
+    """Return letter grade based on score."""
+    if score >= 85:
+        return "A"
+    elif score >= 70:
+        return "B"
+    elif score >= 55:
+        return "C"
+    return "D"
+
+
+def estimated_hold_days(hist: dict) -> int:
+    """Estimate how many days the rate should stay favorable.
+
+    Based on streak length and consistency percentage.
+    """
+    streak = hist.get("streak", 0)
+    pct = hist.get("pct", 0)
+    rates = hist.get("_rates", [])
+
+    if not rates:
+        return 0
+
+    # Each rate is one interval. Convert streak to days.
+    # Assume ~3 payments/day on average (8h intervals)
+    # If we have ipd info, use it; otherwise assume 3
+    intervals_per_day = 3
+
+    streak_days = streak / intervals_per_day
+
+    # If consistency > 90% and streak > 3 days, estimate longer hold
+    if pct >= 90 and streak_days >= 5:
+        return min(int(streak_days * 0.7), 14)  # Conservative: 70% of streak
+    elif pct >= 80 and streak_days >= 3:
+        return min(int(streak_days * 0.5), 10)
+    elif pct >= 70 and streak_days >= 1:
+        return min(int(streak_days * 0.4), 7)
+    elif streak_days >= 1:
+        return max(1, int(streak_days * 0.3))
+    return 0
+
+
 def score_cross_exchange(differential: float, consistency: float,
                          volume_min: float, fee_ratio: float) -> int:
-    """Score a cross-exchange opportunity.
-
-    differential: rate differential between exchanges
-    consistency: % of time the differential was favorable
-    volume_min: minimum volume of the two exchanges
-    fee_ratio: total fees / 3-day revenue (lower is better)
-    """
+    """Score a cross-exchange opportunity."""
     sc = 0
 
     # Differential magnitude (30pts)

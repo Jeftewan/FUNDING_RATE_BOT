@@ -1,4 +1,4 @@
-"""Email alert notifications via SMTP."""
+"""Email alert notifications via SMTP — v8.0 reads config from state."""
 import smtplib
 import logging
 import time
@@ -10,32 +10,35 @@ log = logging.getLogger("bot")
 
 
 class EmailNotifier:
-    def __init__(self, config):
-        self.enabled = config.ALERT_EMAIL_ENABLED
-        self.smtp_host = config.SMTP_HOST
-        self.smtp_port = config.SMTP_PORT
-        self.smtp_user = config.SMTP_USER
-        self.smtp_password = config.SMTP_PASSWORD
-        self.email_to = config.ALERT_EMAIL_TO
-        self.email_from = config.ALERT_EMAIL_FROM or config.SMTP_USER
-        # Track sent alerts to avoid duplicate emails
-        self._sent_cache = {}  # {alert_key: timestamp}
-        self._cooldown_seconds = 300  # 5 min between same alert
+    def __init__(self, state_manager):
+        self.state_manager = state_manager
+        self._sent_cache = {}
+        self._cooldown_seconds = 300
 
-        if self.enabled:
-            if not all([self.smtp_user, self.smtp_password, self.email_to]):
-                log.warning("Email alerts enabled but SMTP config incomplete. Disabling.")
-                self.enabled = False
-            else:
-                log.info(f"Email alerts enabled: {self.email_to}")
+        # Read initial config from state
+        self._sync_from_state()
+
+    def _sync_from_state(self):
+        """Sync email config from state manager."""
+        s = self.state_manager.state
+        self.enabled = s.get("email_enabled", False)
+        self.smtp_host = s.get("smtp_host", "smtp.gmail.com")
+        self.smtp_port = s.get("smtp_port", 587)
+        self.smtp_user = s.get("smtp_user", "")
+        self.smtp_password = s.get("smtp_password", "")
+        self.email_to = s.get("email_to", "")
+        self.email_from = s.get("smtp_user", "")
+
+        if self.enabled and not all([self.smtp_user, self.smtp_password, self.email_to]):
+            self.enabled = False
 
     def send_alert(self, alert: dict) -> bool:
         """Send a single alert via email. Returns True if sent."""
+        self._sync_from_state()
         if not self.enabled:
             return False
 
-        # Dedup: don't send the same alert within cooldown
-        alert_key = f"{alert['type']}_{alert['symbol']}_{alert['exchange']}"
+        alert_key = f"{alert['type']}_{alert['symbol']}_{alert.get('exchange', '')}"
         now = time.time()
         if alert_key in self._sent_cache:
             if now - self._sent_cache[alert_key] < self._cooldown_seconds:
@@ -53,11 +56,11 @@ class EmailNotifier:
 
     def send_alerts(self, alerts: list) -> int:
         """Send multiple alerts, returns count of emails sent."""
+        self._sync_from_state()
         if not self.enabled or not alerts:
             return 0
 
-        # Only send CRITICAL alerts by email
-        critical = [a for a in alerts if a.get("severity") == "CRITICAL"]
+        critical = [a for a in alerts if a.get("severity") in ("CRITICAL", "WARNING")]
         if not critical:
             return 0
 
@@ -65,7 +68,6 @@ class EmailNotifier:
         for alert in critical:
             if self.send_alert(alert):
                 sent += 1
-
         return sent
 
     def _format_alert(self, alert: dict) -> tuple:
@@ -76,32 +78,31 @@ class EmailNotifier:
         alert_type = alert.get("type", "UNKNOWN")
         message = alert.get("message", "")
 
-        # Subject
-        emoji = "🚨" if severity == "CRITICAL" else "⚠️"
-        subject = f"{emoji} {alert_type}: {symbol} ({exchange})"
+        emoji = "🚨" if severity == "CRITICAL" else "⚠️" if severity == "WARNING" else "ℹ️"
+        subject = f"{emoji} {alert_type}: {symbol}" + (f" ({exchange})" if exchange else "")
 
-        # Body
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         action_text = ""
         if alert_type == "RATE_REVERSAL":
             action_text = (
                 "<p style='color:#ef4444;font-weight:bold;font-size:18px'>"
-                "⛔ ACCION REQUERIDA: Cerrar posicion inmediatamente</p>"
-                "<p>El funding rate cambio de direccion. La posicion ahora "
-                "esta pagando en lugar de recibir funding.</p>"
+                "ACCION: Cerrar posicion inmediatamente</p>"
             )
-        elif alert_type == "STOP_LOSS":
+        elif alert_type == "PRE_PAYMENT_UNFAVORABLE":
             action_text = (
-                "<p style='color:#ef4444;font-weight:bold;font-size:18px'>"
-                "⛔ STOP LOSS ALCANZADO: Cerrar posicion</p>"
-                "<p>El precio cayo por debajo del stop loss configurado.</p>"
+                "<p style='color:#fbbf24;font-weight:bold;font-size:18px'>"
+                "REVISAR: Tasa desfavorable antes del pago</p>"
             )
         elif alert_type == "RATE_DROP":
             action_text = (
                 "<p style='color:#fbbf24;font-weight:bold;font-size:18px'>"
-                "⚠️ Rate cayo significativamente</p>"
-                "<p>Considerar cerrar si no se recupera en los proximos cobros.</p>"
+                "Rate cayo significativamente — considerar cerrar</p>"
+            )
+        elif alert_type == "POSITION_CLOSED":
+            action_text = (
+                "<p style='color:#22c55e;font-weight:bold;font-size:18px'>"
+                "Posicion cerrada — resumen incluido</p>"
             )
 
         body = f"""
@@ -109,7 +110,7 @@ class EmailNotifier:
         <div style="max-width:600px;margin:0 auto;background:#111318;border-radius:12px;
                     padding:24px;border:1px solid #1a1d23">
             <h2 style="color:#fff;margin-bottom:8px">
-                {emoji} Funding Bot v7.0 — Alerta
+                {emoji} Funding Bot v8.0 — Alerta
             </h2>
             <hr style="border-color:#1a1d23">
 
@@ -117,7 +118,7 @@ class EmailNotifier:
                 <tr><td style="color:#666;padding:4px 8px">Tipo</td>
                     <td style="color:#fff;font-weight:bold">{alert_type}</td></tr>
                 <tr><td style="color:#666;padding:4px 8px">Severidad</td>
-                    <td style="color:{'#ef4444' if severity=='CRITICAL' else '#fbbf24'};
+                    <td style="color:{'#ef4444' if severity=='CRITICAL' else '#fbbf24' if severity=='WARNING' else '#22c55e'};
                         font-weight:bold">{severity}</td></tr>
                 <tr><td style="color:#666;padding:4px 8px">Symbol</td>
                     <td style="color:#fff;font-weight:bold;font-size:16px">{symbol}</td></tr>
@@ -133,7 +134,7 @@ class EmailNotifier:
 
             <hr style="border-color:#1a1d23;margin-top:16px">
             <p style="font-size:11px;color:#444;text-align:center">
-                Funding Rate Arbitrage Bot v7.0 — Alerta automatica
+                Funding Rate Arbitrage Bot v8.0
             </p>
         </div>
         </body></html>
@@ -155,8 +156,6 @@ class EmailNotifier:
 
     def test_connection(self) -> dict:
         """Test SMTP connection. Returns {ok, error}."""
-        if not self.enabled:
-            return {"ok": False, "error": "Email alerts not enabled"}
         try:
             with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
                 server.starttls()

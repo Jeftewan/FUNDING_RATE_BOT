@@ -77,6 +77,8 @@ class SpotPerpOpportunity:
     mins_to_next: float = -1
     history: dict = field(default_factory=dict)
     rsi: float = -1
+    stability_grade: str = "D"
+    estimated_hold_days: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -95,6 +97,8 @@ class SpotPerpOpportunity:
             "score": self.score, "has_spot": self.has_spot,
             "mins_to_next": self.mins_to_next,
             "rsi": self.rsi,
+            "stability_grade": self.stability_grade,
+            "estimated_hold_days": self.estimated_hold_days,
         }
 
 
@@ -119,6 +123,7 @@ class CrossExchangeOpportunity:
     margin_required_per_1000: float = 2000  # Need margin on both sides
     liquidation_risk: str = "MEDIUM"
     mins_to_next: float = -1
+    stability_grade: str = "D"
 
     def to_dict(self) -> dict:
         return {
@@ -138,6 +143,7 @@ class CrossExchangeOpportunity:
             "margin_required_per_1000": self.margin_required_per_1000,
             "liquidation_risk": self.liquidation_risk,
             "mins_to_next": self.mins_to_next,
+            "stability_grade": self.stability_grade,
         }
 
 
