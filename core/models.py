@@ -118,6 +118,10 @@ class CrossExchangeOpportunity:
     daily_income_per_1000: float
     net_3d_revenue_per_1000: float
     total_fees: float
+    long_interval_hours: int = 8
+    short_interval_hours: int = 8
+    long_ppd: float = 3
+    short_ppd: float = 3
     break_even_hours: float = 0
     score: int = 0
     margin_required_per_1000: float = 2000  # Need margin on both sides
@@ -133,6 +137,10 @@ class CrossExchangeOpportunity:
             "short_exchange": self.short_exchange,
             "long_rate": self.long_rate, "short_rate": self.short_rate,
             "rate_differential": self.rate_differential,
+            "long_interval_hours": self.long_interval_hours,
+            "short_interval_hours": self.short_interval_hours,
+            "long_ppd": self.long_ppd,
+            "short_ppd": self.short_ppd,
             "accumulated_3d_pct": self.accumulated_3d_pct,
             "apr": self.apr,
             "daily_income_per_1000": self.daily_income_per_1000,
