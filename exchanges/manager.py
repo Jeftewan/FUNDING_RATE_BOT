@@ -129,9 +129,8 @@ class ExchangeManager:
 
                 mark_price = data.get("markPrice", 0) or 0
                 next_ts = data.get("fundingTimestamp", 0) or 0
-                interval = data.get("fundingDatetime")
 
-                # Determine funding interval
+                # Determine funding interval from CCXT unified response
                 ih = self._get_funding_interval(exchange_name, info, data)
                 ipd = 24 / ih if ih > 0 else 3
 
@@ -169,31 +168,42 @@ class ExchangeManager:
 
     def _get_funding_interval(self, exchange_name: str, market_info: dict,
                               funding_data: dict) -> int:
-        """Determine funding interval in hours."""
-        # Some exchanges report it in market info
+        """Determine funding interval in hours.
+
+        Uses the unified CCXT 'interval' field first (e.g. '8h', '4h', '1h'),
+        then falls back to exchange-specific raw fields in market info.
+        """
+        # 1. Check unified CCXT 'interval' field from fetch_funding_rates()
+        #    Works for Bybit, OKX, Bitget; None for Binance
+        if funding_data:
+            interval_str = funding_data.get("interval")
+            if interval_str and isinstance(interval_str, str):
+                hours = interval_str.replace("h", "")
+                try:
+                    return int(hours)
+                except (ValueError, TypeError):
+                    pass
+
+        # 2. Fall back to exchange-specific raw fields in market info
         if market_info:
-            # Check for fundingRateFrequency or similar
             info = market_info.get("info", {})
             if isinstance(info, dict):
-                freq = info.get("fundingIntervalHours")
-                if freq:
-                    return int(freq)
-                # Bybit
+                # Bybit: fundingInterval in minutes (60, 240, 480)
                 fund_interval = info.get("fundingInterval")
                 if fund_interval:
                     try:
-                        return int(fund_interval) // 60  # minutes to hours
+                        return int(fund_interval) // 60
+                    except (ValueError, TypeError):
+                        pass
+                # Bitget: fundInterval in hours as string ("1", "4", "8")
+                fund_iv = info.get("fundInterval")
+                if fund_iv:
+                    try:
+                        return int(fund_iv)
                     except (ValueError, TypeError):
                         pass
 
-        # Default intervals per exchange
-        defaults = {
-            "binance": 8,
-            "bybit": 8,
-            "okx": 8,
-            "bitget": 8,
-        }
-        return defaults.get(exchange_name, 8)
+        return 8
 
     def _enrich_volumes(self, exchange_name: str, rates: list):
         """Fetch 24h volumes via tickers if not available from funding data."""
