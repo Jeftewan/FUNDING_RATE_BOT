@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Funding Rate Arbitrage Bot v7.0
+Funding Rate Arbitrage Bot v8.0
 4 Exchanges (Binance, Bybit, OKX, Bitget) via CCXT
-Spot-Perp + Cross-Exchange arbitrage detection
-3-Day Revenue Ranking (Coinglass-style)
-Manual execution mode — bot recommends, operator executes
+Unified opportunity scanner — no safe/aggressive split
+User-driven position management with real payment tracking
 """
 import os
 import logging
@@ -19,7 +18,6 @@ log = logging.getLogger("bot")
 # ── Configuration ──────────────────────────────────────────────
 from config import Config
 
-# Ensure data directory exists
 if not os.path.exists(Config.DATA_DIR):
     try:
         os.makedirs(Config.DATA_DIR, exist_ok=True)
@@ -37,11 +35,9 @@ state_manager.load()
 # Apply initial config if first run
 if state_manager.get("scan_count") == 0:
     state_manager.update(
-        total_capital=Config.CAPITAL,
+        total_capital=float(os.environ.get("CAPITAL", "1000")),
         scan_interval=Config.SCAN_INTERVAL_MINUTES * 60,
         min_volume=Config.MIN_VOLUME,
-        safe_pct=Config.SAFE_PCT,
-        aggr_pct=Config.AGGR_PCT,
     )
 
 # ── Exchange Manager (CCXT) ───────────────────────────────────
@@ -62,10 +58,10 @@ if Config.COINGLASS_API_KEY:
     coinglass_client = CoinglassClient(Config.COINGLASS_API_KEY)
     log.info("Coinglass API configured")
 
-# ── Email Notifications (optional) ────────────────────────────
+# ── Email Notifications ───────────────────────────────────────
 from notifications.email import EmailNotifier
 
-email_notifier = EmailNotifier(Config)
+email_notifier = EmailNotifier(state_manager)
 
 # ── Scanner Worker ────────────────────────────────────────────
 from scanner.worker import ScannerWorker
@@ -85,8 +81,7 @@ init_routes(app, state_manager, scanner_worker, Config)
 
 s = state_manager.state
 log.info(
-    f"Bot v7.0: ${s['total_capital']:,.0f} | "
-    f"{s['safe_pct']}/{s['aggr_pct']} | "
+    f"Bot v8.0: ${s['total_capital']:,.0f} | "
     f"{s['scan_interval']//60}min | "
     f"Exchanges: {', '.join(Config.ENABLED_EXCHANGES)} | "
     f"{Config.DATA_DIR}"

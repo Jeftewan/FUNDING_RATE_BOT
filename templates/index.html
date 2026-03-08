@@ -1,19 +1,96 @@
 <!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Funding Bot v7.0</title>
+<title>Funding Bot v8.0</title>
 <link rel="stylesheet" href="/static/style.css">
 </head><body>
 <div class="c">
-<div class="hdr"><h1>💰 Funding Rate Arbitrage Bot v7.0</h1>
-<div class="s">4 Exchanges · Spot-Perp + Cross-Exchange · 3-Day Revenue Ranking</div>
-<div class="tabs">
-<button class="tab active" onclick="switchTab('dashboard')">📊 Dashboard</button>
-<button class="tab" onclick="switchTab('opportunities')">🎯 Oportunidades</button>
-<button class="tab" onclick="switchTab('positions')">💼 Posiciones</button>
+  <div class="hdr">
+    <h1>Funding Rate Bot <span class="v">v8.0</span></h1>
+    <div class="tabs">
+      <button class="tab active" onclick="switchTab('opportunities')" id="tab-opportunities">Oportunidades</button>
+      <button class="tab" onclick="switchTab('positions')" id="tab-positions">Posiciones</button>
+      <button class="tab" onclick="switchTab('config')" id="tab-config">Configuracion</button>
+    </div>
+    <div class="status-bar" id="status-bar">
+      <span id="st-status">Cargando...</span>
+      <span id="st-scan">Scan #0</span>
+      <span id="st-time">—</span>
+    </div>
+  </div>
+
+  <!-- ═══ OPPORTUNITIES TAB ═══ -->
+  <div id="page-opportunities" class="page active">
+    <div class="toolbar">
+      <button class="btn btn-scan" onclick="forceScan()">Escanear</button>
+      <div class="filter-bar">
+        <label>APR min <input type="number" id="f-apr" value="10" class="inp-sm" onchange="loadOpps()">%</label>
+        <label>Score min <input type="number" id="f-score" value="40" class="inp-sm" onchange="loadOpps()"></label>
+      </div>
+      <span class="count" id="opp-count">0 oportunidades</span>
+    </div>
+
+    <div id="opp-list"></div>
+  </div>
+
+  <!-- ═══ POSITIONS TAB ═══ -->
+  <div id="page-positions" class="page">
+    <div class="capital-bar" id="capital-bar"></div>
+    <div id="alerts-bar"></div>
+    <div id="pos-list"></div>
+    <div class="history-section" id="history-section">
+      <h3>Historial</h3>
+      <div id="history-list"></div>
+    </div>
+  </div>
+
+  <!-- ═══ CONFIG TAB ═══ -->
+  <div id="page-config" class="page">
+    <div class="cfg-section">
+      <h3>General</h3>
+      <div class="cfg-grid">
+        <label>Capital USD<input type="number" id="cfg-capital" class="inp"></label>
+        <label>Escaneo (min)<input type="number" id="cfg-scan-min" class="inp"></label>
+        <label>Max posiciones<input type="number" id="cfg-max-pos" class="inp"></label>
+        <label>Vol min 24h<input type="number" id="cfg-min-vol" class="inp"></label>
+        <label>APR minimo %<input type="number" id="cfg-min-apr" class="inp"></label>
+        <label>Score minimo<input type="number" id="cfg-min-score" class="inp"></label>
+        <label>Dias estabilidad<input type="number" id="cfg-min-days" class="inp"></label>
+        <label>Alerta (min antes)<input type="number" id="cfg-alert-min" class="inp"></label>
+      </div>
+    </div>
+    <div class="cfg-section">
+      <h3>Email / Notificaciones</h3>
+      <div class="cfg-grid">
+        <label class="full"><input type="checkbox" id="cfg-email-on"> Notificaciones habilitadas</label>
+        <label>SMTP Host<input type="text" id="cfg-smtp-host" class="inp"></label>
+        <label>SMTP Puerto<input type="number" id="cfg-smtp-port" class="inp"></label>
+        <label>SMTP Usuario<input type="text" id="cfg-smtp-user" class="inp"></label>
+        <label>SMTP Password<input type="password" id="cfg-smtp-pass" class="inp"></label>
+        <label>Email destino<input type="text" id="cfg-email-to" class="inp"></label>
+      </div>
+      <div class="cfg-actions">
+        <button class="btn btn-secondary" onclick="testEmail()">Enviar prueba</button>
+        <span id="email-status"></span>
+      </div>
+    </div>
+    <div class="cfg-actions">
+      <button class="btn btn-primary" onclick="saveConfig()">Guardar configuracion</button>
+      <span id="cfg-status"></span>
+    </div>
+  </div>
 </div>
+
+<!-- Modal for position steps -->
+<div id="modal" class="modal" onclick="if(event.target===this)closeModal()">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3 id="modal-title"></h3>
+      <button class="btn-close" onclick="closeModal()">&times;</button>
+    </div>
+    <div id="modal-body"></div>
+  </div>
 </div>
-<div id="ct"><div class="ld"><div class="sp"></div><br>Esperando scan...<br><span style="font-size:.8em">~15 segundos</span></div></div>
-</div>
+
 <script src="/static/app.js"></script>
 </body></html>

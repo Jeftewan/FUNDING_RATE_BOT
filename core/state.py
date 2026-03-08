@@ -1,7 +1,6 @@
-"""Thread-safe state manager."""
+"""Thread-safe state manager — v8.0 unified (no safe/aggr split)."""
 import threading
 import logging
-from core.models import Position
 from core.persistence import JSONPersistence
 
 log = logging.getLogger("bot")
@@ -12,24 +11,36 @@ class StateManager:
         self._lock = threading.RLock()
         self._persistence = persistence
         self._state = {
+            # --- Configurable from frontend ---
             "total_capital": 1000,
-            "scan_interval": 300,
-            "min_volume": 1000000,
-            "safe_pct": 80, "aggr_pct": 20,
-            "reserve_pct": 10,
-            "max_pos_safe": 1, "max_pos_aggr": 1,
-            "min_apr_safe": 5, "min_apr_aggr": 15, "min_score": 40,
-            "positions": [], "history": [],
-            "total_earned": 0, "scan_count": 0,
-            "safe_top": [], "aggr_top": [],
+            "scan_interval": 300,           # seconds
+            "min_volume": 1_000_000,
+            "min_apr": 10,
+            "min_score": 40,
+            "min_stability_days": 3,
+            "max_positions": 5,
+            "alert_minutes_before": 5,
+
+            # --- Email / Notifications ---
+            "email_enabled": False,
+            "smtp_host": "smtp.gmail.com",
+            "smtp_port": 587,
+            "smtp_user": "",
+            "smtp_password": "",
+            "email_to": "",
+
+            # --- Operational state (not editable) ---
+            "positions": [],
+            "history": [],
+            "total_earned": 0,
+            "scan_count": 0,
             "all_data": [],
-            "actions": [], "last_scan_time": "—",
-            "status": "Iniciando...", "last_error": "",
-            "skipped_tokens": [],
-            # v7 additions
-            "spot_perp_opportunities": [],
-            "cross_exchange_opportunities": [],
+            "opportunities": [],        # Unified opportunity list
+            "coinglass_data": [],
             "alerts": [],
+            "status": "Iniciando...",
+            "last_error": "",
+            "last_scan_time": "—",
             "last_scan": 0,
         }
 
@@ -39,8 +50,7 @@ class StateManager:
             for k, v in saved.items():
                 if k in self._state:
                     self._state[k] = v
-            # Convert position dicts to Position objects then back
-            # (keep as dicts for backward compat)
+            # Migrate from old state: remove deprecated keys silently
             pos_count = len(self._state["positions"])
             earned = self._state.get("total_earned", 0)
             log.info(f"State loaded: {pos_count} pos, ${earned:.2f} earned")
@@ -86,14 +96,10 @@ class StateManager:
                 return self._state["positions"].pop(idx)
             return {}
 
-    def set_scan_results(self, spot_perp: list, cross_exchange: list,
-                         all_data: list, safe_top: list, aggr_top: list) -> None:
+    def set_scan_results(self, opportunities: list, all_data: list) -> None:
         with self._lock:
-            self._state["spot_perp_opportunities"] = spot_perp
-            self._state["cross_exchange_opportunities"] = cross_exchange
+            self._state["opportunities"] = opportunities
             self._state["all_data"] = all_data
-            self._state["safe_top"] = safe_top
-            self._state["aggr_top"] = aggr_top
 
     def set_alerts(self, alerts: list) -> None:
         with self._lock:
