@@ -157,59 +157,103 @@ class ScannerWorker:
         """Accumulate real earnings based on funding payment intervals."""
         now = time.time()
         for pos in state["positions"]:
-            cur = next(
-                (d for d in all_data
-                 if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]),
-                None,
-            )
-            if not cur:
-                continue
-
-            ih = pos.get("ih", 8)
-            last_up = pos.get("last_earn_update", pos["entry_time"] / 1000)
-            elapsed_h = (now - last_up) / 3600
-            full_ivs = int(elapsed_h / ih)
-            if full_ivs < 1:
-                continue
-
-            cfr = cur["fr"]
             mode = pos.get("mode", "spot_perp")
 
             if mode == "spot_perp":
-                # Spot-perp: earn when FR > 0 (we are short futures)
-                if cfr > 0:
-                    fut_size = pos["capital_used"] / 2
-                    earn_per_iv = fut_size * cfr
-                else:
-                    earn_per_iv = 0
+                self._update_spot_perp_earnings(pos, all_data, now)
             else:
-                # Cross-exchange: earn from differential
-                # Simplified: use current rate as proxy
-                fut_size = pos["capital_used"] / 2
-                earn_per_iv = fut_size * abs(cfr) if cfr > 0 else 0
+                self._update_cross_exchange_earnings(pos, all_data, now)
 
-            earned_now = earn_per_iv * full_ivs
+    def _update_spot_perp_earnings(self, pos: dict, all_data: list, now: float):
+        """Spot-perp earnings: earn when FR > 0 (we are short futures)."""
+        cur = next(
+            (d for d in all_data
+             if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]),
+            None,
+        )
+        if not cur:
+            return
 
-            # Record payment
-            if earned_now > 0:
-                if "payments" not in pos:
-                    pos["payments"] = []
-                pos["payments"].append({
-                    "ts": int(now),
-                    "rate": cfr,
-                    "earned": earned_now,
-                    "cumulative": pos.get("earned_real", 0) + earned_now,
-                })
+        ih = pos.get("ih", 8)
+        last_up = pos.get("last_earn_update", pos["entry_time"] / 1000)
+        elapsed_h = (now - last_up) / 3600
+        full_ivs = int(elapsed_h / ih)
+        if full_ivs < 1:
+            return
 
-            pos["earned_real"] = pos.get("earned_real", 0) + earned_now
-            pos["last_earn_update"] = now
-            pos["last_fr_used"] = cfr
-            pos["payment_count"] = len(pos.get("payments", []))
-            if pos.get("payments"):
-                pos["avg_rate"] = sum(p["rate"] for p in pos["payments"]) / len(pos["payments"])
+        cfr = cur["fr"]
+        if cfr > 0:
+            fut_size = pos["capital_used"] / 2
+            earn_per_iv = fut_size * cfr
+        else:
+            earn_per_iv = 0
 
-            if earned_now > 0:
-                log.info(f"  +${earned_now:.4f} {pos['symbol']} ({full_ivs}ivs @ {cfr*100:.4f}%)")
+        self._record_earnings(pos, earn_per_iv * full_ivs, cfr, now, full_ivs)
+
+    def _update_cross_exchange_earnings(self, pos: dict, all_data: list, now: float):
+        """Cross-exchange earnings: track differential between both exchanges."""
+        long_ex = pos.get("long_exchange", "")
+        short_ex = pos.get("short_exchange", pos.get("exchange", ""))
+
+        long_data = next(
+            (d for d in all_data
+             if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex),
+            None,
+        )
+        short_data = next(
+            (d for d in all_data
+             if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex),
+            None,
+        )
+        if not long_data or not short_data:
+            return
+
+        # Use the shorter interval to determine payment timing
+        long_ih = long_data.get("ih", 8)
+        short_ih = short_data.get("ih", 8)
+        min_ih = min(long_ih, short_ih)
+
+        last_up = pos.get("last_earn_update", pos["entry_time"] / 1000)
+        elapsed_h = (now - last_up) / 3600
+        full_ivs = int(elapsed_h / min_ih)
+        if full_ivs < 1:
+            return
+
+        # Net earnings: short side receives, long side pays
+        fut_size = pos["capital_used"] / 2
+        short_fr = short_data["fr"]
+        long_fr = long_data["fr"]
+        # Short side: we receive short_fr when positive
+        short_earn = fut_size * short_fr if short_fr > 0 else -(fut_size * abs(short_fr))
+        # Long side: we pay long_fr when positive (longs pay shorts)
+        long_cost = -(fut_size * long_fr) if long_fr > 0 else fut_size * abs(long_fr)
+        earn_per_iv = short_earn + long_cost
+
+        differential = short_fr - long_fr
+        self._record_earnings(pos, earn_per_iv * full_ivs, differential, now, full_ivs)
+
+    def _record_earnings(self, pos: dict, earned_now: float, rate: float,
+                         now: float, full_ivs: int):
+        """Record earnings for a position."""
+        if earned_now > 0:
+            if "payments" not in pos:
+                pos["payments"] = []
+            pos["payments"].append({
+                "ts": int(now),
+                "rate": rate,
+                "earned": earned_now,
+                "cumulative": pos.get("earned_real", 0) + earned_now,
+            })
+
+        pos["earned_real"] = pos.get("earned_real", 0) + earned_now
+        pos["last_earn_update"] = now
+        pos["last_fr_used"] = rate
+        pos["payment_count"] = len(pos.get("payments", []))
+        if pos.get("payments"):
+            pos["avg_rate"] = sum(p["rate"] for p in pos["payments"]) / len(pos["payments"])
+
+        if earned_now > 0:
+            log.info(f"  +${earned_now:.4f} {pos['symbol']} ({full_ivs}ivs @ {rate*100:.4f}%)")
 
     def _check_alerts(self, state: dict, all_data: list) -> list:
         """Check positions for alerts: rate reversal, rate drop, pre-payment."""

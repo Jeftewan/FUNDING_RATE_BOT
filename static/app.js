@@ -48,10 +48,11 @@ function renderOpps(data) {
 
   el.innerHTML = opps.map((o, i) => {
     const mode = o.mode === 'spot_perp' ? 'Spot-Perp' : 'Cross-Exchange';
-    const exchange = o.mode === 'spot_perp' ? o.exchange :
-      `${o.long_exchange} / ${o.short_exchange}`;
+    const isCross = o.mode === 'cross_exchange';
+    const exchange = !isCross ? o.exchange :
+      `${o.long_exchange} (${o.long_interval_hours||'?'}h) / ${o.short_exchange} (${o.short_interval_hours||'?'}h)`;
     const grade = o.stability_grade || gradeFromScore(o.score);
-    const fr = o.mode === 'spot_perp' ? o.funding_rate : o.rate_differential;
+    const fr = !isCross ? o.funding_rate : o.rate_differential;
     const frPct = (fr * 100).toFixed(4);
     const days = o.estimated_hold_days || '?';
 
@@ -82,7 +83,9 @@ function renderOpps(data) {
 
       <div class="opp-meta">
         Vol: $${fmtVol(o.volume_24h)} |
-        Intervalo: ${o.interval_hours || '?'}h |
+        ${isCross
+          ? `Long ${o.long_rate ? (o.long_rate*100).toFixed(4)+'%' : '?'} (${o.long_interval_hours||'?'}h) · Short ${o.short_rate ? (o.short_rate*100).toFixed(4)+'%' : '?'} (${o.short_interval_hours||'?'}h)`
+          : `Intervalo: ${o.interval_hours || '?'}h`} |
         ${o.mins_to_next > 0 ? `Prox pago: ${Math.round(o.mins_to_next)}min` : ''}
       </div>
 

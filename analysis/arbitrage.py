@@ -163,26 +163,41 @@ class ArbitrageScanner:
         self, symbol: str,
         long_fr: FundingRate, short_fr: FundingRate
     ) -> CrossExchangeOpportunity:
-        """Analyze a single cross-exchange opportunity."""
+        """Analyze a single cross-exchange opportunity.
+
+        Each side earns/costs at its own payment frequency:
+        - Short side earns: short_rate * short_ppd per day
+        - Long side costs: long_rate * long_ppd per day
+        Net daily rate = short_rate * short_ppd - long_rate * long_ppd
+        """
         differential = short_fr.rate - long_fr.rate
+        long_ppd = long_fr.payments_per_day
+        short_ppd = short_fr.payments_per_day
 
-        avg_ppd = (long_fr.payments_per_day + short_fr.payments_per_day) / 2
+        # Daily rate accounting for each side's actual payment frequency
+        # Short side: you receive short_rate each payment (short is positive = you earn)
+        # Long side: you pay long_rate each payment (long's rate, usually lower/negative)
+        daily_rate = (short_fr.rate * short_ppd) - (long_fr.rate * long_ppd)
 
-        n_payments = int(avg_ppd * 3)
+        # Fetch history from both exchanges
+        n_long_3d = int(long_ppd * 3)
+        n_short_3d = int(short_ppd * 3)
         long_hist = self.exchange_manager.fetch_funding_history(
-            symbol, long_fr.exchange, limit=max(n_payments + 5, 15)
+            symbol, long_fr.exchange, limit=max(n_long_3d + 5, 15)
         )
         short_hist = self.exchange_manager.fetch_funding_history(
-            symbol, short_fr.exchange, limit=max(n_payments + 5, 15)
+            symbol, short_fr.exchange, limit=max(n_short_3d + 5, 15)
         )
 
+        # Calculate 3-day accumulated using each side's own history and frequency
         if long_hist.rates and short_hist.rates:
-            n = min(len(long_hist.rates), len(short_hist.rates), n_payments)
-            long_sum = sum(long_hist.rates[-n:])
-            short_sum = sum(short_hist.rates[-n:])
+            n_long = min(len(long_hist.rates), n_long_3d)
+            n_short = min(len(short_hist.rates), n_short_3d)
+            long_sum = sum(long_hist.rates[-n_long:])
+            short_sum = sum(short_hist.rates[-n_short:])
             accumulated_3d = short_sum - long_sum
         else:
-            accumulated_3d = differential * n_payments
+            accumulated_3d = daily_rate * 3
 
         fees = calculate_cross_exchange_fees(
             long_fr.exchange, short_fr.exchange,
@@ -192,12 +207,13 @@ class ArbitrageScanner:
         revenue_3d_usd = NOTIONAL / 2 * abs(accumulated_3d)
         net_3d = revenue_3d_usd - fees["total_cost"]
 
-        daily_income = abs(differential) * avg_ppd * (NOTIONAL / 2)
-        apr = abs(differential) * avg_ppd * 365 * 100
+        daily_income = abs(daily_rate) * (NOTIONAL / 2)
+        apr = abs(daily_rate) * 365 * 100
 
         hourly_income = daily_income / 24
         break_even_h = calculate_break_even_hours(fees["total_cost"], hourly_income)
 
+        # Consistency: check if differential was favorable in historical payments
         consistency = 0
         if long_hist.rates and short_hist.rates:
             n_check = min(len(long_hist.rates), len(short_hist.rates))
@@ -231,6 +247,10 @@ class ArbitrageScanner:
             rate_differential=differential,
             long_price=long_fr.price,
             short_price=short_fr.price,
+            long_interval_hours=long_fr.interval_hours,
+            short_interval_hours=short_fr.interval_hours,
+            long_ppd=long_ppd,
+            short_ppd=short_ppd,
             accumulated_3d_pct=accumulated_3d * 100,
             apr=apr,
             daily_income_per_1000=daily_income,

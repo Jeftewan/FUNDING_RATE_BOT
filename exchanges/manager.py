@@ -20,6 +20,7 @@ class ExchangeManager:
         self.config = config
         self._exchanges = {}
         self._spot_caches = {}  # {exchange: set of spot symbols}
+        self._funding_intervals = {}  # {exchange: {symbol: hours}}
         self._init_exchanges()
 
     def _init_exchanges(self):
@@ -110,6 +111,25 @@ class ExchangeManager:
             if not ex.markets:
                 ex.load_markets()
 
+            # For Binance: fetch funding intervals (separate API call)
+            # since fetch_funding_rates() doesn't include interval info
+            if exchange_name == "binance" and exchange_name not in self._funding_intervals:
+                try:
+                    fi_data = ex.fetch_funding_intervals()
+                    iv_map = {}
+                    for sym, fi in fi_data.items():
+                        interval_str = fi.get("interval")
+                        if interval_str and isinstance(interval_str, str):
+                            try:
+                                iv_map[sym] = int(interval_str.replace("h", ""))
+                            except (ValueError, TypeError):
+                                pass
+                    self._funding_intervals["binance"] = iv_map
+                    log.info(f"Binance: cached {len(iv_map)} funding intervals")
+                except Exception as e:
+                    log.warning(f"Binance funding intervals fetch failed: {e}")
+                    self._funding_intervals["binance"] = {}
+
             # Fetch funding rates
             funding_rates = ex.fetch_funding_rates()
 
@@ -131,7 +151,7 @@ class ExchangeManager:
                 next_ts = data.get("fundingTimestamp", 0) or 0
 
                 # Determine funding interval from CCXT unified response
-                ih = self._get_funding_interval(exchange_name, info, data)
+                ih = self._get_funding_interval(exchange_name, info, data, symbol)
                 ipd = 24 / ih if ih > 0 else 3
 
                 # Minutes to next funding
@@ -167,14 +187,16 @@ class ExchangeManager:
         return rates
 
     def _get_funding_interval(self, exchange_name: str, market_info: dict,
-                              funding_data: dict) -> int:
+                              funding_data: dict, symbol: str = None) -> int:
         """Determine funding interval in hours.
 
-        Uses the unified CCXT 'interval' field first (e.g. '8h', '4h', '1h'),
-        then falls back to exchange-specific raw fields in market info.
+        Priority:
+        1. Unified CCXT 'interval' from fetch_funding_rates() (Bybit, OKX, Bitget)
+        2. Cached fetch_funding_intervals() data (Binance)
+        3. Exchange-specific raw fields in market info (fallback)
+        4. Default 8h
         """
         # 1. Check unified CCXT 'interval' field from fetch_funding_rates()
-        #    Works for Bybit, OKX, Bitget; None for Binance
         if funding_data:
             interval_str = funding_data.get("interval")
             if interval_str and isinstance(interval_str, str):
@@ -184,7 +206,13 @@ class ExchangeManager:
                 except (ValueError, TypeError):
                     pass
 
-        # 2. Fall back to exchange-specific raw fields in market info
+        # 2. Check cached funding intervals (from fetch_funding_intervals())
+        if symbol and exchange_name in self._funding_intervals:
+            cached = self._funding_intervals[exchange_name].get(symbol)
+            if cached:
+                return cached
+
+        # 3. Fall back to exchange-specific raw fields in market info
         if market_info:
             info = market_info.get("info", {})
             if isinstance(info, dict):
