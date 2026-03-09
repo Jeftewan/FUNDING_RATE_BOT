@@ -142,24 +142,46 @@ class EmailNotifier:
         return subject, body
 
     def _send_email(self, subject: str, html_body: str):
-        """Send email via SMTP."""
+        """Send email via SMTP (STARTTLS on 587 or SSL on 465)."""
         msg = MIMEMultipart("alternative")
         msg["From"] = self.email_from
         msg["To"] = self.email_to
         msg["Subject"] = subject
         msg.attach(MIMEText(html_body, "html"))
 
-        with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
-            server.starttls()
-            server.login(self.smtp_user, self.smtp_password)
-            server.sendmail(self.email_from, self.email_to, msg.as_string())
-
-    def test_connection(self) -> dict:
-        """Test SMTP connection. Returns {ok, error}."""
-        try:
+        if self.smtp_port == 465:
+            # Direct SSL (port 465)
+            with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=10) as server:
+                server.login(self.smtp_user, self.smtp_password)
+                server.sendmail(self.email_from, self.email_to, msg.as_string())
+        else:
+            # STARTTLS (port 587 or other)
             with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
                 server.starttls()
                 server.login(self.smtp_user, self.smtp_password)
+                server.sendmail(self.email_from, self.email_to, msg.as_string())
+
+    def test_connection(self) -> dict:
+        """Test SMTP connection. Returns {ok, error}."""
+        self._sync_from_state()
+        if not all([self.smtp_host, self.smtp_user, self.smtp_password]):
+            return {"ok": False, "error": "Configuracion SMTP incompleta"}
+        try:
+            if self.smtp_port == 465:
+                with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=10) as server:
+                    server.login(self.smtp_user, self.smtp_password)
+            else:
+                with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
+                    server.starttls()
+                    server.login(self.smtp_user, self.smtp_password)
             return {"ok": True, "error": ""}
+        except OSError as e:
+            if e.errno == 101:
+                return {"ok": False, "error": "Red no disponible — el servidor no tiene acceso a internet saliente"}
+            if "getaddrinfo" in str(e) or "Name or service not known" in str(e):
+                return {"ok": False, "error": f"No se pudo resolver DNS para {self.smtp_host}"}
+            return {"ok": False, "error": f"Error de red: {str(e)[:200]}"}
+        except smtplib.SMTPAuthenticationError:
+            return {"ok": False, "error": "Credenciales SMTP incorrectas. Para Gmail usa una App Password"}
         except Exception as e:
             return {"ok": False, "error": str(e)[:200]}
