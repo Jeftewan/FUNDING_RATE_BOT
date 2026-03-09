@@ -264,6 +264,25 @@ def init_routes(app, state_manager, scanner_worker, config):
                 "total_earned": s.get("total_earned", 0),
             })
 
+    @app.route("/api/clear_history", methods=["POST"])
+    def api_clear_history():
+        """Clear all history and optionally reset positions."""
+        data = flask_req.json or {}
+        reset_all = data.get("reset_all", False)
+
+        with state_manager.lock:
+            s = state_manager.state
+            s["history"] = []
+            s["total_earned"] = 0
+            if reset_all:
+                s["positions"] = []
+                s["alerts"] = []
+            state_manager.save()
+
+        what = "todo (historial + posiciones)" if reset_all else "historial"
+        log.info(f"Cleared: {what}")
+        return jsonify({"ok": True, "msg": f"{what} borrado"})
+
     # ── Force Scan ─────────────────────────────────────────────
     @app.route("/api/force_scan", methods=["POST"])
     def api_force():

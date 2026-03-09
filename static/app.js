@@ -236,12 +236,13 @@ function renderPositions(data) {
     return;
   }
 
-  el.innerHTML = positions.map(p => {
+  el.innerHTML = positions.map((p, idx) => {
     const mode = p.mode === 'spot_perp' ? 'Spot-Perp' : 'Cross-Exchange';
     const exchange = p.mode === 'cross_exchange'
       ? `${p.long_exchange} / ${p.short_exchange}` : p.exchange;
     const frColor = p.current_fr > 0 ? '#22c55e' : '#ef4444';
     const earnColor = p.net_earned >= 0 ? '#22c55e' : '#ef4444';
+    const posId = p.id || String(idx);
 
     let alertHtml = '';
     if (p.fr_reversed) {
@@ -280,7 +281,7 @@ function renderPositions(data) {
           <span class="opp-mode">${mode}</span>
           <span style="font-size:11px;color:#888;margin-left:6px">${exchange}</span>
         </div>
-        <button class="btn btn-danger" onclick="closePos('${p.id}','${p.symbol}')">Cerrar posicion</button>
+        <button class="btn btn-danger" onclick="closePos('${posId}','${p.symbol}')">Cerrar posicion</button>
       </div>
 
       <div class="pos-grid">
@@ -340,6 +341,25 @@ function renderHistory(data) {
       <span style="color:#555">${h.closed_at ? h.closed_at.split('T')[0] : h.time?.split('T')[0] || ''}</span>
     </div>`;
   }).join('');
+}
+
+async function clearHistory(resetAll) {
+  const msg = resetAll
+    ? 'RESET TOTAL: Borrar historial + cerrar todas las posiciones. Continuar?'
+    : 'Borrar todo el historial de posiciones cerradas?';
+  if (!confirm(msg)) return;
+  try {
+    const res = await fetch('/api/clear_history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reset_all: resetAll }),
+    });
+    const data = await res.json();
+    alert(data.msg || 'Listo');
+    loadPositions();
+  } catch (e) {
+    alert('Error al borrar');
+  }
 }
 
 // ── Config ────────────────────────────────────────────────────

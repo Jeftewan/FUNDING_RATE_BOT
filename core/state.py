@@ -50,7 +50,11 @@ class StateManager:
             for k, v in saved.items():
                 if k in self._state:
                     self._state[k] = v
-            # Migrate from old state: remove deprecated keys silently
+            # Migrate: ensure all positions have an id
+            import uuid
+            for pos in self._state["positions"]:
+                if not pos.get("id"):
+                    pos["id"] = str(uuid.uuid4())[:8]
             pos_count = len(self._state["positions"])
             earned = self._state.get("total_earned", 0)
             log.info(f"State loaded: {pos_count} pos, ${earned:.2f} earned")
