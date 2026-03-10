@@ -21,15 +21,9 @@ class StateManager:
             "max_positions": 5,
             "alert_minutes_before": 5,
 
-            # --- Notifications ---
-            "email_enabled": False,
-            "notify_method": "whatsapp",    # "email" or "whatsapp"
-            "smtp_host": "smtp.gmail.com",
-            "smtp_port": 587,
-            "smtp_user": "",
-            "smtp_password": "",
-            "email_to": "",
-            "wa_phone": "",                 # WhatsApp phone with country code
+            # --- WhatsApp Notifications (CallMeBot) ---
+            "email_enabled": False,         # kept as "email_enabled" for compat
+            "wa_phone": "",                 # Phone with country code (no +)
             "wa_apikey": "",                # CallMeBot API key
 
             # --- Operational state (not editable) ---

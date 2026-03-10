@@ -42,12 +42,6 @@ def init_routes(app, state_manager, scanner_worker, config):
                     "max_positions": s.get("max_positions", 5),
                     "alert_minutes_before": s.get("alert_minutes_before", 5),
                     "email_enabled": s.get("email_enabled", False),
-                    "notify_method": s.get("notify_method", "whatsapp"),
-                    "smtp_host": s.get("smtp_host", "smtp.gmail.com"),
-                    "smtp_port": s.get("smtp_port", 587),
-                    "smtp_user": s.get("smtp_user", ""),
-                    "smtp_password": "***" if s.get("smtp_password") else "",
-                    "email_to": s.get("email_to", ""),
                     "wa_phone": s.get("wa_phone", ""),
                     "wa_apikey": s.get("wa_apikey", ""),
                 })
@@ -71,21 +65,9 @@ def init_routes(app, state_manager, scanner_worker, config):
                 s["max_positions"] = int(data["max_positions"])
             if "alert_minutes_before" in data:
                 s["alert_minutes_before"] = int(data["alert_minutes_before"])
-            # Notification settings
+            # WhatsApp notification settings
             if "email_enabled" in data:
                 s["email_enabled"] = bool(data["email_enabled"])
-            if "notify_method" in data:
-                s["notify_method"] = str(data["notify_method"])
-            if "smtp_host" in data:
-                s["smtp_host"] = str(data["smtp_host"])
-            if "smtp_port" in data:
-                s["smtp_port"] = int(data["smtp_port"])
-            if "smtp_user" in data:
-                s["smtp_user"] = str(data["smtp_user"])
-            if "smtp_password" in data and data["smtp_password"] != "***":
-                s["smtp_password"] = str(data["smtp_password"])
-            if "email_to" in data:
-                s["email_to"] = str(data["email_to"])
             if "wa_phone" in data:
                 s["wa_phone"] = str(data["wa_phone"]).strip()
             if "wa_apikey" in data:
@@ -291,41 +273,22 @@ def init_routes(app, state_manager, scanner_worker, config):
         threading.Thread(target=scanner_worker._run_scan, daemon=True).start()
         return jsonify({"ok": True})
 
-    # ── Test Notification ────────────────────────────────────
+    # ── Test WhatsApp ─────────────────────────────────────────
     @app.route("/api/test_email", methods=["POST"])
-    def api_test_notification():
-        """Send a test notification (WhatsApp or Email)."""
+    def api_test_whatsapp():
+        """Send a test WhatsApp message via CallMeBot."""
         n = scanner_worker.email_notifier
         if not n:
             return jsonify({"ok": False, "msg": "Notifier no disponible"})
 
-        # Sync latest config and force enabled for test
         n._sync_from_state()
-        method = n.notify_method
-        prev_enabled = n.enabled
-        n.enabled = True
+        if not all([n.wa_phone, n.wa_apikey]):
+            return jsonify({"ok": False, "msg": "Configura telefono y API key primero"})
 
-        # Test connection first
-        conn = n.test_connection()
-        if not conn["ok"]:
-            n.enabled = prev_enabled
-            return jsonify({"ok": False, "msg": conn["error"]})
-
-        # Send test alert
-        test_alert = {
-            "type": "TEST",
-            "severity": "INFO",
-            "symbol": "TEST",
-            "exchange": "Test",
-            "message": "Prueba de notificacion del Funding Bot v8.0",
-        }
-        sent = n.send_alert(test_alert)
-        n.enabled = prev_enabled
-
-        if sent:
-            dest = n.wa_phone if method == "whatsapp" else n.email_to
-            return jsonify({"ok": True, "msg": f"Enviado via {method} a {dest}"})
-        return jsonify({"ok": False, "msg": "No enviado (posible cooldown de 5min)"})
+        result = n.test_connection()
+        if result["ok"]:
+            return jsonify({"ok": True, "msg": f"WhatsApp enviado a {n.wa_phone}"})
+        return jsonify({"ok": False, "msg": result["error"]})
 
     # ── Alerts ─────────────────────────────────────────────────
     @app.route("/api/alerts")
