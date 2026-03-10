@@ -66,36 +66,21 @@
       </div>
     </div>
     <div class="cfg-section">
-      <h3>Notificaciones</h3>
+      <h3>WhatsApp Notificaciones</h3>
       <div class="cfg-grid">
         <label class="full"><input type="checkbox" id="cfg-email-on"> Notificaciones habilitadas</label>
-        <label class="full">Metodo:
-          <select id="cfg-notify-method" class="inp" onchange="toggleNotifyFields()">
-            <option value="whatsapp">WhatsApp (CallMeBot)</option>
-            <option value="email">Email (SMTP)</option>
-          </select>
-        </label>
-      </div>
-      <!-- WhatsApp fields -->
-      <div id="notify-wa" class="cfg-grid" style="margin-top:8px">
-        <label>Telefono (con codigo pais)<input type="text" id="cfg-wa-phone" class="inp" placeholder="+5491155551234"></label>
+        <label>Telefono (con codigo pais)<input type="text" id="cfg-wa-phone" class="inp" placeholder="5491155551234"></label>
         <label>API Key (CallMeBot)<input type="text" id="cfg-wa-apikey" class="inp" placeholder="123456"></label>
-        <p class="full" style="font-size:11px;color:#666;margin:4px 0">
-          1. Envia "I allow callmebot to send me messages" al +34 644 31 89 93 en WhatsApp<br>
-          2. Espera el API key que te responde CallMeBot<br>
-          3. Ingresa tu telefono con codigo de pais y el API key aqui
-        </p>
       </div>
-      <!-- Email fields -->
-      <div id="notify-email" class="cfg-grid" style="margin-top:8px;display:none">
-        <label>SMTP Host<input type="text" id="cfg-smtp-host" class="inp"></label>
-        <label>SMTP Puerto<input type="number" id="cfg-smtp-port" class="inp"></label>
-        <label>SMTP Usuario<input type="text" id="cfg-smtp-user" class="inp"></label>
-        <label>SMTP Password<input type="password" id="cfg-smtp-pass" class="inp"></label>
-        <label>Email destino<input type="text" id="cfg-email-to" class="inp"></label>
-      </div>
+      <p style="font-size:11px;color:#666;margin:8px 0 4px;line-height:1.5">
+        <b>Como configurar:</b><br>
+        1. Guarda el numero <b>+34 644 31 89 93</b> en tus contactos<br>
+        2. Envia "<b>I allow callmebot to send me messages</b>" a ese numero en WhatsApp<br>
+        3. Espera la respuesta con tu API key<br>
+        4. Ingresa tu telefono (sin +, ej: 5491155551234) y el API key aqui
+      </p>
       <div class="cfg-actions">
-        <button class="btn btn-secondary" onclick="testEmail()">Enviar prueba</button>
+        <button class="btn btn-secondary" onclick="testEmail()">Enviar prueba WhatsApp</button>
         <span id="email-status"></span>
       </div>
     </div>
