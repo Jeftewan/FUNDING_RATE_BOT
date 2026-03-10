@@ -1,10 +1,24 @@
-"""Background scanner and position monitor threads — v8.1 smart scan."""
+"""Background monitor — v8.2 minimal API calls.
+
+Scans ONLY happen in 3 moments:
+1. ~10 min before a funding payment (verify rate is still good)
+2. At payment time (get actual rate for earnings)
+3. Manual scan (user clicks button)
+
+NO periodic scan loop. Monitor runs every 30s checking timestamps
+locally (zero API calls) and triggers scans only when needed.
+"""
 import time
 import logging
 import threading
 from datetime import datetime
 
 log = logging.getLogger("bot")
+
+# Pre-payment scan: minutes before payment to trigger verification scan
+PRE_PAYMENT_SCAN_MINS = 10
+# Payment scan: minutes after payment to fetch actual rate used
+POST_PAYMENT_SCAN_MINS = 1
 
 
 class ScannerWorker:
@@ -19,111 +33,132 @@ class ScannerWorker:
         self._started = False
         self._last_scan_ts = 0
         self._scan_lock = threading.Lock()
+        # Track which payment windows we already scanned for
+        # Key: "{symbol}_{exchange}_{payment_ts}" → avoids duplicate scans
+        self._scanned_events = set()
 
     def start(self):
         if self._started:
             return
         self._started = True
-        threading.Thread(target=self._scan_loop, daemon=True).start()
+        # Only ONE thread — the monitor. No periodic scan loop.
         threading.Thread(target=self._monitor_loop, daemon=True).start()
-        log.info("Scanner workers launched (scan + monitor)")
+        log.info("Monitor started (scans only on payment events + manual)")
 
-    def _scan_loop(self):
-        """Main scan loop — fetch rates, find opportunities."""
-        time.sleep(5)
-        while True:
-            try:
-                self._run_scan()
-            except Exception as e:
-                log.exception(f"Scan error: {e}")
-                with self.state_manager.lock:
-                    self.state_manager.update(
-                        status=f"Error: {str(e)[:80]}",
-                        last_error=str(e),
-                    )
-            time.sleep(self.state_manager.get("scan_interval", 300))
+    # ── Monitor Loop (runs every 30s, ZERO api calls) ─────────
 
     def _monitor_loop(self):
-        """Position monitor — every 30s: update mins_next, check payments,
-        trigger smart scan before payments, send alerts."""
-        time.sleep(15)
+        """Every 30s: check payment schedule locally, trigger scan if needed."""
+        # Initial scan to have data on first load
+        time.sleep(5)
+        try:
+            log.info("Initial scan on startup...")
+            self._run_scan()
+        except Exception as e:
+            log.error(f"Initial scan failed: {e}")
+
         while True:
-            alerts = []
             try:
-                with self.state_manager.lock:
-                    s = self.state_manager.state
-                    all_data = s.get("all_data", [])
-                    positions = s.get("positions", [])
-
-                    if positions:
-                        # Recalculate mins_next from stored timestamps (live)
-                        now = time.time()
-                        for d in all_data:
-                            nts = d.get("next_funding_ts", 0)
-                            if nts and nts > 0:
-                                d["mins_next"] = max(0, (nts / 1000 - now) / 60)
-
-                        # Check if any position has a payment coming in <= 2 min
-                        # and we haven't scanned in the last 90 seconds
-                        need_fresh_scan = False
-                        for pos in positions:
-                            cur = self._find_data(pos, all_data)
-                            if cur:
-                                mn = cur.get("mins_next", -1)
-                                if 0 < mn <= 2 and (now - self._last_scan_ts) > 90:
-                                    need_fresh_scan = True
-                                    log.info(
-                                        f"Smart scan: {pos['symbol']}@{pos['exchange']} "
-                                        f"payment in {mn:.1f}min"
-                                    )
-                                    break
-
-                if need_fresh_scan:
-                    # Run scan outside the lock to get fresh rates
-                    log.info("Triggering pre-payment scan...")
-                    try:
-                        self._run_scan()
-                    except Exception as e:
-                        log.error(f"Pre-payment scan failed: {e}")
-
-                # Now process earnings and alerts with (possibly refreshed) data
-                with self.state_manager.lock:
-                    s = self.state_manager.state
-                    all_data = s.get("all_data", [])
-                    positions = s.get("positions", [])
-
-                    if all_data and positions:
-                        # Recalc mins_next again (may have been updated by scan)
-                        now = time.time()
-                        for d in all_data:
-                            nts = d.get("next_funding_ts", 0)
-                            if nts and nts > 0:
-                                d["mins_next"] = max(0, (nts / 1000 - now) / 60)
-
-                        self._update_earnings(s, all_data)
-                        alerts = self._check_alerts(s, all_data)
-                        s["alerts"] = alerts
-                        self.state_manager.save()
-
-                # Send WhatsApp alerts outside the lock
-                if alerts and self.email_notifier:
-                    try:
-                        sent = self.email_notifier.send_alerts(alerts)
-                        if sent:
-                            log.info(f"Sent {sent} WhatsApp alert(s)")
-                    except Exception as e:
-                        log.error(f"WhatsApp notification error: {e}")
+                self._monitor_tick()
             except Exception as e:
                 log.exception(f"Monitor error: {e}")
             time.sleep(30)
 
-    def _find_data(self, pos: dict, all_data: list) -> dict:
-        """Find current market data for a position."""
-        return next(
-            (d for d in all_data
-             if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]),
-            None,
-        )
+    def _monitor_tick(self):
+        """Single monitor tick — check positions, trigger scans if needed."""
+        scan_reason = None
+        alerts = []
+        now = time.time()
+
+        with self.state_manager.lock:
+            s = self.state_manager.state
+            all_data = s.get("all_data", [])
+            positions = s.get("positions", [])
+
+            if not positions:
+                # No positions → no need for scans, just update mins_next
+                self._refresh_mins_next(all_data, now)
+                return
+
+            # Recalculate mins_next from stored timestamps (no API call)
+            self._refresh_mins_next(all_data, now)
+
+            # Check each position for scan triggers
+            for pos in positions:
+                cur = self._find_data(pos, all_data)
+                if not cur:
+                    continue
+
+                mn = cur.get("mins_next", -1)
+                if mn < 0:
+                    continue
+
+                sym_key = f"{pos['symbol']}_{pos['exchange']}"
+                nts = cur.get("next_funding_ts", 0)
+                event_key = f"{sym_key}_{nts}"
+
+                # Momento 1: ~10 min antes del pago → verificar rate
+                pre_key = f"pre_{event_key}"
+                if PRE_PAYMENT_SCAN_MINS >= mn > POST_PAYMENT_SCAN_MINS:
+                    if pre_key not in self._scanned_events:
+                        scan_reason = f"Pre-pago {pos['symbol']}@{pos['exchange']} en {mn:.0f}min"
+                        self._scanned_events.add(pre_key)
+                        break
+
+                # Momento 2: Justo despues del pago → obtener rate real
+                post_key = f"post_{event_key}"
+                if mn <= POST_PAYMENT_SCAN_MINS:
+                    if post_key not in self._scanned_events:
+                        scan_reason = f"Pago {pos['symbol']}@{pos['exchange']} — capturar rate"
+                        self._scanned_events.add(post_key)
+                        break
+
+        # Trigger scan if needed (outside lock)
+        if scan_reason:
+            log.info(f"Scan trigger: {scan_reason}")
+            try:
+                self._run_scan()
+            except Exception as e:
+                log.error(f"Triggered scan failed: {e}")
+
+        # Process earnings and alerts with current data
+        with self.state_manager.lock:
+            s = self.state_manager.state
+            all_data = s.get("all_data", [])
+            positions = s.get("positions", [])
+
+            if all_data and positions:
+                self._refresh_mins_next(all_data, time.time())
+                self._update_earnings(s, all_data)
+                alerts = self._check_alerts(s, all_data)
+                s["alerts"] = alerts
+                self.state_manager.save()
+
+        # Send WhatsApp alerts outside lock
+        if alerts and self.email_notifier:
+            try:
+                sent = self.email_notifier.send_alerts(alerts)
+                if sent:
+                    log.info(f"Sent {sent} WhatsApp alert(s)")
+            except Exception as e:
+                log.error(f"WhatsApp error: {e}")
+
+        # Cleanup old event keys (keep only recent ones)
+        self._cleanup_events()
+
+    def _refresh_mins_next(self, all_data: list, now: float):
+        """Recalculate mins_next from next_funding_ts. Zero API calls."""
+        for d in all_data:
+            nts = d.get("next_funding_ts", 0)
+            if nts and nts > 0:
+                d["mins_next"] = max(0, (nts / 1000 - now) / 60)
+
+    def _cleanup_events(self):
+        """Remove old scanned events to avoid memory growth."""
+        if len(self._scanned_events) > 200:
+            self._scanned_events.clear()
+
+    # ── Scan (called only by triggers or manual) ──────────────
 
     def _run_scan(self):
         with self._scan_lock:
@@ -214,6 +249,18 @@ class ScannerWorker:
             f"{len(all_data)} pairs, {n_sp} spot-perp, {n_cx} cross-exchange"
         )
 
+    # ── Data helpers ──────────────────────────────────────────
+
+    def _find_data(self, pos: dict, all_data: list) -> dict:
+        """Find current market data for a position."""
+        return next(
+            (d for d in all_data
+             if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]),
+            None,
+        )
+
+    # ── Earnings ──────────────────────────────────────────────
+
     def _update_earnings(self, state: dict, all_data: list) -> None:
         """Accumulate real earnings based on funding payment timestamps."""
         now = time.time()
@@ -236,20 +283,16 @@ class ScannerWorker:
         cfr = cur["fr"]
         nts = cur.get("next_funding_ts", 0)
 
-        # Determine the last payment timestamp
         last_payment_ts = self._calc_last_payment_ts(nts, interval_secs, now)
         if last_payment_ts <= 0:
-            # Fallback: use elapsed-time method if no timestamp available
             self._update_earnings_elapsed(pos, cfr, ih, now)
             return
 
-        # How many payments happened since last update?
         last_up = pos.get("last_earn_update", pos["entry_time"] / 1000)
         payments = self._count_payments_since(last_up, last_payment_ts, interval_secs)
         if payments < 1:
             return
 
-        # Calculate earnings
         if cfr > 0:
             fut_size = pos["capital_used"] / 2
             earn_per_payment = fut_size * cfr
@@ -276,16 +319,13 @@ class ScannerWorker:
         if not long_data or not short_data:
             return
 
-        # Use the shorter interval
         long_ih = long_data.get("ih", 8)
         short_ih = short_data.get("ih", 8)
         min_ih = min(long_ih, short_ih)
         interval_secs = min_ih * 3600
 
-        # Try timestamp-based detection
         short_nts = short_data.get("next_funding_ts", 0)
         long_nts = long_data.get("next_funding_ts", 0)
-        # Use whichever has a valid next timestamp
         nts = short_nts if short_nts > 0 else long_nts
 
         last_payment_ts = self._calc_last_payment_ts(nts, interval_secs, now)
@@ -294,14 +334,12 @@ class ScannerWorker:
         if last_payment_ts > 0:
             payments = self._count_payments_since(last_up, last_payment_ts, interval_secs)
         else:
-            # Fallback: elapsed time
             elapsed_h = (now - last_up) / 3600
             payments = int(elapsed_h / min_ih)
 
         if payments < 1:
             return
 
-        # Net earnings
         fut_size = pos["capital_used"] / 2
         short_fr = short_data["fr"]
         long_fr = long_data["fr"]
@@ -314,22 +352,14 @@ class ScannerWorker:
 
     def _calc_last_payment_ts(self, next_funding_ts: int, interval_secs: int,
                               now: float) -> float:
-        """Calculate when the most recent funding payment occurred.
-
-        next_funding_ts is in milliseconds from the exchange.
-        Returns unix timestamp in seconds of the last payment, or 0.
-        """
         if not next_funding_ts or next_funding_ts <= 0:
             return 0
 
         next_ts_sec = next_funding_ts / 1000
 
         if next_ts_sec > now:
-            # Next payment is in the future → last payment was one interval before
             return next_ts_sec - interval_secs
         else:
-            # next_funding_ts is in the past (stale data from last scan)
-            # Walk forward to find the actual last payment before now
             ts = next_ts_sec
             while ts + interval_secs <= now:
                 ts += interval_secs
@@ -337,11 +367,9 @@ class ScannerWorker:
 
     def _count_payments_since(self, last_update: float, last_payment_ts: float,
                               interval_secs: int) -> int:
-        """Count how many funding payments occurred between last_update and last_payment_ts."""
         if last_payment_ts <= last_update:
             return 0
 
-        # Walk backwards from last_payment to count payments after last_update
         count = 0
         ts = last_payment_ts
         while ts > last_update:
@@ -388,6 +416,8 @@ class ScannerWorker:
 
         if earned_now > 0:
             log.info(f"  +${earned_now:.4f} {pos['symbol']} ({full_ivs}ivs @ {rate*100:.4f}%)")
+
+    # ── Alerts ────────────────────────────────────────────────
 
     def _check_alerts(self, state: dict, all_data: list) -> list:
         """Check positions for alerts: rate reversal, rate drop, pre-payment."""
