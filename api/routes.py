@@ -42,11 +42,14 @@ def init_routes(app, state_manager, scanner_worker, config):
                     "max_positions": s.get("max_positions", 5),
                     "alert_minutes_before": s.get("alert_minutes_before", 5),
                     "email_enabled": s.get("email_enabled", False),
+                    "notify_method": s.get("notify_method", "whatsapp"),
                     "smtp_host": s.get("smtp_host", "smtp.gmail.com"),
                     "smtp_port": s.get("smtp_port", 587),
                     "smtp_user": s.get("smtp_user", ""),
                     "smtp_password": "***" if s.get("smtp_password") else "",
                     "email_to": s.get("email_to", ""),
+                    "wa_phone": s.get("wa_phone", ""),
+                    "wa_apikey": s.get("wa_apikey", ""),
                 })
         # POST — update config
         data = flask_req.json or {}
@@ -68,9 +71,11 @@ def init_routes(app, state_manager, scanner_worker, config):
                 s["max_positions"] = int(data["max_positions"])
             if "alert_minutes_before" in data:
                 s["alert_minutes_before"] = int(data["alert_minutes_before"])
-            # Email settings
+            # Notification settings
             if "email_enabled" in data:
                 s["email_enabled"] = bool(data["email_enabled"])
+            if "notify_method" in data:
+                s["notify_method"] = str(data["notify_method"])
             if "smtp_host" in data:
                 s["smtp_host"] = str(data["smtp_host"])
             if "smtp_port" in data:
@@ -81,17 +86,14 @@ def init_routes(app, state_manager, scanner_worker, config):
                 s["smtp_password"] = str(data["smtp_password"])
             if "email_to" in data:
                 s["email_to"] = str(data["email_to"])
+            if "wa_phone" in data:
+                s["wa_phone"] = str(data["wa_phone"]).strip()
+            if "wa_apikey" in data:
+                s["wa_apikey"] = str(data["wa_apikey"]).strip()
 
-            # Update email notifier if present
+            # Sync notifier
             if scanner_worker.email_notifier:
-                n = scanner_worker.email_notifier
-                n.enabled = s.get("email_enabled", False)
-                n.smtp_host = s.get("smtp_host", "smtp.gmail.com")
-                n.smtp_port = s.get("smtp_port", 587)
-                n.smtp_user = s.get("smtp_user", "")
-                n.smtp_password = s.get("smtp_password", "")
-                n.email_to = s.get("email_to", "")
-                n.email_from = s.get("smtp_user", "")
+                scanner_worker.email_notifier._sync_from_state()
 
             state_manager.save()
             return jsonify({"ok": True, "msg": "Configuracion guardada"})
@@ -289,46 +291,41 @@ def init_routes(app, state_manager, scanner_worker, config):
         threading.Thread(target=scanner_worker._run_scan, daemon=True).start()
         return jsonify({"ok": True})
 
-    # ── Test Email ─────────────────────────────────────────────
+    # ── Test Notification ────────────────────────────────────
     @app.route("/api/test_email", methods=["POST"])
-    def api_test_email():
-        """Send a test email using current state config."""
-        if not scanner_worker.email_notifier:
-            return jsonify({"ok": False, "msg": "Email notifier no disponible"})
+    def api_test_notification():
+        """Send a test notification (WhatsApp or Email)."""
+        n = scanner_worker.email_notifier
+        if not n:
+            return jsonify({"ok": False, "msg": "Notifier no disponible"})
 
-        with state_manager.lock:
-            s = state_manager.state
-            n = scanner_worker.email_notifier
-            n.enabled = True
-            n.smtp_host = s.get("smtp_host", "smtp.gmail.com")
-            n.smtp_port = s.get("smtp_port", 587)
-            n.smtp_user = s.get("smtp_user", "")
-            n.smtp_password = s.get("smtp_password", "")
-            n.email_to = s.get("email_to", "")
-            n.email_from = s.get("smtp_user", "")
+        # Sync latest config and force enabled for test
+        n._sync_from_state()
+        method = n.notify_method
+        prev_enabled = n.enabled
+        n.enabled = True
 
-        if not all([n.smtp_user, n.smtp_password, n.email_to]):
-            return jsonify({"ok": False, "msg": "Configuracion SMTP incompleta"})
-
+        # Test connection first
         conn = n.test_connection()
         if not conn["ok"]:
-            return jsonify({"ok": False, "msg": f"SMTP error: {conn['error']}"})
+            n.enabled = prev_enabled
+            return jsonify({"ok": False, "msg": conn["error"]})
 
+        # Send test alert
         test_alert = {
             "type": "TEST",
             "severity": "INFO",
             "symbol": "TEST",
             "exchange": "Test",
-            "message": "Email de prueba del Funding Bot v8.0",
+            "message": "Prueba de notificacion del Funding Bot v8.0",
         }
         sent = n.send_alert(test_alert)
-
-        with state_manager.lock:
-            n.enabled = state_manager.state.get("email_enabled", False)
+        n.enabled = prev_enabled
 
         if sent:
-            return jsonify({"ok": True, "msg": f"Email enviado a {n.email_to}"})
-        return jsonify({"ok": False, "msg": "Email no enviado (posible cooldown)"})
+            dest = n.wa_phone if method == "whatsapp" else n.email_to
+            return jsonify({"ok": True, "msg": f"Enviado via {method} a {dest}"})
+        return jsonify({"ok": False, "msg": "No enviado (posible cooldown de 5min)"})
 
     # ── Alerts ─────────────────────────────────────────────────
     @app.route("/api/alerts")
