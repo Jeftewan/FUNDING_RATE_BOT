@@ -30,6 +30,7 @@ class FundingRate:
             "symbol": self.symbol, "pair": self.pair, "exchange": self.exchange,
             "fr": self.rate, "price": self.price, "vol24h": self.volume_24h,
             "ih": self.interval_hours, "ipd": self.payments_per_day,
+            "next_funding_ts": self.next_funding_ts,
             "mins_next": self.mins_to_next,
         }
 
