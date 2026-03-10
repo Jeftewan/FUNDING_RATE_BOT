@@ -1,7 +1,9 @@
-"""Email alert notifications via SMTP — v8.0 reads config from state."""
+"""Notification system — WhatsApp (CallMeBot) + Email SMTP."""
 import smtplib
 import logging
 import time
+import urllib.request
+import urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -14,14 +16,16 @@ class EmailNotifier:
         self.state_manager = state_manager
         self._sent_cache = {}
         self._cooldown_seconds = 300
-
-        # Read initial config from state
         self._sync_from_state()
 
     def _sync_from_state(self):
-        """Sync email config from state manager."""
+        """Sync notification config from state manager."""
         s = self.state_manager.state
+        # General
         self.enabled = s.get("email_enabled", False)
+        self.notify_method = s.get("notify_method", "email")  # "email", "whatsapp"
+
+        # SMTP config
         self.smtp_host = s.get("smtp_host", "smtp.gmail.com")
         self.smtp_port = s.get("smtp_port", 587)
         self.smtp_user = s.get("smtp_user", "")
@@ -29,11 +33,21 @@ class EmailNotifier:
         self.email_to = s.get("email_to", "")
         self.email_from = s.get("smtp_user", "")
 
-        if self.enabled and not all([self.smtp_user, self.smtp_password, self.email_to]):
-            self.enabled = False
+        # WhatsApp (CallMeBot) config
+        self.wa_phone = s.get("wa_phone", "")
+        self.wa_apikey = s.get("wa_apikey", "")
+
+        # Validate
+        if self.enabled:
+            if self.notify_method == "email":
+                if not all([self.smtp_user, self.smtp_password, self.email_to]):
+                    self.enabled = False
+            elif self.notify_method == "whatsapp":
+                if not all([self.wa_phone, self.wa_apikey]):
+                    self.enabled = False
 
     def send_alert(self, alert: dict) -> bool:
-        """Send a single alert via email. Returns True if sent."""
+        """Send a single alert. Returns True if sent."""
         self._sync_from_state()
         if not self.enabled:
             return False
@@ -45,17 +59,22 @@ class EmailNotifier:
                 return False
 
         try:
-            subject, body = self._format_alert(alert)
-            self._send_email(subject, body)
+            if self.notify_method == "whatsapp":
+                text = self._format_whatsapp(alert)
+                self._send_whatsapp(text)
+            else:
+                subject, body = self._format_email_alert(alert)
+                self._send_email(subject, body)
+
             self._sent_cache[alert_key] = now
-            log.info(f"Alert email sent: {subject}")
+            log.info(f"Alert sent ({self.notify_method}): {alert.get('type')} {alert.get('symbol')}")
             return True
         except Exception as e:
-            log.error(f"Email send failed: {e}")
+            log.error(f"Notification send failed ({self.notify_method}): {e}")
             return False
 
     def send_alerts(self, alerts: list) -> int:
-        """Send multiple alerts, returns count of emails sent."""
+        """Send multiple alerts, returns count sent."""
         self._sync_from_state()
         if not self.enabled or not alerts:
             return 0
@@ -70,7 +89,73 @@ class EmailNotifier:
                 sent += 1
         return sent
 
-    def _format_alert(self, alert: dict) -> tuple:
+    # ── WhatsApp (CallMeBot) ─────────────────────────────────
+
+    def _format_whatsapp(self, alert: dict) -> str:
+        """Format alert as plain text for WhatsApp."""
+        severity = alert.get("severity", "INFO")
+        symbol = alert.get("symbol", "???")
+        exchange = alert.get("exchange", "")
+        alert_type = alert.get("type", "UNKNOWN")
+        message = alert.get("message", "")
+
+        icon = "🚨" if severity == "CRITICAL" else "⚠️" if severity == "WARNING" else "ℹ️"
+        now = datetime.now().strftime("%H:%M:%S")
+
+        lines = [
+            f"{icon} *FUNDING BOT*",
+            f"*{alert_type}*",
+            f"Token: *{symbol}*",
+        ]
+        if exchange:
+            lines.append(f"Exchange: {exchange}")
+        lines.append(f"Detalle: {message}")
+        lines.append(f"Hora: {now}")
+
+        if alert_type == "RATE_REVERSAL":
+            lines.append("\n🔴 *CERRAR POSICION INMEDIATAMENTE*")
+        elif alert_type == "RATE_DROP":
+            lines.append("\n🟡 Considerar cerrar posicion")
+        elif alert_type == "PRE_PAYMENT_UNFAVORABLE":
+            lines.append("\n🟡 Tasa desfavorable antes del pago")
+        elif alert_type == "POSITION_CLOSED":
+            lines.append("\n🟢 Posicion cerrada")
+
+        return "\n".join(lines)
+
+    def _send_whatsapp(self, text: str):
+        """Send WhatsApp message via CallMeBot API."""
+        encoded = urllib.parse.quote_plus(text)
+        url = (
+            f"https://api.callmebot.com/whatsapp.php"
+            f"?phone={self.wa_phone}"
+            f"&text={encoded}"
+            f"&apikey={self.wa_apikey}"
+        )
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = resp.getcode()
+            if status != 200:
+                body = resp.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"CallMeBot returned {status}: {body}")
+
+    def test_whatsapp(self) -> dict:
+        """Test WhatsApp connection."""
+        self._sync_from_state()
+        if not all([self.wa_phone, self.wa_apikey]):
+            return {"ok": False, "error": "Configura telefono y API key de CallMeBot"}
+        try:
+            self._send_whatsapp("✅ Funding Bot — Prueba de notificacion WhatsApp OK")
+            return {"ok": True, "error": ""}
+        except Exception as e:
+            err = str(e)[:200]
+            if "urlopen" in err or "getaddrinfo" in err:
+                return {"ok": False, "error": "Sin acceso a internet desde el servidor"}
+            return {"ok": False, "error": f"Error: {err}"}
+
+    # ── Email (SMTP) ─────────────────────────────────────────
+
+    def _format_email_alert(self, alert: dict) -> tuple:
         """Format alert into email subject and HTML body."""
         severity = alert.get("severity", "INFO")
         symbol = alert.get("symbol", "???")
@@ -150,20 +235,21 @@ class EmailNotifier:
         msg.attach(MIMEText(html_body, "html"))
 
         if self.smtp_port == 465:
-            # Direct SSL (port 465)
             with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=10) as server:
                 server.login(self.smtp_user, self.smtp_password)
                 server.sendmail(self.email_from, self.email_to, msg.as_string())
         else:
-            # STARTTLS (port 587 or other)
             with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
                 server.starttls()
                 server.login(self.smtp_user, self.smtp_password)
                 server.sendmail(self.email_from, self.email_to, msg.as_string())
 
     def test_connection(self) -> dict:
-        """Test SMTP connection. Returns {ok, error}."""
+        """Test notification connection (email or whatsapp)."""
         self._sync_from_state()
+        if self.notify_method == "whatsapp":
+            return self.test_whatsapp()
+        # SMTP test
         if not all([self.smtp_host, self.smtp_user, self.smtp_password]):
             return {"ok": False, "error": "Configuracion SMTP incompleta"}
         try:
@@ -177,7 +263,7 @@ class EmailNotifier:
             return {"ok": True, "error": ""}
         except OSError as e:
             if e.errno == 101:
-                return {"ok": False, "error": "Red no disponible — el servidor no tiene acceso a internet saliente"}
+                return {"ok": False, "error": "Red no disponible — prueba WhatsApp como alternativa"}
             if "getaddrinfo" in str(e) or "Name or service not known" in str(e):
                 return {"ok": False, "error": f"No se pudo resolver DNS para {self.smtp_host}"}
             return {"ok": False, "error": f"Error de red: {str(e)[:200]}"}

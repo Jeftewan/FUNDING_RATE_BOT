@@ -363,6 +363,12 @@ async function clearHistory(resetAll) {
 }
 
 // ── Config ────────────────────────────────────────────────────
+function toggleNotifyFields() {
+  const method = document.getElementById('cfg-notify-method').value;
+  document.getElementById('notify-wa').style.display = method === 'whatsapp' ? '' : 'none';
+  document.getElementById('notify-email').style.display = method === 'email' ? '' : 'none';
+}
+
 async function loadConfig() {
   try {
     const res = await fetch('/api/config');
@@ -376,11 +382,17 @@ async function loadConfig() {
     document.getElementById('cfg-min-days').value = cfg.min_stability_days;
     document.getElementById('cfg-alert-min').value = cfg.alert_minutes_before;
     document.getElementById('cfg-email-on').checked = cfg.email_enabled;
+    document.getElementById('cfg-notify-method').value = cfg.notify_method || 'whatsapp';
+    // WhatsApp
+    document.getElementById('cfg-wa-phone').value = cfg.wa_phone || '';
+    document.getElementById('cfg-wa-apikey').value = cfg.wa_apikey || '';
+    // Email
     document.getElementById('cfg-smtp-host').value = cfg.smtp_host;
     document.getElementById('cfg-smtp-port').value = cfg.smtp_port;
     document.getElementById('cfg-smtp-user').value = cfg.smtp_user;
     document.getElementById('cfg-smtp-pass').value = cfg.smtp_password === '***' ? '' : cfg.smtp_password;
     document.getElementById('cfg-email-to').value = cfg.email_to;
+    toggleNotifyFields();
   } catch (e) {
     console.error('loadConfig error:', e);
   }
@@ -398,6 +410,9 @@ async function saveConfig() {
     min_stability_days: parseInt(document.getElementById('cfg-min-days').value),
     alert_minutes_before: parseInt(document.getElementById('cfg-alert-min').value),
     email_enabled: document.getElementById('cfg-email-on').checked,
+    notify_method: document.getElementById('cfg-notify-method').value,
+    wa_phone: document.getElementById('cfg-wa-phone').value,
+    wa_apikey: document.getElementById('cfg-wa-apikey').value,
     smtp_host: document.getElementById('cfg-smtp-host').value,
     smtp_port: parseInt(document.getElementById('cfg-smtp-port').value),
     smtp_user: document.getElementById('cfg-smtp-user').value,
@@ -421,13 +436,14 @@ async function saveConfig() {
 
 async function testEmail() {
   document.getElementById('email-status').textContent = 'Enviando...';
+  document.getElementById('email-status').style.color = '#888';
   try {
     const res = await fetch('/api/test_email', { method: 'POST' });
     const data = await res.json();
     document.getElementById('email-status').textContent = data.msg;
     document.getElementById('email-status').style.color = data.ok ? '#22c55e' : '#ef4444';
   } catch (e) {
-    document.getElementById('email-status').textContent = 'Error';
+    document.getElementById('email-status').textContent = 'Error de conexion';
     document.getElementById('email-status').style.color = '#ef4444';
   }
 }
