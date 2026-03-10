@@ -1,6 +1,7 @@
 """Unified exchange access via CCXT for Binance, Bybit, OKX, Bitget."""
 import logging
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.models import FundingRate, FundingHistory
 
@@ -14,6 +15,9 @@ EXCHANGE_NAMES = {
     "bitget": "Bitget",
 }
 
+# Minimum seconds between API calls per exchange
+MIN_FETCH_INTERVAL = 120
+
 
 class ExchangeManager:
     def __init__(self, config):
@@ -21,6 +25,10 @@ class ExchangeManager:
         self._exchanges = {}
         self._spot_caches = {}  # {exchange: set of spot symbols}
         self._funding_intervals = {}  # {exchange: {symbol: hours}}
+        # Rate limit / ban tracking
+        self._last_fetch_ts = {}    # {exchange: timestamp}
+        self._rate_cache = {}       # {exchange: [FundingRate, ...]}
+        self._ban_until = {}        # {exchange: timestamp} — banned until
         self._init_exchanges()
 
     def _init_exchanges(self):
@@ -80,25 +88,83 @@ class ExchangeManager:
     def get_exchange(self, name: str):
         return self._exchanges.get(name.lower())
 
-    def fetch_all_funding_rates(self) -> dict:
+    def fetch_all_funding_rates(self, force: bool = False) -> dict:
         """Fetch funding rates from all exchanges in parallel.
+        Uses cache if data is fresh enough. Skips banned exchanges.
         Returns {exchange_name: [FundingRate, ...]}"""
         results = {}
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {
-                pool.submit(self._fetch_exchange_rates, name): name
-                for name in self._exchanges
-            }
-            for future in as_completed(futures):
-                name = futures[future]
-                try:
-                    rates = future.result(timeout=30)
-                    results[name] = rates
-                    log.info(f"{EXCHANGE_NAMES.get(name, name)}: {len(rates)} pairs")
-                except Exception as e:
-                    log.error(f"Fetch failed for {name}: {e}")
+        now = time.time()
+
+        # Determine which exchanges need fresh fetch vs cache
+        to_fetch = []
+        for name in self._exchanges:
+            # Check if banned
+            ban_ts = self._ban_until.get(name, 0)
+            if ban_ts > now:
+                mins_left = (ban_ts - now) / 60
+                if name not in self._rate_cache:
+                    log.warning(f"{EXCHANGE_NAMES.get(name, name)}: banned for {mins_left:.0f}min, no cache")
                     results[name] = []
+                else:
+                    log.info(f"{EXCHANGE_NAMES.get(name, name)}: banned, using cache ({len(self._rate_cache[name])} pairs)")
+                    results[name] = self._rate_cache[name]
+                continue
+
+            # Check cache freshness
+            last_ts = self._last_fetch_ts.get(name, 0)
+            if not force and (now - last_ts) < MIN_FETCH_INTERVAL and name in self._rate_cache:
+                log.debug(f"{EXCHANGE_NAMES.get(name, name)}: using cache ({now - last_ts:.0f}s old)")
+                results[name] = self._rate_cache[name]
+                continue
+
+            to_fetch.append(name)
+
+        if to_fetch:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {
+                    pool.submit(self._fetch_exchange_rates, name): name
+                    for name in to_fetch
+                }
+                for future in as_completed(futures):
+                    name = futures[future]
+                    try:
+                        rates = future.result(timeout=30)
+                        results[name] = rates
+                        self._rate_cache[name] = rates
+                        self._last_fetch_ts[name] = time.time()
+                        log.info(f"{EXCHANGE_NAMES.get(name, name)}: {len(rates)} pairs (fresh)")
+                    except Exception as e:
+                        err_str = str(e)
+                        # Detect IP ban from error message
+                        ban_ts = self._parse_ban(err_str)
+                        if ban_ts:
+                            self._ban_until[name] = ban_ts
+                            mins = (ban_ts - time.time()) / 60
+                            log.error(f"{EXCHANGE_NAMES.get(name, name)}: IP BANNED for {mins:.0f}min")
+                        else:
+                            log.error(f"Fetch failed for {name}: {e}")
+
+                        # Use cache if available
+                        if name in self._rate_cache:
+                            results[name] = self._rate_cache[name]
+                            log.info(f"{EXCHANGE_NAMES.get(name, name)}: using stale cache")
+                        else:
+                            results[name] = []
+
         return results
+
+    def _parse_ban(self, error_msg: str) -> float:
+        """Parse ban-until timestamp from exchange error. Returns unix ts or 0."""
+        # Binance: "banned until 1773147057263"
+        m = re.search(r'banned until (\d{13})', error_msg)
+        if m:
+            return int(m.group(1)) / 1000
+        # Generic rate limit — back off 10 minutes
+        if "too many" in error_msg.lower() or "rate limit" in error_msg.lower():
+            return time.time() + 600
+        if "418" in error_msg or "429" in error_msg:
+            return time.time() + 600
+        return 0
 
     def _fetch_exchange_rates(self, exchange_name: str) -> list:
         """Fetch funding rates for a single exchange using CCXT."""
@@ -179,6 +245,7 @@ class ExchangeManager:
 
         except Exception as e:
             log.error(f"Error fetching {display} rates: {e}")
+            raise  # Re-raise so fetch_all can detect bans
 
         # If volume data is missing, try fetching tickers
         if rates and all(r.volume_24h == 0 for r in rates):
@@ -388,8 +455,14 @@ class ExchangeManager:
     def get_exchange_status(self) -> dict:
         """Check connectivity for all configured exchanges."""
         status = {}
+        now = time.time()
         for name, ex in self._exchanges.items():
             display = EXCHANGE_NAMES.get(name, name)
+            ban_ts = self._ban_until.get(name, 0)
+            if ban_ts > now:
+                mins = (ban_ts - now) / 60
+                status[display] = {"ok": False, "error": f"IP banned — {mins:.0f}min restantes"}
+                continue
             try:
                 ex.fetch_time()
                 status[display] = {"ok": True, "error": ""}

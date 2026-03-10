@@ -70,7 +70,7 @@ class ScannerWorker:
                             cur = self._find_data(pos, all_data)
                             if cur:
                                 mn = cur.get("mins_next", -1)
-                                if 0 < mn <= 2 and (now - self._last_scan_ts) > 90:
+                                if 0 < mn <= 2 and (now - self._last_scan_ts) > 180:
                                     need_fresh_scan = True
                                     log.info(
                                         f"Smart scan: {pos['symbol']}@{pos['exchange']} "
