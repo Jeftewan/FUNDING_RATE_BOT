@@ -104,6 +104,7 @@ class ArbitrageScanner:
             score=sc,
             has_spot=has_spot,
             mins_to_next=fr.mins_to_next,
+            next_funding_ts=fr.next_funding_ts,
             history=hist_dict,
             stability_grade=grade,
             estimated_hold_days=est_days,
@@ -260,5 +261,6 @@ class ArbitrageScanner:
             score=sc,
             liquidation_risk=liq_risk,
             mins_to_next=min(long_fr.mins_to_next, short_fr.mins_to_next),
+            next_funding_ts=min(long_fr.next_funding_ts, short_fr.next_funding_ts),
             stability_grade=grade,
         )
