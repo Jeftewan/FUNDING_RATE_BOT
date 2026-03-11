@@ -88,12 +88,17 @@ def init_routes(app, state_manager, scanner_worker, config):
             s = state_manager.state
             min_apr = s.get("min_apr", 10)
             min_score = s.get("min_score", 40)
+            now = time.time()
 
             opps = s.get("opportunities", [])
-            filtered = [
-                o for o in opps
-                if o.get("apr", 0) >= min_apr and o.get("score", 0) >= min_score
-            ]
+            filtered = []
+            for o in opps:
+                if o.get("apr", 0) >= min_apr and o.get("score", 0) >= min_score:
+                    # Recalculate mins_to_next live
+                    nts = o.get("next_funding_ts", 0)
+                    if nts and nts > 0:
+                        o["mins_to_next"] = max(0, (nts / 1000 - now) / 60)
+                    filtered.append(o)
 
             return jsonify({
                 "opportunities": filtered,
@@ -154,6 +159,7 @@ def init_routes(app, state_manager, scanner_worker, config):
             all_data = s.get("all_data", [])
             summary = get_capital_summary(s)
             pdata = []
+            now = time.time()
 
             for pos in s["positions"]:
                 cur = next(
@@ -163,7 +169,15 @@ def init_routes(app, state_manager, scanner_worker, config):
                 )
                 cfr = cur["fr"] if cur else pos["entry_fr"]
                 cp = cur.get("price", pos.get("entry_price", 0)) if cur else pos.get("entry_price", 0)
-                mins_next = cur.get("mins_next", -1) if cur else -1
+
+                # Recalculate mins_next live from next_funding_ts
+                mins_next = -1
+                if cur:
+                    nts = cur.get("next_funding_ts", 0)
+                    if nts and nts > 0:
+                        mins_next = max(0, (nts / 1000 - now) / 60)
+                    else:
+                        mins_next = cur.get("mins_next", -1)
 
                 ih = pos.get("ih", 8)
                 el_h = (time.time() - pos["entry_time"] / 1000) / 3600
