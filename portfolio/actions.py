@@ -21,9 +21,14 @@ def calculate_position_estimate(opportunity: dict, capital: float,
     """
     mode = opportunity.get("mode", "spot_perp")
     fr = abs(opportunity.get("funding_rate", opportunity.get("rate_differential", 0)))
-    ipd = opportunity.get("payments_per_day", 3)
     vol = opportunity.get("volume_24h", 1e6)
     price = opportunity.get("price", 0)
+
+    if mode == "cross_exchange":
+        # Use minimum of both sides' payments per day
+        ipd = min(opportunity.get("long_ppd", 3), opportunity.get("short_ppd", 3))
+    else:
+        ipd = opportunity.get("payments_per_day", 3)
 
     if mode == "spot_perp":
         fees = calculate_spot_perp_fees(opportunity["exchange"], capital, vol)
