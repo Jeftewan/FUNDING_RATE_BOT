@@ -95,9 +95,11 @@ def _calculate_sl_tp(price: float, leverage: int, exchange: str,
 
     if mode == "spot_perp":
         # Spot-perp hedge: Long SPOT + Short PERP
-        # SL is on the PERP (short) side — liquidation if price rises
-        # TP is on the SPOT side — if price drops, spot loses but short gains
-        # (symmetric: closing both at TP locks profit on perp side)
+        # Risk: price rises → short perp loses → liquidation
+        # Exit plan: when price hits SL level, close BOTH sides:
+        #   - Close short perp at a LOSS (SL)
+        #   - Sell spot at a PROFIT (TP) — bought lower, sell higher
+        # So SL perp price = TP spot price (same level, above entry)
         liq_dist_pct = (1 / leverage) - mm
         liq_price_short = price * (1 + liq_dist_pct)
 
@@ -105,15 +107,14 @@ def _calculate_sl_tp(price: float, leverage: int, exchange: str,
         sl_price = price * (1 + liq_dist_pct * SL_SAFETY_PCT)
         sl_pct = (sl_price / price - 1) * 100
 
-        # TP on spot: symmetric distance below entry (price going DOWN)
-        # When price drops this much, close both — perp profits, spot loses
-        tp_price = price * (1 - liq_dist_pct * SL_SAFETY_PCT)
-        tp_pct = (1 - tp_price / price) * 100
+        # TP on spot: SAME price as SL perp (price went UP = spot profit)
+        tp_price = sl_price
+        tp_pct = sl_pct
 
         return {
             "sl_tp": {
                 "mode": "spot_perp",
-                "entry_price": price,
+                "entry_price": round(price, 4),
                 "perp_sl_price": round(sl_price, 4),
                 "perp_sl_pct": round(sl_pct, 2),
                 "perp_liq_price": round(liq_price_short, 4),
@@ -123,9 +124,12 @@ def _calculate_sl_tp(price: float, leverage: int, exchange: str,
             }
         }
     else:
-        # Cross-exchange: Long futures A + Short futures B
-        # Each side's TP = mirror of the other side's SL
-        # When one side hits SL (loss), the other side profits equivalently
+        # Cross-exchange: Long futures A + Short futures B (hedged)
+        # Long: profits when price rises, SL when price drops
+        # Short: profits when price drops, SL when price rises
+        # TP of one side = SL price of the other side (close both together)
+        #   When short hits SL (price UP) → long profits → long TP
+        #   When long hits SL (price DOWN) → short profits → short TP
         long_ex = opp.get("long_exchange", "")
         short_ex = opp.get("short_exchange", "")
         mm_long = MAINTENANCE_MARGIN.get(long_ex, 0.005)
@@ -134,37 +138,39 @@ def _calculate_sl_tp(price: float, leverage: int, exchange: str,
         long_price = opp.get("long_price", price)
         short_price = opp.get("short_price", price)
 
-        # Long side: liq if price drops
+        # Long side: liquidation if price drops
         long_liq_dist = (1 / leverage) - mm_long
         long_liq_price = long_price * (1 - long_liq_dist)
         long_sl_price = long_price * (1 - long_liq_dist * SL_SAFETY_PCT)
         long_sl_pct = (1 - long_sl_price / long_price) * 100
 
-        # Short side: liq if price rises
+        # Short side: liquidation if price rises
         short_liq_dist = (1 / leverage) - mm_short
         short_liq_price = short_price * (1 + short_liq_dist)
         short_sl_price = short_price * (1 + short_liq_dist * SL_SAFETY_PCT)
         short_sl_pct = (short_sl_price / short_price - 1) * 100
 
-        # TP: one side's TP is when the OTHER side hits its SL
-        # Long TP = price goes UP (same % as short's SL distance)
+        # TP: mirror of the other side's SL
+        # Long TP: price goes UP to short's SL level → close long at profit
+        # Use short's SL % move applied to long's entry
         long_tp_price = long_price * (1 + short_liq_dist * SL_SAFETY_PCT)
         long_tp_pct = (long_tp_price / long_price - 1) * 100
 
-        # Short TP = price goes DOWN (same % as long's SL distance)
+        # Short TP: price goes DOWN to long's SL level → close short at profit
+        # Use long's SL % move applied to short's entry
         short_tp_price = short_price * (1 - long_liq_dist * SL_SAFETY_PCT)
         short_tp_pct = (1 - short_tp_price / short_price) * 100
 
         return {
             "sl_tp": {
                 "mode": "cross_exchange",
-                "long_entry": long_price,
+                "long_entry": round(long_price, 4),
                 "long_liq_price": round(long_liq_price, 4),
                 "long_sl_price": round(long_sl_price, 4),
                 "long_sl_pct": round(long_sl_pct, 2),
                 "long_tp_price": round(long_tp_price, 4),
                 "long_tp_pct": round(long_tp_pct, 2),
-                "short_entry": short_price,
+                "short_entry": round(short_price, 4),
                 "short_liq_price": round(short_liq_price, 4),
                 "short_sl_price": round(short_sl_price, 4),
                 "short_sl_pct": round(short_sl_pct, 2),
