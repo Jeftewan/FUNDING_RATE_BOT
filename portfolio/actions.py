@@ -94,32 +94,38 @@ def _calculate_sl_tp(price: float, leverage: int, exchange: str,
     mm = MAINTENANCE_MARGIN.get(exchange, 0.005)
 
     if mode == "spot_perp":
-        # Short futures side only (spot has no liquidation)
-        # Liquidation price (short) = entry × (1 + (1/leverage) - mm)
+        # Spot-perp hedge: Long SPOT + Short PERP
+        # SL is on the PERP (short) side — liquidation if price rises
+        # TP is on the SPOT side — if price drops, spot loses but short gains
+        # (symmetric: closing both at TP locks profit on perp side)
         liq_dist_pct = (1 / leverage) - mm
         liq_price_short = price * (1 + liq_dist_pct)
 
-        # SL: 80% of the way to liquidation
+        # SL on perp: 80% of the way to liquidation (price going UP)
         sl_price = price * (1 + liq_dist_pct * SL_SAFETY_PCT)
         sl_pct = (sl_price / price - 1) * 100
 
-        # TP: symmetric distance below entry
+        # TP on spot: symmetric distance below entry (price going DOWN)
+        # When price drops this much, close both — perp profits, spot loses
         tp_price = price * (1 - liq_dist_pct * SL_SAFETY_PCT)
         tp_pct = (1 - tp_price / price) * 100
 
         return {
             "sl_tp": {
-                "short_entry": price,
-                "short_liq_price": round(liq_price_short, 4),
-                "short_sl_price": round(sl_price, 4),
-                "short_sl_pct": round(sl_pct, 2),
-                "short_tp_price": round(tp_price, 4),
-                "short_tp_pct": round(tp_pct, 2),
+                "mode": "spot_perp",
+                "entry_price": price,
+                "perp_sl_price": round(sl_price, 4),
+                "perp_sl_pct": round(sl_pct, 2),
+                "perp_liq_price": round(liq_price_short, 4),
+                "spot_tp_price": round(tp_price, 4),
+                "spot_tp_pct": round(tp_pct, 2),
                 "liq_dist_pct": round(liq_dist_pct * 100, 2),
             }
         }
     else:
-        # Cross-exchange: both sides are futures
+        # Cross-exchange: Long futures A + Short futures B
+        # Each side's TP = mirror of the other side's SL
+        # When one side hits SL (loss), the other side profits equivalently
         long_ex = opp.get("long_exchange", "")
         short_ex = opp.get("short_exchange", "")
         mm_long = MAINTENANCE_MARGIN.get(long_ex, 0.005)
@@ -140,16 +146,30 @@ def _calculate_sl_tp(price: float, leverage: int, exchange: str,
         short_sl_price = short_price * (1 + short_liq_dist * SL_SAFETY_PCT)
         short_sl_pct = (short_sl_price / short_price - 1) * 100
 
+        # TP: one side's TP is when the OTHER side hits its SL
+        # Long TP = price goes UP (same % as short's SL distance)
+        long_tp_price = long_price * (1 + short_liq_dist * SL_SAFETY_PCT)
+        long_tp_pct = (long_tp_price / long_price - 1) * 100
+
+        # Short TP = price goes DOWN (same % as long's SL distance)
+        short_tp_price = short_price * (1 - long_liq_dist * SL_SAFETY_PCT)
+        short_tp_pct = (1 - short_tp_price / short_price) * 100
+
         return {
             "sl_tp": {
+                "mode": "cross_exchange",
                 "long_entry": long_price,
                 "long_liq_price": round(long_liq_price, 4),
                 "long_sl_price": round(long_sl_price, 4),
                 "long_sl_pct": round(long_sl_pct, 2),
+                "long_tp_price": round(long_tp_price, 4),
+                "long_tp_pct": round(long_tp_pct, 2),
                 "short_entry": short_price,
                 "short_liq_price": round(short_liq_price, 4),
                 "short_sl_price": round(short_sl_price, 4),
                 "short_sl_pct": round(short_sl_pct, 2),
+                "short_tp_price": round(short_tp_price, 4),
+                "short_tp_pct": round(short_tp_pct, 2),
                 "liq_dist_pct": round(min(long_liq_dist, short_liq_dist) * 100, 2),
             }
         }
