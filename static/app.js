@@ -90,11 +90,12 @@ function renderOpps(data) {
       </div>
 
       <div class="opp-actions">
-        <input type="number" id="cap-${i}" placeholder="Capital $" class="inp-sm" style="width:100px">
+        <input type="number" id="cap-${i}" placeholder="Capital $" class="inp-sm" style="width:90px">
+        <input type="number" id="lev-${i}" placeholder="Lev" value="1" min="1" max="50" class="inp-sm" style="width:55px" title="Apalancamiento">
         <button class="btn btn-calc" onclick="calcEst('${o._id}',${i})">Calcular</button>
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${i})">Entrar</button>
-        <span class="opp-est" id="est-${i}"></span>
       </div>
+      <div class="opp-est" id="est-${i}"></div>
     </div>`;
   }).join('');
 }
@@ -116,6 +117,7 @@ function fmtVol(v) {
 
 async function calcEst(oppId, idx) {
   const cap = parseFloat(document.getElementById('cap-' + idx).value);
+  const lev = parseInt(document.getElementById('lev-' + idx).value) || 1;
   if (!cap || cap <= 0) { alert('Ingresa capital'); return; }
 
   const el = document.getElementById('est-' + idx);
@@ -125,17 +127,50 @@ async function calcEst(oppId, idx) {
     const res = await fetch('/api/calculate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ opportunity_id: oppId, capital: cap }),
+      body: JSON.stringify({ opportunity_id: oppId, capital: cap, leverage: lev }),
     });
     const data = await res.json();
     if (data.ok) {
       const e = data.estimate;
-      el.innerHTML = `
-        <span style="color:#22c55e">$${e.daily_income.toFixed(2)}/dia</span> |
-        <span style="color:#22c55e">$${e.income_3day.toFixed(2)}/3d</span> |
-        Neto: <span style="color:#fff">$${e.net_3day.toFixed(2)}</span> |
-        Fees: $${e.fees_total.toFixed(2)} |
-        BE: ${e.break_even_hours.toFixed(1)}h`;
+      let html = `
+        <div style="margin:4px 0">
+          <span style="color:#22c55e">$${e.daily_income.toFixed(2)}/dia</span> |
+          <span style="color:#22c55e">$${e.income_3day.toFixed(2)}/3d</span> |
+          Neto: <span style="color:#fff">$${e.net_3day.toFixed(2)}</span> |
+          Fees: $${e.fees_total.toFixed(2)} |
+          BE: ${e.break_even_hours.toFixed(1)}h
+          ${lev > 1 ? ` | Pos: $${e.position_size?.toFixed(0)}` : ''}
+        </div>`;
+
+      if (e.sl_tp) {
+        const s = e.sl_tp;
+        if (s.short_sl_price && !s.long_sl_price) {
+          // Spot-perp
+          html += `
+          <div style="margin-top:6px;padding:6px 8px;background:#1a1d23;border-radius:6px;font-size:12px">
+            <div style="color:#888;margin-bottom:4px">SL/TP para <b>SHORT</b> (entrada: $${s.short_entry?.toFixed(2)})</div>
+            <span style="color:#ef4444">SL: $${s.short_sl_price?.toFixed(2)} (+${s.short_sl_pct}%)</span> |
+            <span style="color:#22c55e">TP: $${s.short_tp_price?.toFixed(2)} (-${s.short_tp_pct}%)</span> |
+            <span style="color:#f59e0b">Liq: $${s.short_liq_price?.toFixed(2)} (+${s.liq_dist_pct}%)</span>
+          </div>`;
+        } else if (s.long_sl_price && s.short_sl_price) {
+          // Cross-exchange
+          html += `
+          <div style="margin-top:6px;padding:6px 8px;background:#1a1d23;border-radius:6px;font-size:12px">
+            <div style="color:#888;margin-bottom:4px">SL cross-exchange (liq dist: ${s.liq_dist_pct}%)</div>
+            <div><b>LONG</b> ($${s.long_entry?.toFixed(2)}):
+              <span style="color:#ef4444">SL: $${s.long_sl_price?.toFixed(2)} (-${s.long_sl_pct}%)</span> |
+              <span style="color:#f59e0b">Liq: $${s.long_liq_price?.toFixed(2)}</span>
+            </div>
+            <div><b>SHORT</b> ($${s.short_entry?.toFixed(2)}):
+              <span style="color:#ef4444">SL: $${s.short_sl_price?.toFixed(2)} (+${s.short_sl_pct}%)</span> |
+              <span style="color:#f59e0b">Liq: $${s.short_liq_price?.toFixed(2)}</span>
+            </div>
+          </div>`;
+        }
+      }
+
+      el.innerHTML = html;
     } else {
       el.textContent = data.msg;
       el.style.color = '#ef4444';
@@ -147,14 +182,15 @@ async function calcEst(oppId, idx) {
 
 async function enterPosition(oppId, idx) {
   const cap = parseFloat(document.getElementById('cap-' + idx).value);
+  const lev = parseInt(document.getElementById('lev-' + idx).value) || 1;
   if (!cap || cap <= 0) { alert('Ingresa capital primero'); return; }
-  if (!confirm(`Abrir posicion con $${cap}?`)) return;
+  if (!confirm(`Abrir posicion con $${cap} x${lev}?`)) return;
 
   try {
     const res = await fetch('/api/open_position', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ opportunity_id: oppId, capital: cap }),
+      body: JSON.stringify({ opportunity_id: oppId, capital: cap, leverage: lev }),
     });
     const data = await res.json();
     if (data.ok) {

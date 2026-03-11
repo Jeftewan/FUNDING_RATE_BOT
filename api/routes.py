@@ -111,10 +111,11 @@ def init_routes(app, state_manager, scanner_worker, config):
     # ── Calculate (preview before opening) ─────────────────────
     @app.route("/api/calculate", methods=["POST"])
     def api_calculate():
-        """Calculate estimated returns for an opportunity with given capital."""
+        """Calculate estimated returns + SL/TP for an opportunity."""
         data = flask_req.json or {}
         opp_id = data.get("opportunity_id", "")
         capital = float(data.get("capital", 0))
+        leverage = max(1, int(data.get("leverage", 1)))
 
         if capital <= 0:
             return jsonify({"ok": False, "msg": "Capital debe ser mayor a 0"})
@@ -125,7 +126,7 @@ def init_routes(app, state_manager, scanner_worker, config):
             if not opp:
                 return jsonify({"ok": False, "msg": "Oportunidad no encontrada"})
 
-            estimate = calculate_position_estimate(opp, capital)
+            estimate = calculate_position_estimate(opp, capital, leverage)
             return jsonify({"ok": True, "estimate": estimate})
 
     # ── Open Position ──────────────────────────────────────────
