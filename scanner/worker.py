@@ -1,9 +1,10 @@
-"""Background monitor — v8.2 minimal API calls.
+"""Background monitor — v8.3 minimal API calls.
 
-Scans ONLY happen in 3 moments:
+Scans happen in 4 moments:
 1. ~10 min before a funding payment (verify rate is still good)
 2. At payment time (get actual rate for earnings)
-3. Manual scan (user clicks button)
+3. 5 min after payment (refresh to get NEW next_funding_ts)
+4. Manual scan (user clicks button)
 
 NO periodic scan loop. Monitor runs every 30s checking timestamps
 locally (zero API calls) and triggers scans only when needed.
@@ -19,6 +20,8 @@ log = logging.getLogger("bot")
 PRE_PAYMENT_SCAN_MINS = 10
 # Payment scan: minutes after payment to fetch actual rate used
 POST_PAYMENT_SCAN_MINS = 1
+# Refresh scan: seconds after payment scan to refresh next_funding_ts
+REFRESH_AFTER_PAYMENT_SECS = 5 * 60  # 5 minutes
 
 
 class ScannerWorker:
@@ -36,6 +39,9 @@ class ScannerWorker:
         # Track which payment windows we already scanned for
         # Key: "{symbol}_{exchange}_{payment_ts}" → avoids duplicate scans
         self._scanned_events = set()
+        # Momento 3: pending refresh scans after payment
+        # Key: "refresh_{sym_key}_{nts}" → value: timestamp when to trigger
+        self._pending_refreshes = {}
 
     def start(self):
         if self._started:
@@ -70,6 +76,13 @@ class ScannerWorker:
         alerts = []
         now = time.time()
 
+        # Momento 3: Check pending refresh scans (5 min after payment)
+        for rkey, trigger_at in list(self._pending_refreshes.items()):
+            if now >= trigger_at:
+                scan_reason = f"Refresh post-pago ({rkey})"
+                del self._pending_refreshes[rkey]
+                break
+
         with self.state_manager.lock:
             s = self.state_manager.state
             all_data = s.get("all_data", [])
@@ -83,35 +96,41 @@ class ScannerWorker:
             # Recalculate mins_next from stored timestamps (no API call)
             self._refresh_mins_next(all_data, now)
 
-            # Check each position for scan triggers
-            for pos in positions:
-                cur = self._find_data(pos, all_data)
-                if not cur:
-                    continue
+            # Check each position for scan triggers (only if no refresh pending)
+            if not scan_reason:
+                for pos in positions:
+                    cur = self._find_data(pos, all_data)
+                    if not cur:
+                        continue
 
-                mn = cur.get("mins_next", -1)
-                if mn < 0:
-                    continue
+                    mn = cur.get("mins_next", -1)
+                    if mn < 0:
+                        continue
 
-                sym_key = f"{pos['symbol']}_{pos['exchange']}"
-                nts = cur.get("next_funding_ts", 0)
-                event_key = f"{sym_key}_{nts}"
+                    sym_key = f"{pos['symbol']}_{pos['exchange']}"
+                    nts = cur.get("next_funding_ts", 0)
+                    event_key = f"{sym_key}_{nts}"
 
-                # Momento 1: ~10 min antes del pago → verificar rate
-                pre_key = f"pre_{event_key}"
-                if PRE_PAYMENT_SCAN_MINS >= mn > POST_PAYMENT_SCAN_MINS:
-                    if pre_key not in self._scanned_events:
-                        scan_reason = f"Pre-pago {pos['symbol']}@{pos['exchange']} en {mn:.0f}min"
-                        self._scanned_events.add(pre_key)
-                        break
+                    # Momento 1: ~10 min antes del pago → verificar rate
+                    pre_key = f"pre_{event_key}"
+                    if PRE_PAYMENT_SCAN_MINS >= mn > POST_PAYMENT_SCAN_MINS:
+                        if pre_key not in self._scanned_events:
+                            scan_reason = f"Pre-pago {pos['symbol']}@{pos['exchange']} en {mn:.0f}min"
+                            self._scanned_events.add(pre_key)
+                            break
 
-                # Momento 2: Justo despues del pago → obtener rate real
-                post_key = f"post_{event_key}"
-                if mn <= POST_PAYMENT_SCAN_MINS:
-                    if post_key not in self._scanned_events:
-                        scan_reason = f"Pago {pos['symbol']}@{pos['exchange']} — capturar rate"
-                        self._scanned_events.add(post_key)
-                        break
+                    # Momento 2: Justo despues del pago → obtener rate real
+                    # Also schedule Momento 3 (refresh 5min later)
+                    post_key = f"post_{event_key}"
+                    if mn <= POST_PAYMENT_SCAN_MINS:
+                        if post_key not in self._scanned_events:
+                            scan_reason = f"Pago {pos['symbol']}@{pos['exchange']} — capturar rate"
+                            self._scanned_events.add(post_key)
+                            # Schedule refresh scan 5 min from now
+                            refresh_key = f"{sym_key}_{nts}"
+                            self._pending_refreshes[refresh_key] = now + REFRESH_AFTER_PAYMENT_SECS
+                            log.info(f"Refresh programado en 5min para {pos['symbol']}@{pos['exchange']}")
+                            break
 
         # Trigger scan if needed (outside lock)
         if scan_reason:
