@@ -144,34 +144,42 @@ async function calcEst(oppId, idx) {
 
       if (e.sl_tp) {
         const s = e.sl_tp;
+        const p = (v) => v != null ? v.toFixed(4) : '?';
         if (s.mode === 'spot_perp') {
-          // Spot-perp: SL en Perp (short), TP en Spot
+          // Spot-perp: cuando precio sube al SL del short, cierras ambos
+          // SL en Perp (pierdes en short) + TP en Spot (vendes con ganancia)
+          // Ambos al MISMO precio (arriba de entrada)
           html += `
           <div style="margin-top:6px;padding:6px 8px;background:#1a1d23;border-radius:6px;font-size:12px">
-            <div style="color:#888;margin-bottom:4px">Hedge Spot+Perp (entrada: $${s.entry_price?.toFixed(2)})</div>
-            <div>
-              <span style="color:#ef4444">SL Perp: $${s.perp_sl_price?.toFixed(2)} (+${s.perp_sl_pct}%)</span> |
-              <span style="color:#22c55e">TP Spot: $${s.spot_tp_price?.toFixed(2)} (-${s.spot_tp_pct}%)</span>
+            <div style="color:#888;margin-bottom:4px">Hedge Spot+Perp (entrada: $${p(s.entry_price)})</div>
+            <div style="margin-bottom:2px">
+              <span style="color:#ef4444">SL Perp (short): $${p(s.perp_sl_price)} (+${s.perp_sl_pct}%)</span>
+            </div>
+            <div style="margin-bottom:2px">
+              <span style="color:#22c55e">TP Spot (vender): $${p(s.spot_tp_price)} (+${s.spot_tp_pct}%)</span>
             </div>
             <div style="color:#666;margin-top:2px">
-              Liq perp: $${s.perp_liq_price?.toFixed(2)} (+${s.liq_dist_pct}%)
+              Liq perp: $${p(s.perp_liq_price)} (+${s.liq_dist_pct}%) |
+              <span style="color:#999">Cierre: ambos al mismo precio</span>
             </div>
           </div>`;
         } else if (s.mode === 'cross_exchange') {
-          // Cross-exchange: TP de un lado = SL del otro
+          // Cross-exchange: TP de un lado = SL del otro (cierre conjunto)
           html += `
           <div style="margin-top:6px;padding:6px 8px;background:#1a1d23;border-radius:6px;font-size:12px">
             <div style="color:#888;margin-bottom:4px">Cross-Exchange (liq dist: ${s.liq_dist_pct}%)</div>
-            <div><b>LONG</b> ($${s.long_entry?.toFixed(2)}):
-              <span style="color:#ef4444">SL: $${s.long_sl_price?.toFixed(2)} (-${s.long_sl_pct}%)</span> |
-              <span style="color:#22c55e">TP: $${s.long_tp_price?.toFixed(2)} (+${s.long_tp_pct}%)</span>
+            <div style="margin-bottom:3px"><b>LONG</b> (entrada: $${p(s.long_entry)}):
+              <br><span style="color:#ef4444">&nbsp;SL: $${p(s.long_sl_price)} (-${s.long_sl_pct}%)</span> &nbsp;
+              <span style="color:#22c55e">TP: $${p(s.long_tp_price)} (+${s.long_tp_pct}%)</span>
+              <span style="color:#666"> | Liq: $${p(s.long_liq_price)}</span>
             </div>
-            <div><b>SHORT</b> ($${s.short_entry?.toFixed(2)}):
-              <span style="color:#ef4444">SL: $${s.short_sl_price?.toFixed(2)} (+${s.short_sl_pct}%)</span> |
-              <span style="color:#22c55e">TP: $${s.short_tp_price?.toFixed(2)} (-${s.short_tp_pct}%)</span>
+            <div style="margin-bottom:3px"><b>SHORT</b> (entrada: $${p(s.short_entry)}):
+              <br><span style="color:#ef4444">&nbsp;SL: $${p(s.short_sl_price)} (+${s.short_sl_pct}%)</span> &nbsp;
+              <span style="color:#22c55e">TP: $${p(s.short_tp_price)} (-${s.short_tp_pct}%)</span>
+              <span style="color:#666"> | Liq: $${p(s.short_liq_price)}</span>
             </div>
-            <div style="color:#666;margin-top:2px;font-size:11px">
-              Liq Long: $${s.long_liq_price?.toFixed(2)} | Liq Short: $${s.short_liq_price?.toFixed(2)}
+            <div style="color:#999;margin-top:2px;font-size:11px">
+              TP Long = SL Short (precio sube) | TP Short = SL Long (precio baja)
             </div>
           </div>`;
         }
