@@ -15,6 +15,17 @@ log = logging.getLogger("bot")
 MIN_FETCH_INTERVAL = 120  # seconds between fetches per exchange
 
 
+def _calc_next_hourly_ts() -> int:
+    """Calculate the next hour-boundary timestamp in ms.
+
+    Used for DeFi protocols with hourly funding that don't expose
+    a next-payment timestamp in their API.
+    """
+    now = time.time()
+    next_hour = (int(now / 3600) + 1) * 3600
+    return int(next_hour * 1000)
+
+
 class DefiExchangeManager:
     """Fetches funding rates from DeFi perpetual exchanges."""
 
@@ -102,7 +113,7 @@ class DefiExchangeManager:
                 volume_24h=vol24h,
                 interval_hours=1,
                 payments_per_day=24,
-                next_funding_ts=0,  # Hyperliquid pays hourly, no single ts
+                next_funding_ts=_calc_next_hourly_ts(),
             ))
 
         return rates
@@ -193,7 +204,7 @@ class DefiExchangeManager:
                 volume_24h=0,  # GMX doesn't expose 24h vol in this endpoint
                 interval_hours=1,
                 payments_per_day=24,
-                next_funding_ts=0,
+                next_funding_ts=_calc_next_hourly_ts(),
             )
         except Exception as e:
             log.debug(f"GMX market parse error: {e}")
@@ -281,7 +292,7 @@ class DefiExchangeManager:
                     volume_24h=0,
                     interval_hours=1,
                     payments_per_day=24,
-                    next_funding_ts=0,
+                    next_funding_ts=_calc_next_hourly_ts(),
                 ))
             except (ValueError, TypeError):
                 continue
@@ -349,7 +360,7 @@ class DefiExchangeManager:
                     volume_24h=0,
                     interval_hours=1,
                     payments_per_day=24,
-                    next_funding_ts=0,
+                    next_funding_ts=_calc_next_hourly_ts(),
                 ))
             except Exception as e:
                 log.debug(f"Extended {market} error: {e}")
