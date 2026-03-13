@@ -11,7 +11,7 @@ log = logging.getLogger("bot")
 api = Blueprint("api", __name__)
 
 
-def init_routes(app, state_manager, scanner_worker, config):
+def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
     """Register all routes on the Flask app."""
 
     @app.before_request
@@ -108,6 +108,27 @@ def init_routes(app, state_manager, scanner_worker, config):
                 "scan_count": s.get("scan_count", 0),
             })
 
+    # ── DeFi Opportunities ──────────────────────────────────────
+    @app.route("/api/defi_opportunities")
+    def api_defi_opportunities():
+        """DeFi opportunity list sorted by score."""
+        with state_manager.lock:
+            s = state_manager.state
+            now = time.time()
+
+            opps = s.get("defi_opportunities", [])
+            for o in opps:
+                nts = o.get("next_funding_ts", 0)
+                if nts and nts > 0:
+                    o["mins_to_next"] = max(0, (nts / 1000 - now) / 60)
+
+            return jsonify({
+                "opportunities": opps,
+                "total_unfiltered": len(opps),
+                "last_scan": s.get("last_scan_time", "—"),
+                "scan_count": s.get("scan_count", 0),
+            })
+
     # ── Calculate (preview before opening) ─────────────────────
     @app.route("/api/calculate", methods=["POST"])
     def api_calculate():
@@ -122,7 +143,10 @@ def init_routes(app, state_manager, scanner_worker, config):
 
         with state_manager.lock:
             opps = state_manager.get("opportunities", [])
+            defi_opps = state_manager.get("defi_opportunities", [])
             opp = next((o for o in opps if o.get("_id") == opp_id), None)
+            if not opp:
+                opp = next((o for o in defi_opps if o.get("_id") == opp_id), None)
             if not opp:
                 return jsonify({"ok": False, "msg": "Oportunidad no encontrada"})
 
@@ -140,7 +164,10 @@ def init_routes(app, state_manager, scanner_worker, config):
         with state_manager.lock:
             s = state_manager.state
             opps = s.get("opportunities", [])
+            defi_opps = s.get("defi_opportunities", [])
             opp = next((o for o in opps if o.get("_id") == opp_id), None)
+            if not opp:
+                opp = next((o for o in defi_opps if o.get("_id") == opp_id), None)
             if not opp:
                 return jsonify({"ok": False, "msg": "Oportunidad no encontrada"})
 

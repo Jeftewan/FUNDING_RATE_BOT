@@ -39,4 +39,13 @@ class Config:
         "Bybit": {"spot": 0.10, "fut": 0.06},
         "OKX": {"spot": 0.10, "fut": 0.05},
         "Bitget": {"spot": 0.10, "fut": 0.06},
+        # DeFi exchanges (perp-only, no spot fees)
+        "Hyperliquid": {"spot": 0, "fut": 0.035},
+        "GMX": {"spot": 0, "fut": 0.07},
+        "Aster": {"spot": 0, "fut": 0.05},
+        "Lighter": {"spot": 0, "fut": 0.04},
+        "Extended": {"spot": 0, "fut": 0.05},
     }
+
+    # DeFi exchanges
+    DEFI_EXCHANGES = ["Hyperliquid", "GMX", "Aster", "Lighter", "Extended"]

@@ -23,14 +23,19 @@
   <div id="page-opportunities" class="page active">
     <div class="toolbar">
       <button class="btn btn-scan" onclick="forceScan()">Escanear</button>
+      <div class="sub-tabs">
+        <button class="sub-tab active" id="subtab-cex" onclick="switchSubTab('cex')">CEX</button>
+        <button class="sub-tab" id="subtab-defi" onclick="switchSubTab('defi')">DeFi</button>
+      </div>
       <div class="filter-bar">
-        <label>APR min <input type="number" id="f-apr" value="10" class="inp-sm" onchange="loadOpps()">%</label>
-        <label>Score min <input type="number" id="f-score" value="40" class="inp-sm" onchange="loadOpps()"></label>
+        <label>APR min <input type="number" id="f-apr" value="10" class="inp-sm" onchange="loadCurrentOpps()">%</label>
+        <label>Score min <input type="number" id="f-score" value="40" class="inp-sm" onchange="loadCurrentOpps()"></label>
       </div>
       <span class="count" id="opp-count">0 oportunidades</span>
     </div>
 
-    <div id="opp-list"></div>
+    <div id="opp-list-cex"></div>
+    <div id="opp-list-defi" style="display:none"></div>
   </div>
 
   <!-- ═══ POSITIONS TAB ═══ -->

@@ -26,13 +26,15 @@ REFRESH_AFTER_PAYMENT_SECS = 5 * 60  # 5 minutes
 
 class ScannerWorker:
     def __init__(self, exchange_manager, arbitrage_scanner, state_manager,
-                 coinglass_client, config, email_notifier=None):
+                 coinglass_client, config, email_notifier=None,
+                 defi_manager=None):
         self.exchange_manager = exchange_manager
         self.arb_scanner = arbitrage_scanner
         self.state_manager = state_manager
         self.coinglass = coinglass_client
         self.config = config
         self.email_notifier = email_notifier
+        self.defi_manager = defi_manager
         self._started = False
         self._last_scan_ts = 0
         self._scan_lock = threading.Lock()
@@ -225,7 +227,52 @@ class ScannerWorker:
             all_rates, min_volume=min_volume
         )
 
-        # 5. Build unified opportunities list
+        # 5. Fetch DeFi rates (parallel with CEX scan results)
+        defi_rates = {}
+        defi_data = []
+        defi_opportunities = []
+        if self.defi_manager:
+            try:
+                defi_rates = self.defi_manager.fetch_all_funding_rates()
+                for exchange, rates in defi_rates.items():
+                    for fr in rates:
+                        defi_data.append(fr.to_dict())
+
+                # DeFi cross-exchange opportunities (same logic as CEX)
+                defi_cross = self.arb_scanner.scan_cross_exchange_opportunities(
+                    defi_rates, min_volume=0  # DeFi often has low/no volume data
+                )
+                for o in defi_cross:
+                    d = o.to_dict()
+                    d["_id"] = f"{d['symbol']}_{d['long_exchange']}_{d['short_exchange']}_defi_cross"
+                    d["is_defi"] = True
+                    defi_opportunities.append(d)
+
+                # Also scan CEX vs DeFi cross-exchange
+                combined_rates = {**all_rates, **defi_rates}
+                cex_defi_cross = self.arb_scanner.scan_cross_exchange_opportunities(
+                    combined_rates, min_volume=0
+                )
+                for o in cex_defi_cross:
+                    d = o.to_dict()
+                    oid = f"{d['symbol']}_{d['long_exchange']}_{d['short_exchange']}_mixed_cross"
+                    d["_id"] = oid
+                    le = d.get("long_exchange", "")
+                    se = d.get("short_exchange", "")
+                    defi_exs = set(getattr(self.config, 'DEFI_EXCHANGES', []))
+                    is_mixed = (le in defi_exs) != (se in defi_exs)
+                    if is_mixed or (le in defi_exs and se in defi_exs):
+                        d["is_defi"] = True
+                        # Avoid duplicates
+                        if not any(x["_id"] == oid for x in defi_opportunities):
+                            defi_opportunities.append(d)
+
+                defi_opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
+                log.info(f"DeFi: {len(defi_data)} pairs, {len(defi_opportunities)} opportunities")
+            except Exception as e:
+                log.error(f"DeFi scan error: {e}")
+
+        # 6. Build unified CEX opportunities list
         opportunities = []
         for o in spot_perp_opps:
             d = o.to_dict()
@@ -239,13 +286,18 @@ class ScannerWorker:
         # Sort by score DESC
         opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
 
-        # 6. Update state
+        # 7. Update state
         status_parts = [f"{len(r)}{n[:2].upper()}" for n, r in all_rates.items() if r]
         status_str = "+".join(status_parts)
+        defi_parts = [f"{len(r)}{n[:2].upper()}" for n, r in defi_rates.items() if r]
+        if defi_parts:
+            status_str += " | DeFi:" + "+".join(defi_parts)
 
         with self.state_manager.lock:
             s = self.state_manager.state
             s["all_data"] = all_data
+            s["defi_data"] = defi_data
+            s["defi_opportunities"] = defi_opportunities
             self._update_earnings(s, all_data)
             s["opportunities"] = opportunities
             s["coinglass_data"] = cg_opps
@@ -254,10 +306,11 @@ class ScannerWorker:
             s["last_scan_time"] = datetime.now().strftime("%H:%M:%S")
             n_sp = len(spot_perp_opps)
             n_cx = len(cross_ex_opps)
+            n_defi = len(defi_opportunities)
             s["status"] = (
                 f"OK — {status_str} | "
-                f"{n_sp} spot-perp, {n_cx} cross-ex | "
-                f"{len(opportunities)} total"
+                f"{n_sp} spot-perp, {n_cx} cross-ex, {n_defi} defi | "
+                f"{len(opportunities) + n_defi} total"
             )
             s["last_error"] = ""
             self.state_manager.save()

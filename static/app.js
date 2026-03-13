@@ -1,4 +1,5 @@
 let currentTab = 'opportunities';
+let currentSubTab = 'cex';
 let refreshTimer = null;
 
 // ── Tab switching ─────────────────────────────────────────────
@@ -11,8 +12,22 @@ function switchTab(tab) {
   refresh();
 }
 
+function switchSubTab(sub) {
+  currentSubTab = sub;
+  document.querySelectorAll('.sub-tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('subtab-' + sub).classList.add('active');
+  document.getElementById('opp-list-cex').style.display = sub === 'cex' ? '' : 'none';
+  document.getElementById('opp-list-defi').style.display = sub === 'defi' ? '' : 'none';
+  loadCurrentOpps();
+}
+
+function loadCurrentOpps() {
+  if (currentSubTab === 'cex') loadOpps();
+  else loadDefiOpps();
+}
+
 function refresh() {
-  if (currentTab === 'opportunities') loadOpps();
+  if (currentTab === 'opportunities') loadCurrentOpps();
   else if (currentTab === 'positions') loadPositions();
   else if (currentTab === 'config') loadConfig();
 }
@@ -37,7 +52,7 @@ async function loadOpps() {
 
 function renderOpps(data) {
   const opps = data.opportunities || [];
-  const el = document.getElementById('opp-list');
+  const el = document.getElementById('opp-list-cex');
   document.getElementById('opp-count').textContent =
     `${opps.length} oportunidades (${data.total_unfiltered || 0} total)`;
 
@@ -96,6 +111,87 @@ function renderOpps(data) {
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${i})">Entrar</button>
       </div>
       <div class="opp-est" id="est-${i}"></div>
+    </div>`;
+  }).join('');
+}
+
+// ── DeFi Opportunities ────────────────────────────────────────
+async function loadDefiOpps() {
+  try {
+    const res = await fetch('/api/defi_opportunities');
+    const data = await res.json();
+    renderDefiOpps(data);
+    updateStatus(data);
+  } catch (e) {
+    console.error('loadDefiOpps error:', e);
+  }
+}
+
+function renderDefiOpps(data) {
+  const opps = data.opportunities || [];
+  const el = document.getElementById('opp-list-defi');
+  document.getElementById('opp-count').textContent =
+    `${opps.length} oportunidades DeFi (${data.total_unfiltered || 0} total)`;
+
+  if (!opps.length) {
+    el.innerHTML = '<div style="text-align:center;padding:40px;color:#555">Sin oportunidades DeFi — esperando escaneo</div>';
+    return;
+  }
+
+  // DeFi opps are cross-exchange, use index offset to avoid ID collision with CEX
+  const base = 1000;
+  el.innerHTML = opps.map((o, i) => {
+    const idx = base + i;
+    const isCross = true; // DeFi opps are always cross-exchange
+    const exchange = `${o.long_exchange} / ${o.short_exchange}`;
+    const grade = o.stability_grade || gradeFromScore(o.score);
+    const fr = o.rate_differential || 0;
+    const frPct = (fr * 100).toFixed(4);
+
+    // Detect mixed CEX+DeFi
+    const defiExs = ['Hyperliquid','GMX','Aster','Lighter','Extended'];
+    const le = o.long_exchange || '';
+    const se = o.short_exchange || '';
+    const isMixed = (defiExs.includes(le)) !== (defiExs.includes(se));
+    const modeLabel = isMixed ? 'CEX+DeFi' : 'DeFi-DeFi';
+
+    return `
+    <div class="opp-card" style="border-left:3px solid ${isMixed ? '#f59e0b' : '#8b5cf6'}">
+      <div class="opp-header">
+        <div>
+          <span class="opp-symbol">${o.symbol}/USDT</span>
+          <span class="opp-mode" style="background:${isMixed ? '#422006' : '#1e1b4b'};color:${isMixed ? '#f59e0b' : '#a78bfa'}">${modeLabel}</span>
+          <span style="font-size:11px;color:#888;margin-left:6px">${exchange}</span>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span class="opp-badge ${grade}">${grade}</span>
+          <span style="font-size:12px;color:#fff;font-weight:700">${o.score}/100</span>
+        </div>
+      </div>
+
+      <div class="opp-stats">
+        <div class="opp-stat"><span class="label">Diff</span><span class="value green">${frPct}%</span></div>
+        <div class="opp-stat"><span class="label">APR</span><span class="value green">${o.apr?.toFixed(1)}%</span></div>
+        <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
+        <div class="opp-stat"><span class="label">$/dia (1K)</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Neto 3d (1K)</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Fees</span><span class="value">$${(o.fees_total || o.total_fees)?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
+      </div>
+
+      <div class="opp-meta">
+        Long: ${le} ${o.long_rate ? (o.long_rate*100).toFixed(4)+'%' : '?'} (${o.long_interval_hours||'?'}h) ·
+        Short: ${se} ${o.short_rate ? (o.short_rate*100).toFixed(4)+'%' : '?'} (${o.short_interval_hours||'?'}h)
+        ${o.mins_to_next > 0 ? ` | Prox pago: ${Math.round(o.mins_to_next)}min` : ''}
+      </div>
+
+      <div class="opp-actions">
+        <input type="number" id="cap-${idx}" placeholder="Capital $" class="inp-sm" style="width:90px">
+        <input type="number" id="lev-${idx}" placeholder="Lev" value="1" min="1" max="50" class="inp-sm" style="width:55px" title="Apalancamiento">
+        <button class="btn btn-calc" onclick="calcEst('${o._id}',${idx})">Calcular</button>
+        <button class="btn btn-enter" onclick="enterPosition('${o._id}',${idx})">Entrar</button>
+      </div>
+      <div class="opp-est" id="est-${idx}"></div>
     </div>`;
   }).join('');
 }
@@ -210,7 +306,7 @@ async function enterPosition(oppId, idx) {
     const data = await res.json();
     if (data.ok) {
       showStepsModal(data);
-      loadOpps();
+      loadCurrentOpps();
     } else {
       alert(data.msg);
     }
