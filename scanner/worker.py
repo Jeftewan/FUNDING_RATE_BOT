@@ -26,13 +26,15 @@ REFRESH_AFTER_PAYMENT_SECS = 5 * 60  # 5 minutes
 
 class ScannerWorker:
     def __init__(self, exchange_manager, arbitrage_scanner, state_manager,
-                 coinglass_client, config, email_notifier=None):
+                 coinglass_client, config, email_notifier=None,
+                 defi_manager=None):
         self.exchange_manager = exchange_manager
         self.arb_scanner = arbitrage_scanner
         self.state_manager = state_manager
         self.coinglass = coinglass_client
         self.config = config
         self.email_notifier = email_notifier
+        self.defi_manager = defi_manager
         self._started = False
         self._last_scan_ts = 0
         self._scan_lock = threading.Lock()
@@ -86,51 +88,99 @@ class ScannerWorker:
         with self.state_manager.lock:
             s = self.state_manager.state
             all_data = s.get("all_data", [])
+            defi_data = s.get("defi_data", [])
             positions = s.get("positions", [])
 
             if not positions:
                 # No positions → no need for scans, just update mins_next
-                self._refresh_mins_next(all_data, now)
+                self._refresh_mins_next(all_data, now, defi_data)
                 return
 
             # Recalculate mins_next from stored timestamps (no API call)
-            self._refresh_mins_next(all_data, now)
+            self._refresh_mins_next(all_data, now, defi_data)
 
             # Check each position for scan triggers (only if no refresh pending)
+            # Collect ALL triggers first, then group by ±5 min window
             if not scan_reason:
-                for pos in positions:
-                    cur = self._find_data(pos, all_data)
-                    if not cur:
-                        continue
+                triggered_positions = []  # [(mins_next, pos_label, event_keys)]
+                combined = all_data + defi_data
 
-                    mn = cur.get("mins_next", -1)
+                for pos in positions:
+                    cur = self._find_data(pos, all_data, defi_data)
+
+                    # For cross-exchange: use the earliest funding time
+                    # between long and short sides
+                    mn = -1
+                    nts = 0
+                    if pos.get("mode") == "cross_exchange":
+                        long_ex = pos.get("long_exchange", "")
+                        short_ex = pos.get("short_exchange", pos.get("exchange", ""))
+                        long_d = next((d for d in combined if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex), None)
+                        short_d = next((d for d in combined if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex), None)
+                        candidates = [d for d in (long_d, short_d) if d and d.get("mins_next", -1) >= 0]
+                        if candidates:
+                            nearest = min(candidates, key=lambda d: d["mins_next"])
+                            mn = nearest["mins_next"]
+                            nts = nearest.get("next_funding_ts", 0)
+                    elif cur:
+                        mn = cur.get("mins_next", -1)
+                        nts = cur.get("next_funding_ts", 0)
+
                     if mn < 0:
                         continue
 
                     sym_key = f"{pos['symbol']}_{pos['exchange']}"
-                    nts = cur.get("next_funding_ts", 0)
                     event_key = f"{sym_key}_{nts}"
 
                     # Momento 1: ~10 min antes del pago → verificar rate
                     pre_key = f"pre_{event_key}"
                     if PRE_PAYMENT_SCAN_MINS >= mn > POST_PAYMENT_SCAN_MINS:
                         if pre_key not in self._scanned_events:
-                            scan_reason = f"Pre-pago {pos['symbol']}@{pos['exchange']} en {mn:.0f}min"
-                            self._scanned_events.add(pre_key)
-                            break
+                            triggered_positions.append((
+                                mn, f"Pre-pago {pos['symbol']}@{pos['exchange']} en {mn:.0f}min",
+                                [pre_key], []
+                            ))
 
                     # Momento 2: Justo despues del pago → obtener rate real
-                    # Also schedule Momento 3 (refresh 5min later)
                     post_key = f"post_{event_key}"
                     if mn <= POST_PAYMENT_SCAN_MINS:
                         if post_key not in self._scanned_events:
-                            scan_reason = f"Pago {pos['symbol']}@{pos['exchange']} — capturar rate"
-                            self._scanned_events.add(post_key)
-                            # Schedule refresh scan 5 min from now
-                            refresh_key = f"{sym_key}_{nts}"
+                            triggered_positions.append((
+                                mn, f"Pago {pos['symbol']}@{pos['exchange']}",
+                                [post_key],
+                                [(sym_key, nts)]  # schedule refresh
+                            ))
+
+                # Group triggers within ±5 min window → single scan
+                if triggered_positions:
+                    # Sort by mins_next
+                    triggered_positions.sort(key=lambda t: t[0])
+
+                    # Build groups: positions within 5 min of each other
+                    groups = []
+                    current_group = [triggered_positions[0]]
+                    for tp in triggered_positions[1:]:
+                        if tp[0] - current_group[0][0] <= 5:
+                            current_group.append(tp)
+                        else:
+                            groups.append(current_group)
+                            current_group = [tp]
+                    groups.append(current_group)
+
+                    # Take the first (most urgent) group
+                    group = groups[0]
+                    labels = [tp[1] for tp in group]
+                    scan_reason = " + ".join(labels)
+
+                    # Mark all event keys in the group as scanned
+                    for tp in group:
+                        for ek in tp[2]:
+                            self._scanned_events.add(ek)
+                        # Schedule refreshes
+                        for (sk, nts_val) in tp[3]:
+                            refresh_key = f"{sk}_{nts_val}"
                             self._pending_refreshes[refresh_key] = now + REFRESH_AFTER_PAYMENT_SECS
-                            log.info(f"Refresh programado en 5min para {pos['symbol']}@{pos['exchange']}")
-                            break
+                            log.info(f"Refresh programado en 5min para {sk}")
 
         # Trigger scan if needed (outside lock)
         if scan_reason:
@@ -144,12 +194,14 @@ class ScannerWorker:
         with self.state_manager.lock:
             s = self.state_manager.state
             all_data = s.get("all_data", [])
+            defi_data = s.get("defi_data", [])
             positions = s.get("positions", [])
+            combined = all_data + defi_data
 
-            if all_data and positions:
-                self._refresh_mins_next(all_data, time.time())
-                self._update_earnings(s, all_data)
-                alerts = self._check_alerts(s, all_data)
+            if combined and positions:
+                self._refresh_mins_next(all_data, time.time(), defi_data)
+                self._update_earnings(s, combined)
+                alerts = self._check_alerts(s, combined)
                 s["alerts"] = alerts
                 self.state_manager.save()
 
@@ -165,12 +217,18 @@ class ScannerWorker:
         # Cleanup old event keys (keep only recent ones)
         self._cleanup_events()
 
-    def _refresh_mins_next(self, all_data: list, now: float):
+    def _refresh_mins_next(self, all_data: list, now: float,
+                            defi_data: list = None):
         """Recalculate mins_next from next_funding_ts. Zero API calls."""
         for d in all_data:
             nts = d.get("next_funding_ts", 0)
             if nts and nts > 0:
                 d["mins_next"] = max(0, (nts / 1000 - now) / 60)
+        if defi_data:
+            for d in defi_data:
+                nts = d.get("next_funding_ts", 0)
+                if nts and nts > 0:
+                    d["mins_next"] = max(0, (nts / 1000 - now) / 60)
 
     def _cleanup_events(self):
         """Remove old scanned events to avoid memory growth."""
@@ -225,7 +283,52 @@ class ScannerWorker:
             all_rates, min_volume=min_volume
         )
 
-        # 5. Build unified opportunities list
+        # 5. Fetch DeFi rates (parallel with CEX scan results)
+        defi_rates = {}
+        defi_data = []
+        defi_opportunities = []
+        if self.defi_manager:
+            try:
+                defi_rates = self.defi_manager.fetch_all_funding_rates()
+                for exchange, rates in defi_rates.items():
+                    for fr in rates:
+                        defi_data.append(fr.to_dict())
+
+                # DeFi cross-exchange opportunities (same logic as CEX)
+                defi_cross = self.arb_scanner.scan_cross_exchange_opportunities(
+                    defi_rates, min_volume=0  # DeFi often has low/no volume data
+                )
+                for o in defi_cross:
+                    d = o.to_dict()
+                    d["_id"] = f"{d['symbol']}_{d['long_exchange']}_{d['short_exchange']}_defi_cross"
+                    d["is_defi"] = True
+                    defi_opportunities.append(d)
+
+                # Also scan CEX vs DeFi cross-exchange
+                combined_rates = {**all_rates, **defi_rates}
+                cex_defi_cross = self.arb_scanner.scan_cross_exchange_opportunities(
+                    combined_rates, min_volume=0
+                )
+                for o in cex_defi_cross:
+                    d = o.to_dict()
+                    oid = f"{d['symbol']}_{d['long_exchange']}_{d['short_exchange']}_mixed_cross"
+                    d["_id"] = oid
+                    le = d.get("long_exchange", "")
+                    se = d.get("short_exchange", "")
+                    defi_exs = set(getattr(self.config, 'DEFI_EXCHANGES', []))
+                    is_mixed = (le in defi_exs) != (se in defi_exs)
+                    if is_mixed or (le in defi_exs and se in defi_exs):
+                        d["is_defi"] = True
+                        # Avoid duplicates
+                        if not any(x["_id"] == oid for x in defi_opportunities):
+                            defi_opportunities.append(d)
+
+                defi_opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
+                log.info(f"DeFi: {len(defi_data)} pairs, {len(defi_opportunities)} opportunities")
+            except Exception as e:
+                log.error(f"DeFi scan error: {e}")
+
+        # 6. Build unified CEX opportunities list
         opportunities = []
         for o in spot_perp_opps:
             d = o.to_dict()
@@ -239,14 +342,19 @@ class ScannerWorker:
         # Sort by score DESC
         opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
 
-        # 6. Update state
+        # 7. Update state
         status_parts = [f"{len(r)}{n[:2].upper()}" for n, r in all_rates.items() if r]
         status_str = "+".join(status_parts)
+        defi_parts = [f"{len(r)}{n[:2].upper()}" for n, r in defi_rates.items() if r]
+        if defi_parts:
+            status_str += " | DeFi:" + "+".join(defi_parts)
 
         with self.state_manager.lock:
             s = self.state_manager.state
             s["all_data"] = all_data
-            self._update_earnings(s, all_data)
+            s["defi_data"] = defi_data
+            s["defi_opportunities"] = defi_opportunities
+            self._update_earnings(s, all_data + defi_data)
             s["opportunities"] = opportunities
             s["coinglass_data"] = cg_opps
             s["last_scan"] = time.time()
@@ -254,10 +362,11 @@ class ScannerWorker:
             s["last_scan_time"] = datetime.now().strftime("%H:%M:%S")
             n_sp = len(spot_perp_opps)
             n_cx = len(cross_ex_opps)
+            n_defi = len(defi_opportunities)
             s["status"] = (
                 f"OK — {status_str} | "
-                f"{n_sp} spot-perp, {n_cx} cross-ex | "
-                f"{len(opportunities)} total"
+                f"{n_sp} spot-perp, {n_cx} cross-ex, {n_defi} defi | "
+                f"{len(opportunities) + n_defi} total"
             )
             s["last_error"] = ""
             self.state_manager.save()
@@ -270,13 +379,22 @@ class ScannerWorker:
 
     # ── Data helpers ──────────────────────────────────────────
 
-    def _find_data(self, pos: dict, all_data: list) -> dict:
-        """Find current market data for a position."""
-        return next(
-            (d for d in all_data
-             if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]),
+    def _find_data(self, pos: dict, all_data: list,
+                    defi_data: list = None) -> dict:
+        """Find current market data for a position (searches CEX + DeFi)."""
+        sym = pos["symbol"]
+        ex = pos["exchange"]
+        result = next(
+            (d for d in all_data if d["symbol"] == sym and d["exchange"] == ex),
             None,
         )
+        if result is None and defi_data:
+            result = next(
+                (d for d in defi_data
+                 if d["symbol"] == sym and d["exchange"] == ex),
+                None,
+            )
+        return result
 
     # ── Earnings ──────────────────────────────────────────────
 

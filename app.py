@@ -45,6 +45,11 @@ from exchanges.manager import ExchangeManager
 
 exchange_manager = ExchangeManager(Config)
 
+# ── DeFi Exchange Manager ─────────────────────────────────────
+from exchanges.defi_manager import DefiExchangeManager
+
+defi_manager = DefiExchangeManager(Config)
+
 # ── Arbitrage Scanner ─────────────────────────────────────────
 from analysis.arbitrage import ArbitrageScanner
 
@@ -68,7 +73,7 @@ from scanner.worker import ScannerWorker
 
 scanner_worker = ScannerWorker(
     exchange_manager, arb_scanner, state_manager, coinglass_client, Config,
-    email_notifier=email_notifier,
+    email_notifier=email_notifier, defi_manager=defi_manager,
 )
 
 # ── Flask App ─────────────────────────────────────────────────
@@ -77,7 +82,7 @@ app = Flask(__name__,
             static_folder="static")
 
 from api.routes import init_routes
-init_routes(app, state_manager, scanner_worker, Config)
+init_routes(app, state_manager, scanner_worker, Config, defi_manager=defi_manager)
 
 s = state_manager.state
 log.info(
