@@ -263,4 +263,5 @@ class ArbitrageScanner:
             mins_to_next=min(long_fr.mins_to_next, short_fr.mins_to_next),
             next_funding_ts=min(long_fr.next_funding_ts, short_fr.next_funding_ts),
             stability_grade=grade,
+            volume_24h=max(long_fr.volume_24h, short_fr.volume_24h),
         )
