@@ -214,15 +214,15 @@ class ArbitrageScanner:
         hourly_income = daily_income / 24
         break_even_h = calculate_break_even_hours(fees["total_cost"], hourly_income)
 
-        # Consistency: check if differential was favorable in historical payments
+        # Consistency: align by timestamp into daily buckets, then check
+        # if net daily rate (short_sum*short_ppd - long_sum*long_ppd) > 0
+        # per day.  This correctly handles different payment intervals.
         consistency = 0
-        if long_hist.rates and short_hist.rates:
-            n_check = min(len(long_hist.rates), len(short_hist.rates))
-            favorable = sum(
-                1 for i in range(n_check)
-                if short_hist.rates[-(i+1)] - long_hist.rates[-(i+1)] > 0
+        if (long_hist.rates and long_hist.timestamps
+                and short_hist.rates and short_hist.timestamps):
+            consistency = self._calc_time_aligned_consistency(
+                long_hist, short_hist, long_ppd, short_ppd
             )
-            consistency = (favorable / n_check * 100) if n_check > 0 else 0
 
         fee_ratio = fees["total_cost"] / revenue_3d_usd if revenue_3d_usd > 0 else 1
         sc = score_cross_exchange(
@@ -265,3 +265,42 @@ class ArbitrageScanner:
             stability_grade=grade,
             volume_24h=max(long_fr.volume_24h, short_fr.volume_24h),
         )
+
+    @staticmethod
+    def _calc_time_aligned_consistency(
+        long_hist, short_hist, long_ppd: float, short_ppd: float
+    ) -> float:
+        """Calculate consistency by grouping rates into daily buckets.
+
+        Instead of comparing rates by array index (wrong when intervals
+        differ), we bucket each side's payments by calendar day (UTC) and
+        compute the net daily rate:
+            net = sum(short_rates_that_day) - sum(long_rates_that_day)
+        A day is "favorable" when net > 0.
+        Only days where BOTH sides have data are evaluated.
+        """
+        MS_PER_DAY = 86_400_000
+
+        def _bucket_by_day(rates, timestamps):
+            """Group rates by day (ts // MS_PER_DAY)."""
+            buckets = {}
+            for rate, ts in zip(rates, timestamps):
+                day = ts // MS_PER_DAY
+                buckets.setdefault(day, []).append(rate)
+            return buckets
+
+        long_days = _bucket_by_day(long_hist.rates, long_hist.timestamps)
+        short_days = _bucket_by_day(short_hist.rates, short_hist.timestamps)
+
+        common_days = sorted(set(long_days) & set(short_days))
+        if not common_days:
+            return 0
+
+        favorable = 0
+        for day in common_days:
+            short_sum = sum(short_days[day])
+            long_sum = sum(long_days[day])
+            if short_sum - long_sum > 0:
+                favorable += 1
+
+        return favorable / len(common_days) * 100
