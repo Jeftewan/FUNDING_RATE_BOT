@@ -290,29 +290,31 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
             s = state_manager.state
             ok, result = close_position(s, pos_id, reason)
             state_manager.save()
-            if ok:
-                # Send close summary email
-                if scanner_worker.email_notifier and s.get("email_enabled"):
-                    try:
-                        scanner_worker.email_notifier.send_alert({
-                            "type": "POSITION_CLOSED",
-                            "severity": "INFO",
-                            "symbol": result["symbol"],
-                            "exchange": "",
-                            "message": (
-                                f"Posicion cerrada ({reason}). "
-                                f"Ganancia: ${result['earned']:.2f} | "
-                                f"Fees: ${result['fees']:.2f} | "
-                                f"Neto: ${result['net_earned']:.2f} | "
-                                f"Duracion: {result['hours']:.1f}h | "
-                                f"Pagos: {result['payments']}"
-                            ),
-                        })
-                    except Exception:
-                        pass
-                return jsonify({"ok": True, "result": result})
-            else:
-                return jsonify({"ok": False, "msg": result})
+
+        if not ok:
+            return jsonify({"ok": False, "msg": result})
+
+        # Send WhatsApp notification OUTSIDE lock (HTTP call can take seconds)
+        if scanner_worker.email_notifier:
+            try:
+                scanner_worker.email_notifier.send_alert({
+                    "type": "POSITION_CLOSED",
+                    "severity": "INFO",
+                    "symbol": result["symbol"],
+                    "exchange": "",
+                    "message": (
+                        f"Posicion cerrada ({reason}). "
+                        f"Ganancia: ${result['earned']:.2f} | "
+                        f"Fees: ${result['fees']:.2f} | "
+                        f"Neto: ${result['net_earned']:.2f} | "
+                        f"Duracion: {result['hours']:.1f}h | "
+                        f"Pagos: {result['payments']}"
+                    ),
+                })
+            except Exception as e:
+                log.warning(f"WhatsApp close notification failed: {e}")
+
+        return jsonify({"ok": True, "result": result})
 
     # ── History ────────────────────────────────────────────────
     @app.route("/api/history")
