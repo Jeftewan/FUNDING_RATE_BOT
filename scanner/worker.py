@@ -442,7 +442,12 @@ class ScannerWorker:
         self._record_earnings(pos, earn_per_payment * payments, cfr, now, payments)
 
     def _update_cross_exchange_earnings(self, pos: dict, all_data: list, now: float):
-        """Cross-exchange earnings: track differential between both exchanges."""
+        """Cross-exchange earnings: track each side's payments independently.
+
+        Each exchange pays at its own schedule (potentially different intervals
+        and different times).  We detect payments on each side independently
+        and record the net earnings per side per payment event.
+        """
         long_ex = pos.get("long_exchange", "")
         short_ex = pos.get("short_exchange", pos.get("exchange", ""))
 
@@ -459,36 +464,64 @@ class ScannerWorker:
         if not long_data or not short_data:
             return
 
+        fut_size = pos["capital_used"] / 2
         long_ih = long_data.get("ih", 8)
         short_ih = short_data.get("ih", 8)
-        min_ih = min(long_ih, short_ih)
-        interval_secs = min_ih * 3600
+        long_interval = long_ih * 3600
+        short_interval = short_ih * 3600
 
-        short_nts = short_data.get("next_funding_ts", 0)
         long_nts = long_data.get("next_funding_ts", 0)
-        nts = short_nts if short_nts > 0 else long_nts
+        short_nts = short_data.get("next_funding_ts", 0)
 
-        last_payment_ts = self._calc_last_payment_ts(nts, interval_secs, now)
+        # Track last update per side (so each side counts independently)
         last_up = pos.get("last_earn_update", pos["entry_time"] / 1000)
+        long_last = pos.get("_long_last_update", last_up)
+        short_last = pos.get("_short_last_update", last_up)
 
-        if last_payment_ts > 0:
-            payments = self._count_payments_since(last_up, last_payment_ts, interval_secs)
+        total_earned = 0
+        any_payment = False
+
+        # --- SHORT side payments ---
+        short_fr = short_data["fr"]
+        short_last_pay = self._calc_last_payment_ts(short_nts, short_interval, now)
+        if short_last_pay > 0:
+            short_payments = self._count_payments_since(short_last, short_last_pay, short_interval)
         else:
-            elapsed_h = (now - last_up) / 3600
-            payments = int(elapsed_h / min_ih)
+            short_payments = int((now - short_last) / short_interval)
 
-        if payments < 1:
+        if short_payments >= 1:
+            # Short side: we are SHORT, so we RECEIVE when rate > 0
+            short_earn = fut_size * short_fr * short_payments
+            total_earned += short_earn
+            pos["_short_last_update"] = now
+            any_payment = True
+            log.debug(f"  Cross {pos['symbol']} SHORT@{short_ex}: {short_payments} pays, "
+                       f"fr={short_fr*100:.4f}%, earn=${short_earn:.4f}")
+
+        # --- LONG side payments ---
+        long_fr = long_data["fr"]
+        long_last_pay = self._calc_last_payment_ts(long_nts, long_interval, now)
+        if long_last_pay > 0:
+            long_payments = self._count_payments_since(long_last, long_last_pay, long_interval)
+        else:
+            long_payments = int((now - long_last) / long_interval)
+
+        if long_payments >= 1:
+            # Long side: we are LONG, so we PAY when rate > 0
+            long_earn = -(fut_size * long_fr * long_payments)
+            total_earned += long_earn
+            pos["_long_last_update"] = now
+            any_payment = True
+            log.debug(f"  Cross {pos['symbol']} LONG@{long_ex}: {long_payments} pays, "
+                       f"fr={long_fr*100:.4f}%, earn=${long_earn:.4f}")
+
+        if not any_payment:
             return
 
-        fut_size = pos["capital_used"] / 2
-        short_fr = short_data["fr"]
-        long_fr = long_data["fr"]
-        short_earn = fut_size * short_fr if short_fr > 0 else -(fut_size * abs(short_fr))
-        long_cost = -(fut_size * long_fr) if long_fr > 0 else fut_size * abs(long_fr)
-        earn_per_payment = short_earn + long_cost
-
+        # Record with the current differential as the rate
         differential = short_fr - long_fr
-        self._record_earnings(pos, earn_per_payment * payments, differential, now, payments)
+        total_payments = max(short_payments, long_payments)
+        self._record_earnings(pos, total_earned, differential, now, total_payments)
 
     def _calc_last_payment_ts(self, next_funding_ts: int, interval_secs: int,
                               now: float) -> float:
@@ -536,23 +569,21 @@ class ScannerWorker:
 
     def _record_earnings(self, pos: dict, earned_now: float, rate: float,
                          now: float, full_ivs: int):
-        """Record earnings for a position."""
-        if earned_now > 0:
-            if "payments" not in pos:
-                pos["payments"] = []
-            pos["payments"].append({
-                "ts": int(now),
-                "rate": rate,
-                "earned": earned_now,
-                "cumulative": pos.get("earned_real", 0) + earned_now,
-            })
+        """Record earnings for a position (positive and negative)."""
+        if "payments" not in pos:
+            pos["payments"] = []
+        pos["payments"].append({
+            "ts": int(now),
+            "rate": rate,
+            "earned": earned_now,
+            "cumulative": pos.get("earned_real", 0) + earned_now,
+        })
 
         pos["earned_real"] = pos.get("earned_real", 0) + earned_now
         pos["last_earn_update"] = now
         pos["last_fr_used"] = rate
-        pos["payment_count"] = len(pos.get("payments", []))
-        if pos.get("payments"):
-            pos["avg_rate"] = sum(p["rate"] for p in pos["payments"]) / len(pos["payments"])
+        pos["payment_count"] = len(pos["payments"])
+        pos["avg_rate"] = sum(p["rate"] for p in pos["payments"]) / len(pos["payments"])
 
         if earned_now > 0:
             log.info(f"  +${earned_now:.4f} {pos['symbol']} ({full_ivs}ivs @ {rate*100:.4f}%)")

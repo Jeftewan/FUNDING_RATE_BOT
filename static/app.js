@@ -412,8 +412,8 @@ function renderPositions(data) {
                 <td>${payments.length - i}</td>
                 <td>${new Date(pay.ts * 1000).toLocaleTimeString()}</td>
                 <td>${(pay.rate * 100).toFixed(4)}%</td>
-                <td style="color:#22c55e">$${pay.earned.toFixed(4)}</td>
-                <td>$${pay.cumulative.toFixed(2)}</td>
+                <td style="color:${pay.earned >= 0 ? '#22c55e' : '#ef4444'}">$${pay.earned.toFixed(4)}</td>
+                <td style="color:${pay.cumulative >= 0 ? '#22c55e' : '#ef4444'}">$${pay.cumulative.toFixed(2)}</td>
               </tr>`).join('')}
           </table>
         </div>`;
