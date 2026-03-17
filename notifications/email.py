@@ -33,12 +33,15 @@ class EmailNotifier:
         """Send a single alert via WhatsApp. Returns True if sent."""
         self._sync_from_state()
         if not self.enabled:
+            log.debug(f"WhatsApp disabled, skipping alert: {alert.get('type')}")
             return False
 
         alert_key = f"{alert['type']}_{alert['symbol']}_{alert.get('exchange', '')}"
         now = time.time()
         if alert_key in self._sent_cache:
             if now - self._sent_cache[alert_key] < self._cooldown_seconds:
+                remaining = self._cooldown_seconds - (now - self._sent_cache[alert_key])
+                log.debug(f"WhatsApp cooldown active for {alert_key}, {remaining:.0f}s remaining")
                 return False
 
         try:
@@ -54,15 +57,20 @@ class EmailNotifier:
     def send_alerts(self, alerts: list) -> int:
         """Send multiple alerts, returns count sent."""
         self._sync_from_state()
-        if not self.enabled or not alerts:
+        if not self.enabled:
+            log.warning("WhatsApp alerts skipped: notifications disabled")
+            return 0
+        if not alerts:
             return 0
 
-        critical = [a for a in alerts if a.get("severity") in ("CRITICAL", "WARNING")]
-        if not critical:
+        # Send CRITICAL, WARNING, and INFO (for POSITION_CLOSED)
+        actionable = [a for a in alerts
+                      if a.get("severity") in ("CRITICAL", "WARNING", "INFO")]
+        if not actionable:
             return 0
 
         sent = 0
-        for alert in critical:
+        for alert in actionable:
             if self.send_alert(alert):
                 sent += 1
         return sent

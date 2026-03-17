@@ -206,13 +206,16 @@ class ScannerWorker:
                 self.state_manager.save()
 
         # Send WhatsApp alerts outside lock
-        if alerts and self.email_notifier:
-            try:
-                sent = self.email_notifier.send_alerts(alerts)
-                if sent:
-                    log.info(f"Sent {sent} WhatsApp alert(s)")
-            except Exception as e:
-                log.error(f"WhatsApp error: {e}")
+        if alerts:
+            log.info(f"Alerts detected: {[a['type'] for a in alerts]}")
+            if self.email_notifier:
+                try:
+                    sent = self.email_notifier.send_alerts(alerts)
+                    log.info(f"WhatsApp: {sent}/{len(alerts)} alert(s) sent")
+                except Exception as e:
+                    log.error(f"WhatsApp error: {e}")
+            else:
+                log.warning("Alerts detected but no email_notifier configured")
 
         # Cleanup old event keys (keep only recent ones)
         self._cleanup_events()
