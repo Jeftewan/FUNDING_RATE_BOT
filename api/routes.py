@@ -190,22 +190,56 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
             now = time.time()
 
             for pos in s["positions"]:
-                cur = next(
-                    (d for d in all_data
-                     if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]),
-                    None,
-                )
-                cfr = cur["fr"] if cur else pos["entry_fr"]
-                cp = cur.get("price", pos.get("entry_price", 0)) if cur else pos.get("entry_price", 0)
+                is_cross = pos.get("mode") == "cross_exchange"
 
-                # Recalculate mins_next live from next_funding_ts
-                mins_next = -1
-                if cur:
-                    nts = cur.get("next_funding_ts", 0)
-                    if nts and nts > 0:
-                        mins_next = max(0, (nts / 1000 - now) / 60)
+                if is_cross:
+                    # Cross-exchange: look up BOTH sides and compute differential
+                    long_ex = pos.get("long_exchange", "")
+                    short_ex = pos.get("short_exchange", pos.get("exchange", ""))
+                    long_d = next(
+                        (d for d in all_data
+                         if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex),
+                        None,
+                    )
+                    short_d = next(
+                        (d for d in all_data
+                         if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex),
+                        None,
+                    )
+                    if long_d and short_d:
+                        cfr = short_d["fr"] - long_d["fr"]
                     else:
-                        mins_next = cur.get("mins_next", -1)
+                        cfr = pos["entry_fr"]
+                    cp = short_d.get("price", pos.get("entry_price", 0)) if short_d else pos.get("entry_price", 0)
+
+                    # mins_next: earliest of the two sides
+                    mins_next = -1
+                    candidates = [d for d in (long_d, short_d) if d]
+                    for d in candidates:
+                        nts = d.get("next_funding_ts", 0)
+                        if nts and nts > 0:
+                            mn = max(0, (nts / 1000 - now) / 60)
+                        else:
+                            mn = d.get("mins_next", -1)
+                        if mn >= 0 and (mins_next < 0 or mn < mins_next):
+                            mins_next = mn
+                else:
+                    # Spot-perp: single exchange lookup
+                    cur = next(
+                        (d for d in all_data
+                         if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]),
+                        None,
+                    )
+                    cfr = cur["fr"] if cur else pos["entry_fr"]
+                    cp = cur.get("price", pos.get("entry_price", 0)) if cur else pos.get("entry_price", 0)
+
+                    mins_next = -1
+                    if cur:
+                        nts = cur.get("next_funding_ts", 0)
+                        if nts and nts > 0:
+                            mins_next = max(0, (nts / 1000 - now) / 60)
+                        else:
+                            mins_next = cur.get("mins_next", -1)
 
                 ih = pos.get("ih", 8)
                 el_h = (time.time() - pos["entry_time"] / 1000) / 3600

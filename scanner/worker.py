@@ -562,11 +562,36 @@ class ScannerWorker:
         alert_mins = state.get("alert_minutes_before", 5)
 
         for i, pos in enumerate(state["positions"]):
-            cur = self._find_data(pos, all_data)
-            if not cur:
-                continue
+            is_cross = pos.get("mode") == "cross_exchange"
 
-            cfr = cur["fr"]
+            if is_cross:
+                # Cross-exchange: compute cfr as differential of both sides
+                long_ex = pos.get("long_exchange", "")
+                short_ex = pos.get("short_exchange", pos.get("exchange", ""))
+                long_d = next(
+                    (d for d in all_data
+                     if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex),
+                    None,
+                )
+                short_d = next(
+                    (d for d in all_data
+                     if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex),
+                    None,
+                )
+                if not long_d or not short_d:
+                    continue
+                cfr = short_d["fr"] - long_d["fr"]
+                # mins_next: earliest of both sides
+                mins_candidates = [d for d in (long_d, short_d) if d.get("mins_next", -1) >= 0]
+                mins_next = min((d["mins_next"] for d in mins_candidates), default=-1)
+                display_ex = f"{short_ex}/{long_ex}"
+            else:
+                cur = self._find_data(pos, all_data)
+                if not cur:
+                    continue
+                cfr = cur["fr"]
+                mins_next = cur.get("mins_next", -1)
+                display_ex = pos["exchange"]
 
             # Rate reversal (critical)
             if (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
@@ -575,7 +600,7 @@ class ScannerWorker:
                     "severity": "CRITICAL",
                     "position_idx": i,
                     "symbol": pos["symbol"],
-                    "exchange": pos["exchange"],
+                    "exchange": display_ex,
                     "message": f"Funding rate cambio de signo: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
                 })
 
@@ -586,12 +611,11 @@ class ScannerWorker:
                     "severity": "WARNING",
                     "position_idx": i,
                     "symbol": pos["symbol"],
-                    "exchange": pos["exchange"],
+                    "exchange": display_ex,
                     "message": f"Rate cayo >75%: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
                 })
 
             # Pre-payment alert (N min before next funding)
-            mins_next = cur.get("mins_next", -1)
             if 0 < mins_next <= alert_mins:
                 if cfr <= 0 and pos["entry_fr"] > 0:
                     alerts.append({
@@ -599,7 +623,7 @@ class ScannerWorker:
                         "severity": "WARNING",
                         "position_idx": i,
                         "symbol": pos["symbol"],
-                        "exchange": pos["exchange"],
+                        "exchange": display_ex,
                         "message": f"Proximo pago en {mins_next:.0f}min — tasa desfavorable: {cfr*100:.4f}%",
                     })
 
