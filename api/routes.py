@@ -294,13 +294,18 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
         if not ok:
             return jsonify({"ok": False, "msg": result})
 
+        # Clear any notified alerts for this symbol (so new positions get fresh alerts)
+        closed_sym = result["symbol"]
+        stale_keys = {k for k in scanner_worker._notified_alerts if closed_sym in k}
+        scanner_worker._notified_alerts -= stale_keys
+
         # Send WhatsApp notification OUTSIDE lock (HTTP call can take seconds)
         if scanner_worker.email_notifier:
             try:
                 scanner_worker.email_notifier.send_alert({
                     "type": "POSITION_CLOSED",
                     "severity": "INFO",
-                    "symbol": result["symbol"],
+                    "symbol": closed_sym,
                     "exchange": "",
                     "message": (
                         f"Posicion cerrada ({reason}). "

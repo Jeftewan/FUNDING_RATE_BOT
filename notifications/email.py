@@ -14,7 +14,7 @@ class EmailNotifier:
     def __init__(self, state_manager):
         self.state_manager = state_manager
         self._sent_cache = {}
-        self._cooldown_seconds = 300
+        self._cooldown_seconds = 60  # safety net only; dedup handled by worker
         self._sync_from_state()
 
     def _sync_from_state(self):
