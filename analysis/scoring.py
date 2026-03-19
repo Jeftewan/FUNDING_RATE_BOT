@@ -180,63 +180,121 @@ def estimated_hold_days(hist: dict) -> int:
     return 0
 
 
-def score_cross_exchange(differential: float, consistency: float,
+def score_cross_exchange(differential: float, diff_hist: dict,
                          volume_min: float, fee_ratio: float) -> int:
-    """Score a cross-exchange opportunity."""
-    sc = 0
+    """Score a cross-exchange opportunity.
 
-    # Differential magnitude (30pts)
+    Mirrors the structure of risk_score (spot-perp) with 6 dimensions:
+    - Estabilidad:    20pts — CV of historical differential + min_ratio
+    - Consistencia:   15pts — streak of favorable days + % favorable
+    - Differential:   20pts — current rate differential magnitude
+    - Liquidez:       15pts — minimum volume of both sides
+    - Fee efficiency: 15pts — fees / revenue ratio
+    - Tendencia:      15pts — is the differential improving or worsening?
+
+    diff_hist: dict from _analyze_differential_history with keys:
+      consistency_pct, streak, cv, min_ratio, trend, diff_series
+    """
+    sc = 0
+    consistency = diff_hist.get("consistency_pct", 0)
+    streak = diff_hist.get("streak", 0)
+    cv = diff_hist.get("cv", 999)
+    min_ratio = diff_hist.get("min_ratio", 0)
+    trend = diff_hist.get("trend", 1.0)
+    diff_series = diff_hist.get("diff_series", [])
+
+    # 1. ESTABILIDAD (20pts) — CV of differential + worst day ratio
+    #    Low CV = differential is predictable across days
+    #    High min_ratio = even the worst day was decent
+    if diff_series:
+        if cv < 0.3 and min_ratio > 0.4:
+            sc += 20
+        elif cv < 0.4 and min_ratio > 0.3:
+            sc += 17
+        elif cv < 0.5 and min_ratio > 0.2:
+            sc += 14
+        elif cv < 0.7:
+            sc += 10
+        elif cv < 1.0:
+            sc += 6
+        elif cv < 1.5:
+            sc += 3
+        else:
+            sc += 1
+    else:
+        sc += 1  # no history = lowest confidence
+
+    # 2. CONSISTENCIA (15pts) — streak + % favorable
+    if streak >= 5 and consistency >= 90:
+        sc += 15
+    elif streak >= 4 and consistency >= 85:
+        sc += 13
+    elif streak >= 3 and consistency >= 80:
+        sc += 11
+    elif streak >= 2 and consistency >= 70:
+        sc += 9
+    elif consistency >= 60:
+        sc += 6
+    elif consistency >= 50:
+        sc += 3
+    else:
+        sc += 1
+
+    # 3. DIFFERENTIAL magnitude (20pts) — current spread
     d_pct = abs(differential) * 100
     if d_pct >= 0.10:
-        sc += 30
+        sc += 20
     elif d_pct >= 0.05:
-        sc += 25
+        sc += 17
     elif d_pct >= 0.03:
-        sc += 20
+        sc += 14
     elif d_pct >= 0.02:
-        sc += 15
+        sc += 11
     elif d_pct >= 0.01:
-        sc += 10
+        sc += 7
     else:
-        sc += 5
+        sc += 3
 
-    # Consistency (25pts)
-    if consistency >= 90:
-        sc += 25
-    elif consistency >= 80:
-        sc += 20
-    elif consistency >= 70:
-        sc += 15
-    elif consistency >= 60:
-        sc += 10
-    else:
-        sc += 5
-
-    # Liquidity (25pts)
+    # 4. LIQUIDEZ (15pts)
     if volume_min >= 100e6:
-        sc += 25
-    elif volume_min >= 50e6:
-        sc += 20
-    elif volume_min >= 20e6:
         sc += 15
+    elif volume_min >= 50e6:
+        sc += 12
+    elif volume_min >= 20e6:
+        sc += 9
     elif volume_min >= 10e6:
-        sc += 10
+        sc += 6
     elif volume_min >= 5e6:
-        sc += 5
+        sc += 3
+    else:
+        sc += 1
+
+    # 5. FEE EFFICIENCY (15pts) — lower fee_ratio = better
+    if fee_ratio < 0.1:
+        sc += 15
+    elif fee_ratio < 0.2:
+        sc += 12
+    elif fee_ratio < 0.3:
+        sc += 9
+    elif fee_ratio < 0.5:
+        sc += 6
     else:
         sc += 2
 
-    # Fee efficiency (20pts) — lower fee_ratio = better
-    if fee_ratio < 0.1:
-        sc += 20
-    elif fee_ratio < 0.2:
-        sc += 16
-    elif fee_ratio < 0.3:
-        sc += 12
-    elif fee_ratio < 0.5:
-        sc += 8
+    # 6. TENDENCIA (15pts) — is the differential improving?
+    if len(diff_series) >= 4:
+        if trend >= 1.3:
+            sc += 15   # strongly improving
+        elif trend >= 1.0:
+            sc += 12   # stable or slightly improving
+        elif trend >= 0.7:
+            sc += 6    # declining but still ok
+        elif trend >= 0.4:
+            sc += 3    # declining significantly
+        else:
+            sc += 1    # collapsing
     else:
-        sc += 3
+        sc += 7  # not enough data, neutral
 
     return min(sc, 100)
 
