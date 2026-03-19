@@ -198,12 +198,26 @@ class ScannerWorker:
             positions = s.get("positions", [])
             combined = all_data + defi_data
 
-            if combined and positions:
+            if not combined:
+                log.debug(f"Monitor tick: no market data (all_data={len(all_data)}, defi={len(defi_data)})")
+            elif not positions:
+                pass  # No positions to monitor
+            else:
                 self._refresh_mins_next(all_data, time.time(), defi_data)
                 self._update_earnings(s, combined)
                 alerts = self._check_alerts(s, combined)
                 s["alerts"] = alerts
                 self.state_manager.save()
+                if not alerts:
+                    # Log position status for debugging (every ~5 min)
+                    if int(now) % 300 < 35:
+                        for pos in positions:
+                            sym = pos["symbol"]
+                            mode = pos.get("mode", "spot_perp")
+                            efr = pos["entry_fr"]
+                            lfr = pos.get("last_fr_used", 0)
+                            log.info(f"  Monitor {sym} ({mode}): entry_fr={efr*100:.4f}%, "
+                                     f"last_fr={lfr*100:.4f}%, no alerts")
 
         # Send WhatsApp alerts outside lock
         if alerts:

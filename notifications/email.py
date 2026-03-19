@@ -33,7 +33,10 @@ class EmailNotifier:
         """Send a single alert via WhatsApp. Returns True if sent."""
         self._sync_from_state()
         if not self.enabled:
-            log.debug(f"WhatsApp disabled, skipping alert: {alert.get('type')}")
+            log.warning(f"WhatsApp disabled (email_enabled={self.enabled}, "
+                        f"phone={'set' if self.wa_phone else 'empty'}, "
+                        f"apikey={'set' if self.wa_apikey else 'empty'}), "
+                        f"skipping: {alert.get('type')} {alert.get('symbol')}")
             return False
 
         alert_key = f"{alert['type']}_{alert['symbol']}_{alert.get('exchange', '')}"
@@ -41,17 +44,18 @@ class EmailNotifier:
         if alert_key in self._sent_cache:
             if now - self._sent_cache[alert_key] < self._cooldown_seconds:
                 remaining = self._cooldown_seconds - (now - self._sent_cache[alert_key])
-                log.debug(f"WhatsApp cooldown active for {alert_key}, {remaining:.0f}s remaining")
+                log.info(f"WhatsApp cooldown for {alert_key}, {remaining:.0f}s left")
                 return False
 
         try:
+            log.info(f"Sending WhatsApp: {alert.get('type')} {alert.get('symbol')}...")
             text = self._format_message(alert)
             self._send_whatsapp(text)
             self._sent_cache[alert_key] = now
-            log.info(f"WhatsApp alert sent: {alert.get('type')} {alert.get('symbol')}")
+            log.info(f"WhatsApp alert SENT OK: {alert.get('type')} {alert.get('symbol')}")
             return True
         except Exception as e:
-            log.error(f"WhatsApp send failed: {e}")
+            log.error(f"WhatsApp send FAILED: {e}")
             return False
 
     def send_alerts(self, alerts: list) -> int:

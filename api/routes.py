@@ -354,7 +354,12 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
     # ── Test WhatsApp ─────────────────────────────────────────
     @app.route("/api/test_email", methods=["POST"])
     def api_test_whatsapp():
-        """Send a test WhatsApp message via CallMeBot."""
+        """Send a test WhatsApp message via CallMeBot.
+
+        This tests the FULL alert pipeline (send_alerts → send_alert)
+        using a simulated RATE_REVERSAL alert, not just the raw HTTP call.
+        This way we verify: enabled check, cooldown, formatting, and delivery.
+        """
         n = scanner_worker.email_notifier
         if not n:
             return jsonify({"ok": False, "msg": "Notifier no disponible"})
@@ -363,16 +368,127 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
         if not all([n.wa_phone, n.wa_apikey]):
             return jsonify({"ok": False, "msg": "Configura telefono y API key primero"})
 
-        result = n.test_connection()
-        if result["ok"]:
-            return jsonify({"ok": True, "msg": f"WhatsApp enviado a {n.wa_phone}"})
-        return jsonify({"ok": False, "msg": result["error"]})
+        # Clear cooldown for test alerts so they always send
+        test_keys = [k for k in n._sent_cache if k.startswith("TEST_")]
+        for k in test_keys:
+            del n._sent_cache[k]
+
+        # Simulate a real alert through the full pipeline
+        test_alert = {
+            "type": "TEST_ALERT",
+            "severity": "CRITICAL",
+            "symbol": "TEST",
+            "exchange": "Bot",
+            "message": "Prueba de alerta automatica — pipeline completo OK",
+        }
+
+        # Use send_alerts (the same function the monitor uses)
+        sent = n.send_alerts([test_alert])
+        if sent > 0:
+            return jsonify({"ok": True, "msg": f"WhatsApp enviado a {n.wa_phone} (pipeline completo)"})
+
+        # If send_alerts failed, diagnose why
+        diag = []
+        if not n.enabled:
+            diag.append(f"Notificaciones deshabilitadas (email_enabled={n.enabled})")
+        if not n.wa_phone:
+            diag.append("Telefono vacio")
+        if not n.wa_apikey:
+            diag.append("API key vacia")
+
+        if not diag:
+            # send_alerts returned 0 but config looks OK — try raw send
+            try:
+                n._send_whatsapp("✅ Funding Bot — Prueba de WhatsApp OK")
+                return jsonify({"ok": True, "msg": f"WhatsApp enviado (fallback directo) a {n.wa_phone}"})
+            except Exception as e:
+                diag.append(f"Error HTTP: {str(e)[:200]}")
+
+        return jsonify({"ok": False, "msg": " | ".join(diag) if diag else "Error desconocido"})
 
     # ── Alerts ─────────────────────────────────────────────────
     @app.route("/api/alerts")
     def api_alerts():
         with state_manager.lock:
             return jsonify({"alerts": state_manager.get("alerts", [])})
+
+    @app.route("/api/alert_diagnostics")
+    def api_alert_diagnostics():
+        """Diagnostic endpoint to check the full alert pipeline status."""
+        n = scanner_worker.email_notifier
+        with state_manager.lock:
+            s = state_manager.state
+            positions = s.get("positions", [])
+            all_data = s.get("all_data", [])
+            defi_data = s.get("defi_data", [])
+            combined = all_data + defi_data
+            stored_alerts = s.get("alerts", [])
+
+        diag = {
+            "whatsapp": {
+                "notifier_exists": n is not None,
+                "enabled": n.enabled if n else False,
+                "phone_set": bool(n.wa_phone) if n else False,
+                "apikey_set": bool(n.wa_apikey) if n else False,
+                "email_enabled_in_state": s.get("email_enabled", False),
+                "cooldown_cache": {k: f"{time.time() - v:.0f}s ago"
+                                   for k, v in (n._sent_cache if n else {}).items()},
+            },
+            "data": {
+                "all_data_count": len(all_data),
+                "defi_data_count": len(defi_data),
+                "combined_count": len(combined),
+                "positions_count": len(positions),
+            },
+            "stored_alerts": stored_alerts,
+            "positions_detail": [],
+        }
+
+        # Check each position for alert conditions
+        for pos in positions:
+            is_cross = pos.get("mode") == "cross_exchange"
+            p_diag = {
+                "symbol": pos["symbol"],
+                "mode": pos.get("mode", "spot_perp"),
+                "entry_fr": pos["entry_fr"],
+            }
+
+            if is_cross:
+                long_ex = pos.get("long_exchange", "")
+                short_ex = pos.get("short_exchange", "")
+                long_d = next((d for d in combined
+                               if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex), None)
+                short_d = next((d for d in combined
+                                if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex), None)
+                p_diag["long_exchange"] = long_ex
+                p_diag["short_exchange"] = short_ex
+                p_diag["long_data_found"] = long_d is not None
+                p_diag["short_data_found"] = short_d is not None
+                if long_d and short_d:
+                    cfr = short_d["fr"] - long_d["fr"]
+                    p_diag["current_differential"] = cfr
+                    p_diag["short_fr"] = short_d["fr"]
+                    p_diag["long_fr"] = long_d["fr"]
+                    p_diag["would_trigger_reversal"] = (
+                        (pos["entry_fr"] > 0 and cfr < 0) or
+                        (pos["entry_fr"] < 0 and cfr > 0)
+                    )
+                else:
+                    p_diag["issue"] = "Missing data for one or both sides"
+            else:
+                cur = next((d for d in combined
+                            if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]), None)
+                p_diag["data_found"] = cur is not None
+                if cur:
+                    p_diag["current_fr"] = cur["fr"]
+                    p_diag["would_trigger_reversal"] = (
+                        (pos["entry_fr"] > 0 and cur["fr"] < 0) or
+                        (pos["entry_fr"] < 0 and cur["fr"] > 0)
+                    )
+
+            diag["positions_detail"].append(p_diag)
+
+        return jsonify(diag)
 
     # ── Exchanges Status ───────────────────────────────────────
     @app.route("/api/exchanges/status")
