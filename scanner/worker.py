@@ -41,6 +41,9 @@ class ScannerWorker:
         # Track which payment windows we already scanned for
         # Key: "{symbol}_{exchange}_{payment_ts}" → avoids duplicate scans
         self._scanned_events = set()
+        # Track alerts already sent — key: "TYPE_SYMBOL_EXCHANGE"
+        # Once sent, alert won't regenerate until condition clears and reappears
+        self._notified_alerts = set()
         # Momento 3: pending refresh scans after payment
         # Key: "refresh_{sym_key}_{nts}" → value: timestamp when to trigger
         self._pending_refreshes = {}
@@ -219,13 +222,23 @@ class ScannerWorker:
                             log.info(f"  Monitor {sym} ({mode}): entry_fr={efr*100:.4f}%, "
                                      f"last_fr={lfr*100:.4f}%, no alerts")
 
-        # Send WhatsApp alerts outside lock
+        # Send WhatsApp alerts outside lock, then mark as notified
         if alerts:
             log.info(f"Alerts detected: {[a['type'] for a in alerts]}")
             if self.email_notifier:
                 try:
                     sent = self.email_notifier.send_alerts(alerts)
                     log.info(f"WhatsApp: {sent}/{len(alerts)} alert(s) sent")
+                    # Mark successfully-sent alerts so they won't regenerate
+                    if sent > 0:
+                        for a in alerts:
+                            key = f"{a['type']}_{a['symbol']}_{a.get('exchange', '')}"
+                            self._notified_alerts.add(key)
+                            log.info(f"Alert marked as notified: {key}")
+                        # Clear alerts from UI state — already delivered
+                        with self.state_manager.lock:
+                            self.state_manager.state["alerts"] = []
+                            self.state_manager.save()
                 except Exception as e:
                     log.error(f"WhatsApp error: {e}")
             else:
@@ -605,15 +618,21 @@ class ScannerWorker:
     # ── Alerts ────────────────────────────────────────────────
 
     def _check_alerts(self, state: dict, all_data: list) -> list:
-        """Check positions for alerts: rate reversal, rate drop, pre-payment."""
+        """Check positions for alerts: rate reversal, rate drop, pre-payment.
+
+        Uses _notified_alerts to ensure each alert is only generated ONCE.
+        When the condition clears (no longer triggers), its key is removed
+        so it can fire again if the condition reappears.
+        """
         alerts = []
         alert_mins = state.get("alert_minutes_before", 5)
+        # Track which alert keys are active THIS tick — used to clear stale ones
+        active_keys = set()
 
         for i, pos in enumerate(state["positions"]):
             is_cross = pos.get("mode") == "cross_exchange"
 
             if is_cross:
-                # Cross-exchange: compute cfr as differential of both sides
                 long_ex = pos.get("long_exchange", "")
                 short_ex = pos.get("short_exchange", pos.get("exchange", ""))
                 long_d = next(
@@ -629,7 +648,6 @@ class ScannerWorker:
                 if not long_d or not short_d:
                     continue
                 cfr = short_d["fr"] - long_d["fr"]
-                # mins_next: earliest of both sides
                 mins_candidates = [d for d in (long_d, short_d) if d.get("mins_next", -1) >= 0]
                 mins_next = min((d["mins_next"] for d in mins_candidates), default=-1)
                 display_ex = f"{short_ex}/{long_ex}"
@@ -641,38 +659,56 @@ class ScannerWorker:
                 mins_next = cur.get("mins_next", -1)
                 display_ex = pos["exchange"]
 
+            sym = pos["symbol"]
+
             # Rate reversal (critical)
             if (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
-                alerts.append({
-                    "type": "RATE_REVERSAL",
-                    "severity": "CRITICAL",
-                    "position_idx": i,
-                    "symbol": pos["symbol"],
-                    "exchange": display_ex,
-                    "message": f"Funding rate cambio de signo: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
-                })
+                key = f"RATE_REVERSAL_{sym}_{display_ex}"
+                active_keys.add(key)
+                if key not in self._notified_alerts:
+                    alerts.append({
+                        "type": "RATE_REVERSAL",
+                        "severity": "CRITICAL",
+                        "position_idx": i,
+                        "symbol": sym,
+                        "exchange": display_ex,
+                        "message": f"Funding rate cambio de signo: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
+                    })
 
             # Rate dropped >75% (warning)
             elif abs(cfr) < abs(pos["entry_fr"]) * 0.25:
-                alerts.append({
-                    "type": "RATE_DROP",
-                    "severity": "WARNING",
-                    "position_idx": i,
-                    "symbol": pos["symbol"],
-                    "exchange": display_ex,
-                    "message": f"Rate cayo >75%: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
-                })
+                key = f"RATE_DROP_{sym}_{display_ex}"
+                active_keys.add(key)
+                if key not in self._notified_alerts:
+                    alerts.append({
+                        "type": "RATE_DROP",
+                        "severity": "WARNING",
+                        "position_idx": i,
+                        "symbol": sym,
+                        "exchange": display_ex,
+                        "message": f"Rate cayo >75%: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
+                    })
 
             # Pre-payment alert (N min before next funding)
             if 0 < mins_next <= alert_mins:
                 if cfr <= 0 and pos["entry_fr"] > 0:
-                    alerts.append({
-                        "type": "PRE_PAYMENT_UNFAVORABLE",
-                        "severity": "WARNING",
-                        "position_idx": i,
-                        "symbol": pos["symbol"],
-                        "exchange": display_ex,
-                        "message": f"Proximo pago en {mins_next:.0f}min — tasa desfavorable: {cfr*100:.4f}%",
-                    })
+                    key = f"PRE_PAYMENT_UNFAVORABLE_{sym}_{display_ex}"
+                    active_keys.add(key)
+                    if key not in self._notified_alerts:
+                        alerts.append({
+                            "type": "PRE_PAYMENT_UNFAVORABLE",
+                            "severity": "WARNING",
+                            "position_idx": i,
+                            "symbol": sym,
+                            "exchange": display_ex,
+                            "message": f"Proximo pago en {mins_next:.0f}min — tasa desfavorable: {cfr*100:.4f}%",
+                        })
+
+        # Clear notified keys whose condition is no longer active
+        # This allows the alert to fire again if the condition reappears
+        stale = self._notified_alerts - active_keys
+        if stale:
+            log.info(f"Alert conditions cleared: {stale}")
+            self._notified_alerts -= stale
 
         return alerts

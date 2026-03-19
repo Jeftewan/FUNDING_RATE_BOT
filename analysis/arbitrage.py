@@ -214,19 +214,18 @@ class ArbitrageScanner:
         hourly_income = daily_income / 24
         break_even_h = calculate_break_even_hours(fees["total_cost"], hourly_income)
 
-        # Consistency: align by timestamp into daily buckets, then check
-        # if net daily rate (short_sum*short_ppd - long_sum*long_ppd) > 0
-        # per day.  This correctly handles different payment intervals.
-        consistency = 0
+        # Analyze historical differential: consistency, stability, streak, trend
+        diff_hist = {"consistency_pct": 0, "streak": 0, "cv": 999,
+                     "min_ratio": 0, "trend": 1.0, "diff_series": []}
         if (long_hist.rates and long_hist.timestamps
                 and short_hist.rates and short_hist.timestamps):
-            consistency = self._calc_time_aligned_consistency(
+            diff_hist = self._analyze_differential_history(
                 long_hist, short_hist, long_ppd, short_ppd
             )
 
         fee_ratio = fees["total_cost"] / revenue_3d_usd if revenue_3d_usd > 0 else 1
         sc = score_cross_exchange(
-            differential, consistency,
+            differential, diff_hist,
             min(long_fr.volume_24h, short_fr.volume_24h),
             fee_ratio,
         )
@@ -238,6 +237,19 @@ class ArbitrageScanner:
             liq_risk = "MEDIUM"
 
         grade = stability_grade(sc)
+
+        # Estimated hold days based on differential history
+        est_days = 0
+        streak_d = diff_hist.get("streak", 0)
+        cons_pct = diff_hist.get("consistency_pct", 0)
+        if cons_pct >= 90 and streak_d >= 5:
+            est_days = min(int(streak_d * 0.7), 14)
+        elif cons_pct >= 80 and streak_d >= 3:
+            est_days = min(int(streak_d * 0.5), 10)
+        elif cons_pct >= 70 and streak_d >= 2:
+            est_days = min(int(streak_d * 0.4), 7)
+        elif streak_d >= 1:
+            est_days = max(1, int(streak_d * 0.3))
 
         return CrossExchangeOpportunity(
             symbol=symbol,
@@ -263,26 +275,36 @@ class ArbitrageScanner:
             mins_to_next=min(long_fr.mins_to_next, short_fr.mins_to_next),
             next_funding_ts=min(long_fr.next_funding_ts, short_fr.next_funding_ts),
             stability_grade=grade,
+            estimated_hold_days=est_days,
             volume_24h=max(long_fr.volume_24h, short_fr.volume_24h),
         )
 
     @staticmethod
-    def _calc_time_aligned_consistency(
+    def _analyze_differential_history(
         long_hist, short_hist, long_ppd: float, short_ppd: float
-    ) -> float:
-        """Calculate consistency by grouping rates into daily buckets.
+    ) -> dict:
+        """Analyze the historical differential between two exchanges.
 
-        Instead of comparing rates by array index (wrong when intervals
-        differ), we bucket each side's payments by calendar day (UTC) and
-        compute the net daily rate:
-            net = sum(short_rates_that_day) - sum(long_rates_that_day)
-        A day is "favorable" when net > 0.
-        Only days where BOTH sides have data are evaluated.
+        Groups rates into daily buckets by timestamp, then computes:
+        - consistency_pct: % of days where differential > 0
+        - streak: consecutive recent favorable days
+        - diff_series: list of daily net differentials (chronological)
+        - avg_diff: average daily differential
+        - stddev_diff: std deviation of daily differentials
+        - cv: coefficient of variation (stddev/avg) — lower = more stable
+        - min_ratio: min(favorable_diffs) / avg — how bad is the worst day
+        - trend: ratio of recent avg vs older avg — >1 = improving
         """
+        import math
         MS_PER_DAY = 86_400_000
 
+        empty = {
+            "consistency_pct": 0, "streak": 0, "diff_series": [],
+            "avg_diff": 0, "stddev_diff": 0, "cv": 999,
+            "min_ratio": 0, "trend": 1.0,
+        }
+
         def _bucket_by_day(rates, timestamps):
-            """Group rates by day (ts // MS_PER_DAY)."""
             buckets = {}
             for rate, ts in zip(rates, timestamps):
                 day = ts // MS_PER_DAY
@@ -294,13 +316,57 @@ class ArbitrageScanner:
 
         common_days = sorted(set(long_days) & set(short_days))
         if not common_days:
-            return 0
+            return empty
 
-        favorable = 0
+        # Build daily differential series
+        diff_series = []
         for day in common_days:
             short_sum = sum(short_days[day])
             long_sum = sum(long_days[day])
-            if short_sum - long_sum > 0:
-                favorable += 1
+            diff_series.append(short_sum - long_sum)
 
-        return favorable / len(common_days) * 100
+        n = len(diff_series)
+
+        # Consistency: % of days where differential > 0
+        favorable_diffs = [d for d in diff_series if d > 0]
+        favorable_count = len(favorable_diffs)
+        consistency_pct = favorable_count / n * 100
+
+        # Streak: consecutive favorable days from most recent
+        streak = 0
+        for d in reversed(diff_series):
+            if d > 0:
+                streak += 1
+            else:
+                break
+
+        # Stability: avg, stddev, CV of the differential
+        avg_diff = sum(diff_series) / n
+        variance = sum((d - avg_diff) ** 2 for d in diff_series) / n
+        stddev_diff = math.sqrt(variance)
+        cv = stddev_diff / abs(avg_diff) if abs(avg_diff) > 1e-10 else 999
+
+        # Min ratio: worst favorable day / average
+        min_ratio = 0
+        if favorable_diffs and abs(avg_diff) > 1e-10:
+            min_ratio = min(favorable_diffs) / abs(avg_diff)
+
+        # Trend: compare recent half vs older half
+        trend = 1.0
+        if n >= 4:
+            mid = n // 2
+            older_avg = sum(abs(d) for d in diff_series[:mid]) / mid
+            recent_avg = sum(abs(d) for d in diff_series[mid:]) / (n - mid)
+            if older_avg > 1e-10:
+                trend = recent_avg / older_avg
+
+        return {
+            "consistency_pct": consistency_pct,
+            "streak": streak,
+            "diff_series": diff_series,
+            "avg_diff": avg_diff,
+            "stddev_diff": stddev_diff,
+            "cv": cv,
+            "min_ratio": min_ratio,
+            "trend": trend,
+        }

@@ -132,6 +132,7 @@ class CrossExchangeOpportunity:
     mins_to_next: float = -1
     next_funding_ts: int = 0
     stability_grade: str = "D"
+    estimated_hold_days: int = 0
     volume_24h: float = 0
 
     def to_dict(self) -> dict:
@@ -161,6 +162,7 @@ class CrossExchangeOpportunity:
             "mins_to_next": self.mins_to_next,
             "next_funding_ts": self.next_funding_ts,
             "stability_grade": self.stability_grade,
+            "estimated_hold_days": self.estimated_hold_days,
             "volume_24h": self.volume_24h,
         }
 
