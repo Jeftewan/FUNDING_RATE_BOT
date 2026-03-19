@@ -5,7 +5,7 @@ from core.models import FundingRate, SpotPerpOpportunity, CrossExchangeOpportuni
 from analysis.funding import FundingAggregator
 from analysis.fees import (calculate_spot_perp_fees, calculate_cross_exchange_fees,
                            calculate_break_even_hours)
-from analysis.scoring import risk_score, score_cross_exchange, stability_grade, estimated_hold_days
+from analysis.scoring import opportunity_score, stability_grade, estimated_hold_days
 
 log = logging.getLogger("bot")
 
@@ -77,9 +77,36 @@ class ArbitrageScanner:
         hourly_income = daily_income / 24
         break_even_h = calculate_break_even_hours(fees["total_cost"], hourly_income)
 
-        token_dict = fr.to_dict()
         hist_dict = history_obj.to_dict()
-        sc = risk_score(token_dict, hist_dict)
+        rates = hist_dict.get("_rates", [])
+        avg_abs = history_obj.avg if history_obj.avg else abs(fr.rate)
+        stddev = history_obj.stddev if history_obj.stddev < 999 else 0
+        cv = stddev / abs(avg_abs) if abs(avg_abs) > 1e-10 else 999
+
+        # Favorable rates for min_ratio
+        favorable = [abs(r) for r in rates
+                     if (fr.rate > 0 and r > 0) or (fr.rate < 0 and r < 0)]
+        min_ratio = min(favorable) / abs(avg_abs) if favorable and abs(avg_abs) > 1e-10 else 0
+
+        # Settlement-based yield: avg of actual historical settlement rates
+        settlement_avg = sum(abs(r) for r in rates) / len(rates) if rates else abs(fr.rate)
+
+        # Fee drag
+        gross_3d_usd = NOTIONAL * abs(accumulated_3d) if abs(accumulated_3d) > 0 else 1
+        fee_drag = fees["total_cost"] / gross_3d_usd
+
+        sc = opportunity_score({
+            "cv": cv,
+            "min_ratio": min_ratio,
+            "streak": history_obj.streak,
+            "pct": history_obj.favorable_pct,
+            "volume": fr.volume_24h,
+            "settlement_avg": settlement_avg,
+            "payments_per_day": fr.payments_per_day,
+            "fee_drag": fee_drag,
+            "current_rate": fr.rate,
+            "rates": rates,
+        })
         grade = stability_grade(sc)
         est_days = estimated_hold_days(hist_dict)
 
@@ -224,11 +251,24 @@ class ArbitrageScanner:
             )
 
         fee_ratio = fees["total_cost"] / revenue_3d_usd if revenue_3d_usd > 0 else 1
-        sc = score_cross_exchange(
-            differential, diff_hist,
-            min(long_fr.volume_24h, short_fr.volume_24h),
-            fee_ratio,
-        )
+        diff_series = diff_hist.get("diff_series", [])
+
+        # Settlement-based yield: avg of historical daily differentials
+        settlement_avg = (abs(diff_hist.get("avg_diff", 0))
+                          if diff_series else abs(differential))
+
+        sc = opportunity_score({
+            "cv": diff_hist.get("cv", 999),
+            "min_ratio": diff_hist.get("min_ratio", 0),
+            "streak": diff_hist.get("streak", 0),
+            "pct": diff_hist.get("consistency_pct", 0),
+            "volume": min(long_fr.volume_24h, short_fr.volume_24h),
+            "settlement_avg": settlement_avg,
+            "payments_per_day": (long_ppd + short_ppd) / 2,
+            "fee_drag": fee_ratio,
+            "current_rate": differential,
+            "rates": diff_series,
+        })
 
         liq_risk = "LOW"
         if NOTIONAL < 2000:
