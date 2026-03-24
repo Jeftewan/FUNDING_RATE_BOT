@@ -46,6 +46,7 @@ async function loadOpps() {
     const data = await res.json();
     renderOpps(data);
     updateStatus(data);
+    setScanUI(!!data.scanning);
   } catch (e) {
     console.error('loadOpps error:', e);
   }
@@ -136,6 +137,7 @@ async function loadDefiOpps() {
     const data = await res.json();
     renderDefiOpps(data);
     updateStatus(data);
+    setScanUI(!!data.scanning);
   } catch (e) {
     console.error('loadDefiOpps error:', e);
   }
@@ -603,11 +605,41 @@ async function testEmail() {
 }
 
 // ── Force scan ────────────────────────────────────────────────
+let scanPolling = null;
+
+function setScanUI(scanning) {
+  const btn = document.getElementById('btn-scan');
+  const bar = document.getElementById('scan-progress');
+  if (scanning) {
+    btn.disabled = true;
+    btn.textContent = 'Escaneando...';
+    bar.style.display = 'flex';
+  } else {
+    btn.disabled = false;
+    btn.textContent = 'Escanear';
+    bar.style.display = 'none';
+    if (scanPolling) { clearInterval(scanPolling); scanPolling = null; }
+  }
+}
+
 async function forceScan() {
+  const btn = document.getElementById('btn-scan');
+  if (btn.disabled) return;
   try {
     await fetch('/api/force_scan', { method: 'POST' });
-    document.getElementById('st-status').textContent = 'Escaneando...';
-    setTimeout(refresh, 5000);
+    setScanUI(true);
+    // Poll every 3s until scan finishes
+    scanPolling = setInterval(async () => {
+      try {
+        const res = await fetch('/api/opportunities');
+        const data = await res.json();
+        if (!data.scanning) {
+          setScanUI(false);
+          renderOpps(data);
+          updateStatus(data);
+        }
+      } catch (e) {}
+    }, 3000);
   } catch (e) {}
 }
 

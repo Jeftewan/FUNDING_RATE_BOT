@@ -275,6 +275,7 @@ class ScannerWorker:
         log.info("Scan starting...")
         with self.state_manager.lock:
             self.state_manager.set("status", "Escaneando...")
+            self.state_manager.set("scanning", True)
             min_volume = self.state_manager.get("min_volume", 1_000_000)
 
         # 1. Fetch rates from all exchanges via CCXT
@@ -291,6 +292,7 @@ class ScannerWorker:
                 self.state_manager.update(
                     status="Error: sin conexion",
                     last_error="Sin conexion a exchanges",
+                    scanning=False,
                 )
             return
 
@@ -399,6 +401,7 @@ class ScannerWorker:
                 f"{len(opportunities) + n_defi} total"
             )
             s["last_error"] = ""
+            s["scanning"] = False
             self.state_manager.save()
 
         self._last_scan_ts = time.time()
