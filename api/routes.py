@@ -106,6 +106,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
                 "coinglass": s.get("coinglass_data", []),
                 "last_scan": s.get("last_scan_time", "—"),
                 "scan_count": s.get("scan_count", 0),
+                "scanning": s.get("scanning", False),
             })
 
     # ── DeFi Opportunities ──────────────────────────────────────
@@ -127,6 +128,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
                 "total_unfiltered": len(opps),
                 "last_scan": s.get("last_scan_time", "—"),
                 "scan_count": s.get("scan_count", 0),
+                "scanning": s.get("scanning", False),
             })
 
     # ── Calculate (preview before opening) ─────────────────────

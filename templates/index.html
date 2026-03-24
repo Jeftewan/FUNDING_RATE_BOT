@@ -22,7 +22,11 @@
   <!-- ═══ OPPORTUNITIES TAB ═══ -->
   <div id="page-opportunities" class="page active">
     <div class="toolbar">
-      <button class="btn btn-scan" onclick="forceScan()">Escanear</button>
+      <button class="btn btn-scan" id="btn-scan" onclick="forceScan()">Escanear</button>
+      <div class="scan-progress" id="scan-progress" style="display:none">
+        <div class="scan-progress-bar"></div>
+        <span class="scan-progress-text">Escaneando exchanges...</span>
+      </div>
       <div class="sub-tabs">
         <button class="sub-tab active" id="subtab-cex" onclick="switchSubTab('cex')">CEX</button>
         <button class="sub-tab" id="subtab-defi" onclick="switchSubTab('defi')">DeFi</button>

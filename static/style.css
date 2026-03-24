@@ -40,6 +40,13 @@ body{font-family:'JetBrains Mono',monospace;background:#0a0b0d;color:#c8ccd0;min
      border:1px solid #333;transition:all .2s}
 .btn-scan{background:#1a1d23;color:#22c55e;border-color:#22c55e33}
 .btn-scan:hover{background:#22c55e22}
+.btn-scan:disabled{opacity:.5;cursor:not-allowed;background:#1a1d23}
+.scan-progress{display:flex;align-items:center;gap:8px;margin-left:4px}
+.scan-progress-bar{width:80px;height:6px;background:#1a1d23;border-radius:3px;overflow:hidden;position:relative}
+.scan-progress-bar::after{content:'';position:absolute;top:0;left:-40px;width:40px;height:100%;
+  background:#22c55e;border-radius:3px;animation:scan-slide 1s ease-in-out infinite}
+@keyframes scan-slide{0%{left:-40px}100%{left:80px}}
+.scan-progress-text{font-size:11px;color:#22c55e;white-space:nowrap}
 .btn-primary{background:#3b82f6;color:#fff;border-color:#3b82f6}
 .btn-primary:hover{background:#2563eb}
 .btn-secondary{background:#1a1d23;color:#ccc;border-color:#333}

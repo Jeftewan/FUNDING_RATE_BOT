@@ -1,6 +1,7 @@
 let currentTab = 'opportunities';
 let currentSubTab = 'cex';
 let refreshTimer = null;
+const calcCache = {};  // oppId -> { html, capVal, levVal }
 
 // ── Tab switching ─────────────────────────────────────────────
 function switchTab(tab) {
@@ -45,6 +46,7 @@ async function loadOpps() {
     const data = await res.json();
     renderOpps(data);
     updateStatus(data);
+    setScanUI(!!data.scanning);
   } catch (e) {
     console.error('loadOpps error:', e);
   }
@@ -113,6 +115,19 @@ function renderOpps(data) {
       <div class="opp-est" id="est-${i}"></div>
     </div>`;
   }).join('');
+
+  // Restore cached calculation results and input values
+  opps.forEach((o, i) => {
+    const cached = calcCache[o._id];
+    if (cached) {
+      const estEl = document.getElementById('est-' + i);
+      if (estEl) estEl.innerHTML = cached.html;
+      const capEl = document.getElementById('cap-' + i);
+      if (capEl) capEl.value = cached.capVal;
+      const levEl = document.getElementById('lev-' + i);
+      if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
+    }
+  });
 }
 
 // ── DeFi Opportunities ────────────────────────────────────────
@@ -122,6 +137,7 @@ async function loadDefiOpps() {
     const data = await res.json();
     renderDefiOpps(data);
     updateStatus(data);
+    setScanUI(!!data.scanning);
   } catch (e) {
     console.error('loadDefiOpps error:', e);
   }
@@ -194,6 +210,20 @@ function renderDefiOpps(data) {
       <div class="opp-est" id="est-${idx}"></div>
     </div>`;
   }).join('');
+
+  // Restore cached calculation results and input values
+  opps.forEach((o, i) => {
+    const idx = base + i;
+    const cached = calcCache[o._id];
+    if (cached) {
+      const estEl = document.getElementById('est-' + idx);
+      if (estEl) estEl.innerHTML = cached.html;
+      const capEl = document.getElementById('cap-' + idx);
+      if (capEl) capEl.value = cached.capVal;
+      const levEl = document.getElementById('lev-' + idx);
+      if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
+    }
+  });
 }
 
 function gradeFromScore(s) {
@@ -282,6 +312,7 @@ async function calcEst(oppId, idx) {
       }
 
       el.innerHTML = html;
+      calcCache[oppId] = { html, capVal: cap, levVal: lev };
     } else {
       el.textContent = data.msg;
       el.style.color = '#ef4444';
@@ -574,11 +605,41 @@ async function testEmail() {
 }
 
 // ── Force scan ────────────────────────────────────────────────
+let scanPolling = null;
+
+function setScanUI(scanning) {
+  const btn = document.getElementById('btn-scan');
+  const bar = document.getElementById('scan-progress');
+  if (scanning) {
+    btn.disabled = true;
+    btn.textContent = 'Escaneando...';
+    bar.style.display = 'flex';
+  } else {
+    btn.disabled = false;
+    btn.textContent = 'Escanear';
+    bar.style.display = 'none';
+    if (scanPolling) { clearInterval(scanPolling); scanPolling = null; }
+  }
+}
+
 async function forceScan() {
+  const btn = document.getElementById('btn-scan');
+  if (btn.disabled) return;
   try {
     await fetch('/api/force_scan', { method: 'POST' });
-    document.getElementById('st-status').textContent = 'Escaneando...';
-    setTimeout(refresh, 5000);
+    setScanUI(true);
+    // Poll every 3s until scan finishes
+    scanPolling = setInterval(async () => {
+      try {
+        const res = await fetch('/api/opportunities');
+        const data = await res.json();
+        if (!data.scanning) {
+          setScanUI(false);
+          renderOpps(data);
+          updateStatus(data);
+        }
+      } catch (e) {}
+    }, 3000);
   } catch (e) {}
 }
 
