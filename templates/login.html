@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login — Funding Rate Bot</title>
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  .login-page{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+  .login-box{background:#111318;border:1px solid #1a1d23;border-radius:12px;padding:32px;
+             max-width:400px;width:100%;text-align:center}
+  .login-box h1{font-size:20px;color:#fff;margin-bottom:6px;font-weight:500}
+  .login-box .subtitle{color:#555;font-size:12px;margin-bottom:24px}
+  .login-box .inp{margin-bottom:16px;text-align:center;font-size:14px;padding:10px 16px}
+  .login-box .btn-primary{width:100%;padding:12px;font-size:14px}
+  .login-msg{font-size:12px;margin-top:16px;padding:10px;border-radius:6px}
+  .login-msg.success{background:#22c55e22;color:#22c55e;border:1px solid #22c55e44}
+  .login-msg.error{background:#ef444422;color:#ef4444;border:1px solid #ef444444}
+  .login-help{font-size:10px;color:#555;margin-top:20px;line-height:1.5}
+</style>
+</head><body>
+<div class="login-page">
+  <div class="login-box">
+    <h1>Funding Rate Bot</h1>
+    <div class="subtitle">Ingresa tu email para recibir un enlace de acceso</div>
+
+    <form id="login-form" onsubmit="requestLink(event)">
+      <input type="email" id="login-email" class="inp" placeholder="tu@email.com" required autofocus>
+      <button type="submit" class="btn btn-primary" id="login-btn">Enviar enlace magico</button>
+    </form>
+
+    <div id="login-msg" class="login-msg" style="display:none"></div>
+
+    {% if error %}
+    <div class="login-msg error">{{ error }}</div>
+    {% endif %}
+
+    <div class="login-help">
+      Se enviara un enlace de un solo uso a tu correo.<br>
+      No necesitas contrasena — el enlace expira en 15 minutos.
+    </div>
+  </div>
+</div>
+
+<script>
+async function requestLink(e) {
+  e.preventDefault();
+  const email = document.getElementById('login-email').value.trim();
+  const btn = document.getElementById('login-btn');
+  const msg = document.getElementById('login-msg');
+
+  btn.disabled = true;
+  btn.textContent = 'Enviando...';
+  msg.style.display = 'none';
+
+  try {
+    const res = await fetch('/auth/request-link', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    const data = await res.json();
+    msg.textContent = data.msg;
+    msg.className = 'login-msg ' + (data.ok ? 'success' : 'error');
+    msg.style.display = '';
+    if (data.ok) {
+      btn.textContent = 'Enlace enviado';
+    } else {
+      btn.disabled = false;
+      btn.textContent = 'Enviar enlace magico';
+    }
+  } catch (err) {
+    msg.textContent = 'Error de conexion';
+    msg.className = 'login-msg error';
+    msg.style.display = '';
+    btn.disabled = false;
+    btn.textContent = 'Enviar enlace magico';
+  }
+}
+</script>
+</body></html>

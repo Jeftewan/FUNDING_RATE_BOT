@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Funding Rate Arbitrage Bot v8.0
-4 Exchanges (Binance, Bybit, OKX, Bitget) via CCXT
-Unified opportunity scanner — no safe/aggressive split
-User-driven position management with real payment tracking
+Funding Rate Arbitrage Bot v9.0
+4 CEX (Binance, Bybit, OKX, Bitget) + 5 DeFi via CCXT
+Multi-user SaaS with PostgreSQL + magic link auth
 """
 import os
 import logging
@@ -80,13 +79,59 @@ scanner_worker = ScannerWorker(
 app = Flask(__name__,
             template_folder="templates",
             static_folder="static")
+app.secret_key = Config.SECRET_KEY
 
+# ── Database + Auth (SaaS mode) ──────────────────────────────
+db_enabled = False
+if Config.USE_DB and Config.DATABASE_URL:
+    try:
+        from core.database import init_db
+        db_enabled = init_db(app)
+        if db_enabled:
+            from flask_login import LoginManager
+            from core.db_models import User
+
+            login_manager = LoginManager()
+            login_manager.init_app(app)
+            login_manager.login_view = "auth.login_page"
+
+            @login_manager.user_loader
+            def load_user(user_id):
+                return User.query.get(int(user_id))
+
+            @login_manager.unauthorized_handler
+            def unauthorized():
+                from flask import request as req, jsonify as jfy, redirect as rdr
+                if req.path.startswith("/api/"):
+                    return jfy({"ok": False, "msg": "No autenticado"}), 401
+                return rdr("/auth/login")
+
+            from auth.routes import init_auth, auth_bp
+
+            # Add login page route to auth blueprint
+            @auth_bp.route("/login")
+            def login_page():
+                from flask import render_template
+                return render_template("login.html", error=None)
+
+            init_auth(app, Config)
+            log.info("SaaS mode enabled: PostgreSQL + magic link auth")
+    except Exception as e:
+        log.error(f"Failed to initialize SaaS mode: {e}")
+        db_enabled = False
+
+if not db_enabled:
+    log.info("Running in single-user mode (JSON persistence)")
+
+# ── API Routes ────────────────────────────────────────────────
 from api.routes import init_routes
-init_routes(app, state_manager, scanner_worker, Config, defi_manager=defi_manager)
+init_routes(app, state_manager, scanner_worker, Config,
+            defi_manager=defi_manager, db_enabled=db_enabled)
 
 s = state_manager.state
+mode = "SaaS" if db_enabled else "Single-user"
 log.info(
-    f"Bot v8.0: ${s['total_capital']:,.0f} | "
+    f"Bot v9.0 [{mode}]: ${s['total_capital']:,.0f} | "
     f"{s['scan_interval']//60}min | "
     f"Exchanges: {', '.join(Config.ENABLED_EXCHANGES)} | "
     f"{Config.DATA_DIR}"

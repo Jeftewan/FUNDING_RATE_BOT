@@ -49,3 +49,18 @@ class Config:
 
     # DeFi exchanges
     DEFI_EXCHANGES = ["Hyperliquid", "GMX", "Aster", "Lighter", "Extended"]
+
+    # SaaS / Multi-user
+    USE_DB = os.environ.get("USE_DB", "false").lower() in ("true", "1", "yes")
+    DATABASE_URL = os.environ.get("DATABASE_URL", "")
+    SECRET_KEY = os.environ.get("SECRET_KEY", os.urandom(32).hex())
+    FERNET_KEY = os.environ.get("FERNET_KEY", "")
+    ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "")
+
+    # Email for magic links
+    SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+    SMTP_HOST = os.environ.get("SMTP_HOST", "")
+    SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+    SMTP_USER = os.environ.get("SMTP_USER", "")
+    SMTP_PASS = os.environ.get("SMTP_PASS", "")
+    MAIL_FROM = os.environ.get("MAIL_FROM", "noreply@fundingbot.app")

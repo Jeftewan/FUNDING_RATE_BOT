@@ -987,6 +987,14 @@ function playBeep() {
   } catch (e) {}
 }
 
+// ── Auth ─────────────────────────────────────────────────────
+async function doLogout() {
+  try {
+    await fetch('/auth/logout', { method: 'POST' });
+  } catch (e) {}
+  window.location.href = '/auth/login';
+}
+
 // ── Init ──────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   refresh();
