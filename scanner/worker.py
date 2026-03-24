@@ -445,7 +445,11 @@ class ScannerWorker:
         if not cur:
             return
 
-        ih = pos.get("ih", 8)
+        # Use current market ih (not position's stored ih) to handle interval changes
+        ih = cur.get("ih", pos.get("ih", 8))
+        if ih != pos.get("ih", 8):
+            log.info(f"  {pos['symbol']}: interval changed {pos.get('ih')}h -> {ih}h, updating")
+            pos["ih"] = ih
         interval_secs = ih * 3600
         cfr = cur["fr"]
         nts = cur.get("next_funding_ts", 0)
@@ -558,12 +562,17 @@ class ScannerWorker:
         next_ts_sec = next_funding_ts / 1000
 
         if next_ts_sec > now:
-            return next_ts_sec - interval_secs
+            last_pay = next_ts_sec - interval_secs
         else:
             ts = next_ts_sec
             while ts + interval_secs <= now:
                 ts += interval_secs
-            return ts
+            last_pay = ts
+
+        # Safety: last payment can never be in the future
+        if last_pay > now:
+            return 0
+        return last_pay
 
     def _count_payments_since(self, last_update: float, last_payment_ts: float,
                               interval_secs: int) -> int:
