@@ -1,6 +1,7 @@
 let currentTab = 'opportunities';
 let currentSubTab = 'cex';
 let refreshTimer = null;
+const calcCache = {};  // oppId -> { html, capVal, levVal }
 
 // ── Tab switching ─────────────────────────────────────────────
 function switchTab(tab) {
@@ -113,6 +114,19 @@ function renderOpps(data) {
       <div class="opp-est" id="est-${i}"></div>
     </div>`;
   }).join('');
+
+  // Restore cached calculation results and input values
+  opps.forEach((o, i) => {
+    const cached = calcCache[o._id];
+    if (cached) {
+      const estEl = document.getElementById('est-' + i);
+      if (estEl) estEl.innerHTML = cached.html;
+      const capEl = document.getElementById('cap-' + i);
+      if (capEl) capEl.value = cached.capVal;
+      const levEl = document.getElementById('lev-' + i);
+      if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
+    }
+  });
 }
 
 // ── DeFi Opportunities ────────────────────────────────────────
@@ -194,6 +208,20 @@ function renderDefiOpps(data) {
       <div class="opp-est" id="est-${idx}"></div>
     </div>`;
   }).join('');
+
+  // Restore cached calculation results and input values
+  opps.forEach((o, i) => {
+    const idx = base + i;
+    const cached = calcCache[o._id];
+    if (cached) {
+      const estEl = document.getElementById('est-' + idx);
+      if (estEl) estEl.innerHTML = cached.html;
+      const capEl = document.getElementById('cap-' + idx);
+      if (capEl) capEl.value = cached.capVal;
+      const levEl = document.getElementById('lev-' + idx);
+      if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
+    }
+  });
 }
 
 function gradeFromScore(s) {
@@ -282,6 +310,7 @@ async function calcEst(oppId, idx) {
       }
 
       el.innerHTML = html;
+      calcCache[oppId] = { html, capVal: cap, levVal: lev };
     } else {
       el.textContent = data.msg;
       el.style.color = '#ef4444';
