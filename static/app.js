@@ -295,6 +295,7 @@ function refresh() {
   if (currentTab === 'opportunities') loadCurrentOpps();
   else if (currentTab === 'positions') loadPositions();
   else if (currentTab === 'config') loadConfig();
+  else if (currentTab === 'account') loadAccount();
 }
 
 // ── Auto refresh ──────────────────────────────────────────────
@@ -985,6 +986,93 @@ function playBeep() {
     osc.start();
     osc.stop(ctx.currentTime + 0.3);
   } catch (e) {}
+}
+
+// ── Account & Exchange Keys (SaaS) ───────────────────────────
+const EXCHANGES = ['Binance', 'Bybit', 'OKX', 'Bitget'];
+
+async function loadAccount() {
+  const el = document.getElementById('exchange-keys-list');
+  if (!el) return;
+  try {
+    const res = await fetch('/api/account');
+    if (res.status === 401) return;
+    const data = await res.json();
+    if (!data.ok) return;
+
+    const keyMap = {};
+    (data.exchange_keys || []).forEach(k => { keyMap[k.exchange] = k.has_key; });
+
+    el.innerHTML = EXCHANGES.map(ex => {
+      const hasKey = keyMap[ex] || false;
+      const statusIcon = hasKey ? '<span style="color:#22c55e">&#10003; Configurada</span>' : '<span style="color:#555">No configurada</span>';
+      return `
+        <div class="cfg-section" style="margin:6px 0;padding:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <strong style="font-size:12px;color:#fff">${ex}</strong>
+            ${statusIcon}
+          </div>
+          <div class="cfg-grid" style="grid-template-columns:1fr 1fr">
+            <label>API Key<input type="password" id="ek-key-${ex}" class="inp" placeholder="${hasKey ? '••••••••' : 'API Key'}"></label>
+            <label>API Secret<input type="password" id="ek-secret-${ex}" class="inp" placeholder="${hasKey ? '••••••••' : 'API Secret'}"></label>
+            ${ex === 'OKX' || ex === 'Bitget' ? `<label>Passphrase<input type="password" id="ek-pass-${ex}" class="inp" placeholder="${hasKey ? '••••••••' : 'Passphrase'}"></label>` : ''}
+          </div>
+          <div style="margin-top:8px;display:flex;gap:8px">
+            <button class="btn btn-primary" onclick="saveExchangeKey('${ex}')" style="font-size:11px;padding:4px 12px">Guardar</button>
+            ${hasKey ? `<button class="btn btn-danger" onclick="deleteExchangeKey('${ex}')" style="font-size:11px;padding:4px 12px">Eliminar</button>` : ''}
+          </div>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    console.error('loadAccount error:', e);
+  }
+}
+
+async function saveExchangeKey(exchange) {
+  const key = document.getElementById('ek-key-' + exchange)?.value || '';
+  const secret = document.getElementById('ek-secret-' + exchange)?.value || '';
+  const pass = document.getElementById('ek-pass-' + exchange)?.value || '';
+  if (!key && !secret) { showToast('Ingresa al menos API Key y Secret', 'warning'); return; }
+  try {
+    const res = await fetch('/api/account/exchange_keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exchange, api_key: key, api_secret: secret, passphrase: pass }),
+    });
+    const data = await res.json();
+    showToast(data.msg, data.ok ? 'success' : 'error');
+    if (data.ok) loadAccount();
+  } catch (e) {
+    showToast('Error al guardar keys', 'error');
+  }
+}
+
+async function deleteExchangeKey(exchange) {
+  if (!await showConfirm(`Eliminar API keys de ${exchange}?`)) return;
+  try {
+    const res = await fetch('/api/account/exchange_keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exchange, api_key: '', api_secret: '' }),
+    });
+    const data = await res.json();
+    showToast(data.msg, data.ok ? 'success' : 'error');
+    if (data.ok) loadAccount();
+  } catch (e) {
+    showToast('Error al eliminar keys', 'error');
+  }
+}
+
+async function deleteAccount() {
+  if (!await showConfirm('ELIMINAR CUENTA: Se borraran todos tus datos permanentemente. Continuar?')) return;
+  try {
+    const res = await fetch('/api/account', { method: 'DELETE' });
+    const data = await res.json();
+    if (data.ok) window.location.href = '/auth/login';
+    else showToast(data.msg, 'error');
+  } catch (e) {
+    showToast('Error al eliminar cuenta', 'error');
+  }
 }
 
 // ── Auth ─────────────────────────────────────────────────────

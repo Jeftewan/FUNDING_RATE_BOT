@@ -540,6 +540,75 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         except Exception as e:
             return jsonify({"rates": [], "timestamps": [], "avg": 0, "error": str(e)})
 
+    # ── Account & Exchange Keys (SaaS mode) ─────────────────
+    if db_enabled:
+        @app.route("/api/account")
+        @auth_required
+        def api_account():
+            from flask_login import current_user
+            from core.db_models import UserExchangeKey
+            keys = UserExchangeKey.query.filter_by(user_id=current_user.id).all()
+            return jsonify({
+                "ok": True,
+                "user": {
+                    "email": current_user.email,
+                    "is_admin": current_user.is_admin,
+                    "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
+                },
+                "exchange_keys": [
+                    {"exchange": k.exchange_name, "has_key": bool(k.api_key_encrypted)}
+                    for k in keys
+                ],
+            })
+
+        @app.route("/api/account/exchange_keys", methods=["POST"])
+        @auth_required
+        def api_save_exchange_keys():
+            from flask_login import current_user
+            from core.database import db as _db
+            from core.db_models import UserExchangeKey
+            from core.encryption import encrypt_value
+
+            data = flask_req.get_json() or {}
+            exchange = data.get("exchange", "").strip()
+            api_key = data.get("api_key", "").strip()
+            api_secret = data.get("api_secret", "").strip()
+            passphrase = data.get("passphrase", "").strip()
+
+            if not exchange:
+                return jsonify({"ok": False, "msg": "Exchange requerido"}), 400
+
+            existing = UserExchangeKey.query.filter_by(
+                user_id=current_user.id, exchange_name=exchange).first()
+
+            if not api_key and not api_secret:
+                # Delete keys
+                if existing:
+                    _db.session.delete(existing)
+                    _db.session.commit()
+                return jsonify({"ok": True, "msg": f"Keys de {exchange} eliminadas"})
+
+            if not existing:
+                existing = UserExchangeKey(user_id=current_user.id, exchange_name=exchange)
+                _db.session.add(existing)
+
+            existing.api_key_encrypted = encrypt_value(api_key) if api_key else ""
+            existing.api_secret_encrypted = encrypt_value(api_secret) if api_secret else ""
+            existing.passphrase_encrypted = encrypt_value(passphrase) if passphrase else ""
+            _db.session.commit()
+
+            return jsonify({"ok": True, "msg": f"Keys de {exchange} guardadas"})
+
+        @app.route("/api/account", methods=["DELETE"])
+        @auth_required
+        def api_delete_account():
+            from flask_login import current_user, logout_user
+            from core.database import db as _db
+            _db.session.delete(current_user)
+            _db.session.commit()
+            logout_user()
+            return jsonify({"ok": True, "msg": "Cuenta eliminada"})
+
     # ── Index ──────────────────────────────────────────────────
     @app.route("/")
     @auth_required
