@@ -503,6 +503,20 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
         status = scanner_worker.exchange_manager.get_exchange_status()
         return jsonify({"exchanges": status})
 
+    # ── Funding History (for mini-charts) ─────────────────────
+    @app.route("/api/funding_history/<symbol>/<exchange>")
+    def api_funding_history(symbol, exchange):
+        try:
+            history = scanner_worker.exchange_manager.fetch_funding_history(
+                symbol, exchange, limit=30)
+            return jsonify({
+                "rates": history.rates,
+                "timestamps": history.timestamps,
+                "avg": history.avg,
+            })
+        except Exception as e:
+            return jsonify({"rates": [], "timestamps": [], "avg": 0, "error": str(e)})
+
     # ── Index ──────────────────────────────────────────────────
     @app.route("/")
     def index():
