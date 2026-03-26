@@ -81,9 +81,10 @@ class SpotPerpOpportunity:
     rsi: float = -1
     stability_grade: str = "D"
     estimated_hold_days: int = 0
+    indicators: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "mode": "spot_perp",
             "symbol": self.symbol, "exchange": self.exchange,
             "funding_rate": self.funding_rate,
@@ -103,6 +104,19 @@ class SpotPerpOpportunity:
             "stability_grade": self.stability_grade,
             "estimated_hold_days": self.estimated_hold_days,
         }
+        if self.indicators:
+            d["indicators"] = {
+                "momentum_signal": self.indicators.get("momentum", {}).get("signal", ""),
+                "momentum_roc": self.indicators.get("momentum", {}).get("roc", 0),
+                "z_score": self.indicators.get("z_score", {}).get("z", 0),
+                "z_risk": self.indicators.get("z_score", {}).get("risk", ""),
+                "percentile": self.indicators.get("percentile", {}).get("percentile", 0),
+                "regime": self.indicators.get("regime", {}).get("regime", ""),
+                "is_spike_incoming": self.indicators.get("is_spike_incoming", False),
+                "is_spike_ending": self.indicators.get("is_spike_ending", False),
+                "is_bonanza": self.indicators.get("is_bonanza", False),
+            }
+        return d
 
 
 @dataclass
@@ -134,9 +148,10 @@ class CrossExchangeOpportunity:
     stability_grade: str = "D"
     estimated_hold_days: int = 0
     volume_24h: float = 0
+    indicators: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "mode": "cross_exchange",
             "symbol": self.symbol,
             "long_exchange": self.long_exchange,
@@ -165,6 +180,19 @@ class CrossExchangeOpportunity:
             "estimated_hold_days": self.estimated_hold_days,
             "volume_24h": self.volume_24h,
         }
+        if self.indicators:
+            d["indicators"] = {
+                "momentum_signal": self.indicators.get("momentum", {}).get("signal", ""),
+                "momentum_roc": self.indicators.get("momentum", {}).get("roc", 0),
+                "z_score": self.indicators.get("z_score", {}).get("z", 0),
+                "z_risk": self.indicators.get("z_score", {}).get("risk", ""),
+                "percentile": self.indicators.get("percentile", {}).get("percentile", 0),
+                "regime": self.indicators.get("regime", {}).get("regime", ""),
+                "is_spike_incoming": self.indicators.get("is_spike_incoming", False),
+                "is_spike_ending": self.indicators.get("is_spike_ending", False),
+                "is_bonanza": self.indicators.get("is_bonanza", False),
+            }
+        return d
 
 
 @dataclass

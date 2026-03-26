@@ -345,6 +345,16 @@ function renderOpps(data) {
     const fr = !isCross ? o.funding_rate : o.rate_differential;
     const frPct = (fr * 100).toFixed(4);
     const days = o.estimated_hold_days || '?';
+    const ind = o.indicators || {};
+    const momSignal = ind.momentum_signal || '';
+    const momArrow = momSignal === 'accelerating' ? '⬆' : momSignal === 'decelerating' ? '⬇' : momSignal === 'negative' ? '↓' : '→';
+    const momClass = momSignal === 'accelerating' ? 'ind-up' : momSignal === 'negative' ? 'ind-down' : 'ind-flat';
+    const regimeBadge = ind.regime === 'high_vol' ? '<span class="ind-badge ind-bonanza" title="Alta volatilidad — periodo de bonanza">BONANZA</span>' :
+                        ind.regime === 'low_vol' ? '<span class="ind-badge ind-lowvol" title="Baja volatilidad">BAJA VOL</span>' : '';
+    const spikeBadge = ind.is_spike_incoming ? '<span class="ind-badge ind-spike" title="Momentum positivo + tasa sostenible">SPIKE ↑</span>' :
+                       ind.is_spike_ending ? '<span class="ind-badge ind-warn" title="Tasa extrema — riesgo de reversion">REVERSION ⚠</span>' : '';
+    const zBadge = ind.z_risk === 'extreme' ? '<span class="ind-badge ind-danger" title="Z-score extremo — tasa insostenible">Z:'+ind.z_score+'</span>' :
+                   ind.z_risk === 'high' ? '<span class="ind-badge ind-warn" title="Z-score alto — riesgo de reversion">Z:'+ind.z_score+'</span>' : '';
 
     return `
     <div class="opp-card${grade === 'A' ? ' grade-a' : ''}">
@@ -355,6 +365,7 @@ function renderOpps(data) {
           <span style="font-size:11px;color:#888;margin-left:6px">${exchange}</span>
         </div>
         <div style="display:flex;gap:6px;align-items:center">
+          ${spikeBadge}${regimeBadge}${zBadge}
           <span class="opp-badge ${grade}">${grade}</span>
           <span style="font-size:12px;color:#fff;font-weight:700">${o.score}/100</span>
         </div>
@@ -369,6 +380,8 @@ function renderOpps(data) {
         <div class="opp-stat"><span class="label" data-tooltip="Costos de entrada + salida estimados">Fees</span><span class="value">$${o.fees_total?.toFixed(2) || o.total_fees?.toFixed(2)}</span></div>
         <div class="opp-stat"><span class="label" data-tooltip="Horas necesarias para cubrir los costos de entrada y salida">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
         <div class="opp-stat"><span class="label" data-tooltip="Dias estimados de hold recomendado">Est. dias</span><span class="value">${days}d</span></div>
+        ${ind.momentum_signal ? `<div class="opp-stat"><span class="label" data-tooltip="Momentum: ${momSignal} (ROC: ${ind.momentum_roc||0})">Mom</span><span class="value ${momClass}">${momArrow}</span></div>` : ''}
+        ${ind.percentile !== undefined ? `<div class="opp-stat"><span class="label" data-tooltip="Percentil de la tasa actual vs historico reciente">Pctl</span><span class="value">${Math.round(ind.percentile||0)}%</span></div>` : ''}
       </div>
 
       <div class="opp-meta">
@@ -455,6 +468,13 @@ function renderDefiOpps(data) {
     const isMixed = (defiExs.includes(le)) !== (defiExs.includes(se));
     const modeLabel = isMixed ? 'CEX+DeFi' : 'DeFi-DeFi';
 
+    const dInd = o.indicators || {};
+    const dSpikeBadge = dInd.is_spike_incoming ? '<span class="ind-badge ind-spike">SPIKE ↑</span>' :
+                        dInd.is_spike_ending ? '<span class="ind-badge ind-warn">REVERSION ⚠</span>' : '';
+    const dRegimeBadge = dInd.regime === 'high_vol' ? '<span class="ind-badge ind-bonanza">BONANZA</span>' :
+                         dInd.regime === 'low_vol' ? '<span class="ind-badge ind-lowvol">BAJA VOL</span>' : '';
+    const dZBadge = (dInd.z_risk === 'extreme' || dInd.z_risk === 'high') ? '<span class="ind-badge ind-danger">Z:'+dInd.z_score+'</span>' : '';
+
     return `
     <div class="opp-card" style="border-left:3px solid ${isMixed ? '#f59e0b' : '#8b5cf6'}">
       <div class="opp-header">
@@ -464,6 +484,7 @@ function renderDefiOpps(data) {
           <span style="font-size:11px;color:#888;margin-left:6px">${exchange}</span>
         </div>
         <div style="display:flex;gap:6px;align-items:center">
+          ${dSpikeBadge}${dRegimeBadge}${dZBadge}
           <span class="opp-badge ${grade}">${grade}</span>
           <span style="font-size:12px;color:#fff;font-weight:700">${o.score}/100</span>
         </div>

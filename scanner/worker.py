@@ -35,6 +35,7 @@ class ScannerWorker:
         self.config = config
         self.email_notifier = email_notifier
         self.defi_manager = defi_manager
+        self._flask_app = None  # Set by app.py when DB is enabled
         self._started = False
         self._last_scan_ts = 0
         self._scan_lock = threading.Lock()
@@ -374,6 +375,9 @@ class ScannerWorker:
         # Sort by score DESC
         opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
 
+        # 6.5 Store funding rate snapshots for data accumulation (if DB enabled)
+        self._store_rate_snapshots(all_data + defi_data)
+
         # 7. Update state
         status_parts = [f"{len(r)}{n[:2].upper()}" for n, r in all_rates.items() if r]
         status_str = "+".join(status_parts)
@@ -409,6 +413,73 @@ class ScannerWorker:
             f"Scan #{self.state_manager.get('scan_count')}: "
             f"{len(all_data)} pairs, {n_sp} spot-perp, {n_cx} cross-exchange"
         )
+
+    # ── Rate Snapshot Storage (data accumulation for ML) ─────
+
+    def _store_rate_snapshots(self, all_data: list):
+        """Store funding rate snapshots to PostgreSQL for future analysis.
+
+        Only runs if flask_app is set (DB enabled). Non-blocking — errors
+        are logged but never disrupt the scan pipeline.
+        """
+        if not self._flask_app:
+            return
+
+        try:
+            with self._flask_app.app_context():
+                from core.database import db
+                from core.db_models import FundingRateSnapshot
+                from datetime import datetime, timezone
+
+                now = datetime.now(timezone.utc)
+                inserted = 0
+
+                for d in all_data:
+                    funding_ts = d.get("next_funding_ts", 0)
+                    if not funding_ts:
+                        continue
+
+                    sym = d.get("symbol", "")
+                    exch = d.get("exchange", "")
+                    fts = int(funding_ts)
+
+                    # Skip if this exact snapshot already exists
+                    exists = FundingRateSnapshot.query.filter_by(
+                        symbol=sym, exchange=exch, funding_ts=fts
+                    ).first()
+                    if exists:
+                        continue
+
+                    snapshot = FundingRateSnapshot(
+                        symbol=sym, exchange=exch,
+                        rate=d.get("fr", 0),
+                        volume_24h=d.get("vol24h", 0),
+                        mark_price=d.get("price", 0),
+                        interval_hours=int(d.get("ih", 8)),
+                        funding_ts=fts, captured_at=now,
+                    )
+                    db.session.add(snapshot)
+                    inserted += 1
+
+                if inserted:
+                    db.session.commit()
+
+                # Cleanup old snapshots (>90 days) — run occasionally
+                scan_count = self.state_manager.get("scan_count", 0)
+                if scan_count % 50 == 0:  # Every ~50 scans
+                    from datetime import timedelta
+                    cutoff = now - timedelta(days=90)
+                    deleted = FundingRateSnapshot.query.filter(
+                        FundingRateSnapshot.captured_at < cutoff
+                    ).delete()
+                    db.session.commit()
+                    if deleted:
+                        log.info(f"Cleaned {deleted} old rate snapshots")
+
+                log.info(f"Stored {inserted} rate snapshots")
+
+        except Exception as e:
+            log.warning(f"Rate snapshot storage failed (non-critical): {e}")
 
     # ── Data helpers ──────────────────────────────────────────
 

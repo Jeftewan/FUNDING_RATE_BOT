@@ -70,6 +70,17 @@ body{font-family:'JetBrains Mono',monospace;background:#0a0b0d;color:#c8ccd0;min
 .opp-badge.B{background:#3b82f622;color:#3b82f6;border:1px solid #3b82f644}
 .opp-badge.C{background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b44}
 .opp-badge.D{background:#ef444422;color:#ef4444;border:1px solid #ef444444}
+
+/* Indicator badges */
+.ind-badge{font-size:9px;padding:2px 6px;border-radius:8px;font-weight:700;letter-spacing:0.3px;white-space:nowrap}
+.ind-spike{background:#22c55e22;color:#22c55e;border:1px solid #22c55e55}
+.ind-bonanza{background:#a855f722;color:#a855f7;border:1px solid #a855f755}
+.ind-warn{background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b55}
+.ind-danger{background:#ef444422;color:#ef4444;border:1px solid #ef444455}
+.ind-lowvol{background:#64748b22;color:#64748b;border:1px solid #64748b44}
+.ind-up{color:#22c55e;font-weight:700}
+.ind-down{color:#ef4444;font-weight:700}
+.ind-flat{color:#888;font-weight:700}
 .opp-mode{font-size:10px;color:#888;background:#1a1d23;padding:2px 6px;border-radius:4px}
 .opp-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:6px;
            font-size:11px;margin-bottom:8px}

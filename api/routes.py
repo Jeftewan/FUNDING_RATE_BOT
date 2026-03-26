@@ -1,4 +1,4 @@
-"""Flask API routes — v9.0 unified."""
+"""Flask API routes — v10.0 unified."""
 import time
 import threading
 import logging
@@ -37,7 +37,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         s = state_manager.state
         return jsonify({
             "ok": True, "scans": s["scan_count"],
-            "status": s["status"], "version": "9.0",
+            "status": s["status"], "version": "10.0",
         })
 
     # ── Config ─────────────────────────────────────────────────

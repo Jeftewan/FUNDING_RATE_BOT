@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Funding Rate Arbitrage Bot v9.0
+Funding Rate Arbitrage Bot v10.0
 4 CEX (Binance, Bybit, OKX, Bitget) + 5 DeFi via CCXT
 Multi-user SaaS with PostgreSQL + magic link auth
 """
@@ -123,6 +123,10 @@ if Config.USE_DB and Config.DATABASE_URL:
 if not db_enabled:
     log.info("Running in single-user mode (JSON persistence)")
 
+# Give scanner access to flask app for rate snapshot storage
+if db_enabled:
+    scanner_worker._flask_app = app
+
 # ── API Routes ────────────────────────────────────────────────
 from api.routes import init_routes
 init_routes(app, state_manager, scanner_worker, Config,
@@ -131,7 +135,7 @@ init_routes(app, state_manager, scanner_worker, Config,
 s = state_manager.state
 mode = "SaaS" if db_enabled else "Single-user"
 log.info(
-    f"Bot v9.0 [{mode}]: ${s['total_capital']:,.0f} | "
+    f"Bot v10.0 [{mode}]: ${s['total_capital']:,.0f} | "
     f"{s['scan_interval']//60}min | "
     f"Exchanges: {', '.join(Config.ENABLED_EXCHANGES)} | "
     f"{Config.DATA_DIR}"

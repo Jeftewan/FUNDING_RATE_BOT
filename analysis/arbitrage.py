@@ -95,7 +95,7 @@ class ArbitrageScanner:
         gross_3d_usd = NOTIONAL * abs(accumulated_3d) if abs(accumulated_3d) > 0 else 1
         fee_drag = fees["total_cost"] / gross_3d_usd
 
-        sc = opportunity_score({
+        score_params = {
             "cv": cv,
             "min_ratio": min_ratio,
             "streak": history_obj.streak,
@@ -106,7 +106,8 @@ class ArbitrageScanner:
             "fee_drag": fee_drag,
             "current_rate": fr.rate,
             "rates": rates,
-        })
+        }
+        sc = opportunity_score(score_params)
         grade = stability_grade(sc)
         est_days = estimated_hold_days(hist_dict)
 
@@ -135,6 +136,7 @@ class ArbitrageScanner:
             history=hist_dict,
             stability_grade=grade,
             estimated_hold_days=est_days,
+            indicators=score_params.get("_indicators", {}),
         )
 
     def scan_cross_exchange_opportunities(
@@ -257,7 +259,7 @@ class ArbitrageScanner:
         settlement_avg = (abs(diff_hist.get("avg_diff", 0))
                           if diff_series else abs(differential))
 
-        sc = opportunity_score({
+        cross_score_params = {
             "cv": diff_hist.get("cv", 999),
             "min_ratio": diff_hist.get("min_ratio", 0),
             "streak": diff_hist.get("streak", 0),
@@ -268,7 +270,8 @@ class ArbitrageScanner:
             "fee_drag": fee_ratio,
             "current_rate": differential,
             "rates": diff_series,
-        })
+        }
+        sc = opportunity_score(cross_score_params)
 
         liq_risk = "LOW"
         if NOTIONAL < 2000:
@@ -317,6 +320,7 @@ class ArbitrageScanner:
             stability_grade=grade,
             estimated_hold_days=est_days,
             volume_24h=max(long_fr.volume_24h, short_fr.volume_24h),
+            indicators=cross_score_params.get("_indicators", {}),
         )
 
     @staticmethod

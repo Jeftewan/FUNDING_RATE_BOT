@@ -131,3 +131,30 @@ class ScanCache(db.Model):
     defi_json = db.Column(db.JSON, default=list)
     all_data_json = db.Column(db.JSON, default=dict)
     scan_count = db.Column(db.Integer, default=0)
+
+
+class FundingRateSnapshot(db.Model):
+    """Historical funding rate snapshots for data accumulation.
+
+    Stores rate data from each scan for future analysis and ML training.
+    Retention: 90 days (~180K rows, ~18MB).
+    """
+    __tablename__ = "funding_rate_snapshots"
+
+    id = db.Column(db.Integer, primary_key=True)
+    symbol = db.Column(db.String(20), nullable=False)
+    exchange = db.Column(db.String(50), nullable=False)
+    rate = db.Column(db.Float, nullable=False)
+    volume_24h = db.Column(db.Float, default=0)
+    open_interest = db.Column(db.Float, nullable=True)
+    mark_price = db.Column(db.Float, default=0)
+    interval_hours = db.Column(db.Integer, default=8)
+    funding_ts = db.Column(db.BigInteger, default=0)  # funding payment timestamp
+    captured_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
+                            nullable=False, index=True)
+
+    __table_args__ = (
+        db.UniqueConstraint("symbol", "exchange", "funding_ts",
+                            name="uq_snapshot_symbol_exchange_ts"),
+        db.Index("idx_frs_symbol_exchange", "symbol", "exchange", "captured_at"),
+    )
