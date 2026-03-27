@@ -3,6 +3,270 @@ let currentSubTab = 'cex';
 let refreshTimer = null;
 const calcCache = {};  // oppId -> { html, capVal, levVal }
 
+// ── Toast notification system ────────────────────────────────
+function showToast(msg, type = 'info', duration = 4000) {
+  const container = document.getElementById('toast-container');
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  const icons = { success: '\u2713', error: '\u2717', warning: '\u26A0', info: '\u2139' };
+  toast.innerHTML = `<span class="toast-icon">${icons[type] || icons.info}</span><span class="toast-msg">${msg}</span>`;
+  toast.onclick = () => dismissToast(toast);
+  container.appendChild(toast);
+  setTimeout(() => dismissToast(toast), duration);
+  return toast;
+}
+
+function dismissToast(toast) {
+  if (toast.classList.contains('hiding')) return;
+  toast.classList.add('hiding');
+  toast.addEventListener('animationend', () => toast.remove());
+}
+
+function showConfirm(msg) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `
+      <div class="confirm-box">
+        <div class="confirm-msg">${msg}</div>
+        <div class="confirm-actions">
+          <button class="btn btn-secondary" data-action="cancel">Cancelar</button>
+          <button class="btn btn-primary" data-action="ok">Confirmar</button>
+        </div>
+      </div>`;
+    const close = (val) => { overlay.remove(); resolve(val); };
+    overlay.querySelector('[data-action="ok"]').onclick = () => close(true);
+    overlay.querySelector('[data-action="cancel"]').onclick = () => close(false);
+    overlay.onclick = (e) => { if (e.target === overlay) close(false); };
+    const onEsc = (e) => { if (e.key === 'Escape') { document.removeEventListener('keydown', onEsc); close(false); } };
+    document.addEventListener('keydown', onEsc);
+    document.body.appendChild(overlay);
+    overlay.querySelector('[data-action="ok"]').focus();
+  });
+}
+
+// ── Loading skeletons ─────────────────────────────────────────
+function showSkeletons(el, count = 3) {
+  el.innerHTML = Array.from({length: count}, () => `
+    <div class="skeleton-card">
+      <div class="skeleton skeleton-line w60"></div>
+      <div class="skeleton-grid">
+        <div class="skeleton skeleton-line w80"></div>
+        <div class="skeleton skeleton-line w40"></div>
+        <div class="skeleton skeleton-line w60"></div>
+        <div class="skeleton skeleton-line w30"></div>
+      </div>
+      <div class="skeleton skeleton-line w40" style="margin-top:12px"></div>
+    </div>`).join('');
+}
+
+// ── Sort & filter state ──────────────────────────────────────
+let sortState = { field: 'score', dir: 'desc' };
+let _lastCexData = null;
+let _lastDefiData = null;
+
+function setSort(field) {
+  if (sortState.field === field) {
+    sortState.dir = sortState.dir === 'desc' ? 'asc' : 'desc';
+  } else {
+    sortState.field = field;
+    sortState.dir = field === 'be' ? 'asc' : 'desc';
+  }
+  document.querySelectorAll('.sort-btn').forEach(b => {
+    const isActive = b.dataset.sort === field;
+    b.classList.toggle('active', isActive);
+    if (isActive) {
+      const arrow = sortState.dir === 'desc' ? ' \u25BC' : ' \u25B2';
+      b.textContent = b.textContent.replace(/ [\u25BC\u25B2]/, '') + arrow;
+    } else {
+      b.textContent = b.textContent.replace(/ [\u25BC\u25B2]/, '');
+    }
+  });
+  applyFilters();
+}
+
+function applyFilters() {
+  if (currentSubTab === 'cex' && _lastCexData) renderOpps(_lastCexData);
+  else if (currentSubTab === 'defi' && _lastDefiData) renderDefiOpps(_lastDefiData);
+}
+
+function sortAndFilter(opps) {
+  const query = (document.getElementById('search-symbol')?.value || '').toLowerCase();
+  let filtered = query ? opps.filter(o => o.symbol.toLowerCase().includes(query)) : [...opps];
+
+  const fieldMap = {
+    score: o => o.score || 0,
+    apr: o => o.apr || 0,
+    fr: o => o.funding_rate || o.rate_differential || 0,
+    net3d: o => o.net_3d_revenue_per_1000 || 0,
+    volume: o => o.volume_24h || 0,
+    be: o => o.break_even_hours || 999,
+  };
+  const getter = fieldMap[sortState.field] || fieldMap.score;
+  const mult = sortState.dir === 'desc' ? -1 : 1;
+  filtered.sort((a, b) => mult * (getter(a) - getter(b)));
+  return filtered;
+}
+
+// ── Mini-charts ──────────────────────────────────────────────
+const _chartCache = {};     // symbol_exchange -> { rates, timestamps }
+const _chartInstances = {}; // canvasId -> Chart instance
+let _chartQueue = [];
+let _chartActive = 0;
+const MAX_CONCURRENT_CHARTS = 3;
+
+function initMiniChartObserver() {
+  if (!window.IntersectionObserver || typeof Chart === 'undefined') return;
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const el = entry.target;
+        const symbol = el.dataset.chartSymbol;
+        const exchange = el.dataset.chartExchange;
+        if (symbol && exchange) {
+          observer.unobserve(el);
+          enqueueChart(el, symbol, exchange);
+        }
+      }
+    });
+  }, { rootMargin: '100px' });
+
+  document.querySelectorAll('.mini-chart[data-chart-symbol]').forEach(el => observer.observe(el));
+}
+
+function enqueueChart(el, symbol, exchange) {
+  _chartQueue.push({ el, symbol, exchange });
+  processChartQueue();
+}
+
+async function processChartQueue() {
+  while (_chartQueue.length && _chartActive < MAX_CONCURRENT_CHARTS) {
+    _chartActive++;
+    const { el, symbol, exchange } = _chartQueue.shift();
+    try { await loadMiniChart(el, symbol, exchange); } catch (e) {}
+    _chartActive--;
+  }
+}
+
+async function loadMiniChart(el, symbol, exchange) {
+  const key = `${symbol}_${exchange}`;
+  let data = _chartCache[key];
+  if (!data) {
+    try {
+      const res = await fetch(`/api/funding_history/${encodeURIComponent(symbol)}/${encodeURIComponent(exchange)}`);
+      data = await res.json();
+      if (data.rates?.length) _chartCache[key] = data;
+    } catch (e) { return; }
+  }
+  if (!data?.rates?.length) { el.innerHTML = ''; return; }
+  renderMiniChart(el, data.rates, data.timestamps);
+}
+
+function renderMiniChart(container, rates, timestamps) {
+  const canvas = document.createElement('canvas');
+  container.innerHTML = '';
+  container.appendChild(canvas);
+
+  const avgRate = rates.reduce((a, b) => a + b, 0) / rates.length;
+  const color = avgRate >= 0 ? '#22c55e' : '#ef4444';
+
+  const id = container.id || 'mc-' + Math.random().toString(36).slice(2);
+  if (_chartInstances[id]) { _chartInstances[id].destroy(); delete _chartInstances[id]; }
+
+  _chartInstances[id] = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: timestamps.map(t => ''),
+      datasets: [{
+        data: rates.map(r => r * 100),
+        borderColor: color,
+        backgroundColor: color + '11',
+        fill: true,
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.3,
+      }],
+    },
+    options: {
+      responsive: false,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      scales: {
+        x: { display: false },
+        y: { display: false },
+      },
+      animation: { duration: 300 },
+    },
+  });
+}
+
+// ── Earnings chart ───────────────────────────────────────────
+let _earningsChart = null;
+const CHART_COLORS = ['#22c55e','#3b82f6','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899'];
+
+function renderEarningsChart(positions) {
+  const container = document.getElementById('earnings-chart-container');
+  const canvas = document.getElementById('earnings-chart');
+  if (!container || !canvas || typeof Chart === 'undefined') return;
+
+  const withPayments = (positions || []).filter(p => p.payments?.length >= 2);
+  if (!withPayments.length) { container.style.display = 'none'; return; }
+  container.style.display = '';
+
+  if (_earningsChart) { _earningsChart.destroy(); _earningsChart = null; }
+
+  const datasets = withPayments.map((p, i) => ({
+    label: `${p.symbol} (${p.exchange || p.long_exchange + '/' + p.short_exchange})`,
+    data: p.payments.map(pay => ({ x: pay.ts * 1000, y: pay.cumulative })),
+    borderColor: CHART_COLORS[i % CHART_COLORS.length],
+    backgroundColor: CHART_COLORS[i % CHART_COLORS.length] + '22',
+    fill: false,
+    borderWidth: 2,
+    pointRadius: 2,
+    tension: 0.3,
+  }));
+
+  _earningsChart = new Chart(canvas, {
+    type: 'line',
+    data: { datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'top', labels: { color: '#888', font: { size: 10, family: 'JetBrains Mono' }, boxWidth: 12 } },
+        tooltip: { mode: 'index', intersect: false },
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          ticks: { color: '#555', font: { size: 9 }, callback: v => new Date(v).toLocaleDateString('es', { day: '2-digit', month: 'short' }) },
+          grid: { color: '#1a1d2344' },
+        },
+        y: {
+          ticks: { color: '#555', font: { size: 9 }, callback: v => '$' + v.toFixed(2) },
+          grid: { color: '#1a1d2344' },
+        },
+      },
+      animation: { duration: 300 },
+    },
+  });
+}
+
+// ── Exchange status ──────────────────────────────────────────
+let _exchangeStatusTimer = 0;
+async function loadExchangeStatus() {
+  try {
+    const res = await fetch('/api/exchanges/status');
+    const data = await res.json();
+    const el = document.getElementById('st-exchanges');
+    if (!el || !data.exchanges) return;
+    el.innerHTML = Object.entries(data.exchanges).map(([name, info]) => {
+      const ok = info.status === 'ok' || info.connected;
+      return `<span><i class="exchange-dot ${ok ? 'ok' : 'err'}"></i>${name}</span>`;
+    }).join('');
+  } catch (e) {}
+}
+
 // ── Tab switching ─────────────────────────────────────────────
 function switchTab(tab) {
   currentTab = tab;
@@ -31,6 +295,7 @@ function refresh() {
   if (currentTab === 'opportunities') loadCurrentOpps();
   else if (currentTab === 'positions') loadPositions();
   else if (currentTab === 'config') loadConfig();
+  else if (currentTab === 'account') loadAccount();
 }
 
 // ── Auto refresh ──────────────────────────────────────────────
@@ -41,9 +306,12 @@ function startRefresh() {
 
 // ── Opportunities ─────────────────────────────────────────────
 async function loadOpps() {
+  const el = document.getElementById('opp-list-cex');
+  if (!el.children.length || el.querySelector('.skeleton-card')) showSkeletons(el);
   try {
     const res = await fetch('/api/opportunities');
     const data = await res.json();
+    _lastCexData = data;
     renderOpps(data);
     updateStatus(data);
     setScanUI(!!data.scanning);
@@ -53,13 +321,18 @@ async function loadOpps() {
 }
 
 function renderOpps(data) {
-  const opps = data.opportunities || [];
+  const rawOpps = data.opportunities || [];
+  const opps = sortAndFilter(rawOpps);
   const el = document.getElementById('opp-list-cex');
   document.getElementById('opp-count').textContent =
     `${opps.length} oportunidades (${data.total_unfiltered || 0} total)`;
 
   if (!opps.length) {
-    el.innerHTML = '<div style="text-align:center;padding:40px;color:#555">Sin oportunidades — esperando escaneo</div>';
+    el.innerHTML = `<div class="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M7 16l4-4 3 3 4-5"/></svg>
+      <div class="empty-title">Sin oportunidades</div>
+      <div class="empty-sub">Esperando escaneo de exchanges...</div>
+    </div>`;
     return;
   }
 
@@ -72,9 +345,19 @@ function renderOpps(data) {
     const fr = !isCross ? o.funding_rate : o.rate_differential;
     const frPct = (fr * 100).toFixed(4);
     const days = o.estimated_hold_days || '?';
+    const ind = o.indicators || {};
+    const momSignal = ind.momentum_signal || '';
+    const momArrow = momSignal === 'accelerating' ? '⬆' : momSignal === 'decelerating' ? '⬇' : momSignal === 'negative' ? '↓' : '→';
+    const momClass = momSignal === 'accelerating' ? 'ind-up' : momSignal === 'negative' ? 'ind-down' : 'ind-flat';
+    const regimeBadge = ind.regime === 'high_vol' ? '<span class="ind-badge ind-bonanza" title="Alta volatilidad — periodo de bonanza">BONANZA</span>' :
+                        ind.regime === 'low_vol' ? '<span class="ind-badge ind-lowvol" title="Baja volatilidad">BAJA VOL</span>' : '';
+    const spikeBadge = ind.is_spike_incoming ? '<span class="ind-badge ind-spike" title="Momentum positivo + tasa sostenible">SPIKE ↑</span>' :
+                       ind.is_spike_ending ? '<span class="ind-badge ind-warn" title="Tasa extrema — riesgo de reversion">REVERSION ⚠</span>' : '';
+    const zBadge = ind.z_risk === 'extreme' ? '<span class="ind-badge ind-danger" title="Z-score extremo — tasa insostenible">Z:'+ind.z_score+'</span>' :
+                   ind.z_risk === 'high' ? '<span class="ind-badge ind-warn" title="Z-score alto — riesgo de reversion">Z:'+ind.z_score+'</span>' : '';
 
     return `
-    <div class="opp-card">
+    <div class="opp-card${grade === 'A' ? ' grade-a' : ''}">
       <div class="opp-header">
         <div>
           <span class="opp-symbol">${o.symbol}/USDT</span>
@@ -82,20 +365,23 @@ function renderOpps(data) {
           <span style="font-size:11px;color:#888;margin-left:6px">${exchange}</span>
         </div>
         <div style="display:flex;gap:6px;align-items:center">
+          ${spikeBadge}${regimeBadge}${zBadge}
           <span class="opp-badge ${grade}">${grade}</span>
           <span style="font-size:12px;color:#fff;font-weight:700">${o.score}/100</span>
         </div>
       </div>
 
       <div class="opp-stats">
-        <div class="opp-stat"><span class="label">FR</span><span class="value green">${frPct}%</span></div>
-        <div class="opp-stat"><span class="label">APR</span><span class="value green">${o.apr?.toFixed(1)}%</span></div>
-        <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
-        <div class="opp-stat"><span class="label">$/dia (1K)</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
-        <div class="opp-stat"><span class="label">Neto 3d (1K)</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
-        <div class="opp-stat"><span class="label">Fees</span><span class="value">$${o.fees_total?.toFixed(2) || o.total_fees?.toFixed(2)}</span></div>
-        <div class="opp-stat"><span class="label">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
-        <div class="opp-stat"><span class="label">Est. dias</span><span class="value">${days}d</span></div>
+        <div class="opp-stat"><span class="label" data-tooltip="Tasa de financiacion actual del contrato perpetuo">FR</span><span class="value green">${frPct}%</span></div>
+        <div class="opp-stat"><span class="label" data-tooltip="Tasa anualizada basada en la tasa actual">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
+        <div class="opp-stat"><span class="label" data-tooltip="Tasa acumulada en los ultimos 3 dias">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
+        <div class="opp-stat"><span class="label" data-tooltip="Ingreso diario estimado por cada $1,000">$/dia (1K)</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label" data-tooltip="Ganancia neta en 3 dias por $1,000 (menos fees)">Neto 3d (1K)</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label" data-tooltip="Costos de entrada + salida estimados">Fees</span><span class="value">$${o.fees_total?.toFixed(2) || o.total_fees?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label" data-tooltip="Horas necesarias para cubrir los costos de entrada y salida">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
+        <div class="opp-stat"><span class="label" data-tooltip="Dias estimados de hold recomendado">Est. dias</span><span class="value">${days}d</span></div>
+        ${ind.momentum_signal ? `<div class="opp-stat"><span class="label" data-tooltip="Momentum: ${momSignal} (ROC: ${ind.momentum_roc||0})">Mom</span><span class="value ${momClass}">${momArrow}</span></div>` : ''}
+        ${ind.percentile !== undefined ? `<div class="opp-stat"><span class="label" data-tooltip="Percentil de la tasa actual vs historico reciente">Pctl</span><span class="value">${Math.round(ind.percentile||0)}%</span></div>` : ''}
       </div>
 
       <div class="opp-meta">
@@ -105,6 +391,8 @@ function renderOpps(data) {
           : `Intervalo: ${o.interval_hours || '?'}h`} |
         ${o.mins_to_next > 0 ? `Prox pago: ${Math.round(o.mins_to_next)}min` : ''}
       </div>
+
+      <div class="mini-chart" id="mc-cex-${i}" data-chart-symbol="${o.symbol}" data-chart-exchange="${!isCross ? o.exchange : o.short_exchange}"></div>
 
       <div class="opp-actions">
         <input type="number" id="cap-${i}" placeholder="Capital $" class="inp-sm" style="width:90px">
@@ -128,13 +416,17 @@ function renderOpps(data) {
       if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
     }
   });
+  setTimeout(initMiniChartObserver, 50);
 }
 
 // ── DeFi Opportunities ────────────────────────────────────────
 async function loadDefiOpps() {
+  const el = document.getElementById('opp-list-defi');
+  if (!el.children.length || el.querySelector('.skeleton-card')) showSkeletons(el);
   try {
     const res = await fetch('/api/defi_opportunities');
     const data = await res.json();
+    _lastDefiData = data;
     renderDefiOpps(data);
     updateStatus(data);
     setScanUI(!!data.scanning);
@@ -144,13 +436,18 @@ async function loadDefiOpps() {
 }
 
 function renderDefiOpps(data) {
-  const opps = data.opportunities || [];
+  const rawOpps = data.opportunities || [];
+  const opps = sortAndFilter(rawOpps);
   const el = document.getElementById('opp-list-defi');
   document.getElementById('opp-count').textContent =
     `${opps.length} oportunidades DeFi (${data.total_unfiltered || 0} total)`;
 
   if (!opps.length) {
-    el.innerHTML = '<div style="text-align:center;padding:40px;color:#555">Sin oportunidades DeFi — esperando escaneo</div>';
+    el.innerHTML = `<div class="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M7 16l4-4 3 3 4-5"/></svg>
+      <div class="empty-title">Sin oportunidades DeFi</div>
+      <div class="empty-sub">Esperando escaneo de protocolos DeFi...</div>
+    </div>`;
     return;
   }
 
@@ -171,6 +468,13 @@ function renderDefiOpps(data) {
     const isMixed = (defiExs.includes(le)) !== (defiExs.includes(se));
     const modeLabel = isMixed ? 'CEX+DeFi' : 'DeFi-DeFi';
 
+    const dInd = o.indicators || {};
+    const dSpikeBadge = dInd.is_spike_incoming ? '<span class="ind-badge ind-spike">SPIKE ↑</span>' :
+                        dInd.is_spike_ending ? '<span class="ind-badge ind-warn">REVERSION ⚠</span>' : '';
+    const dRegimeBadge = dInd.regime === 'high_vol' ? '<span class="ind-badge ind-bonanza">BONANZA</span>' :
+                         dInd.regime === 'low_vol' ? '<span class="ind-badge ind-lowvol">BAJA VOL</span>' : '';
+    const dZBadge = (dInd.z_risk === 'extreme' || dInd.z_risk === 'high') ? '<span class="ind-badge ind-danger">Z:'+dInd.z_score+'</span>' : '';
+
     return `
     <div class="opp-card" style="border-left:3px solid ${isMixed ? '#f59e0b' : '#8b5cf6'}">
       <div class="opp-header">
@@ -180,6 +484,7 @@ function renderDefiOpps(data) {
           <span style="font-size:11px;color:#888;margin-left:6px">${exchange}</span>
         </div>
         <div style="display:flex;gap:6px;align-items:center">
+          ${dSpikeBadge}${dRegimeBadge}${dZBadge}
           <span class="opp-badge ${grade}">${grade}</span>
           <span style="font-size:12px;color:#fff;font-weight:700">${o.score}/100</span>
         </div>
@@ -200,6 +505,8 @@ function renderDefiOpps(data) {
         Short: ${se} ${o.short_rate ? (o.short_rate*100).toFixed(4)+'%' : '?'} (${o.short_interval_hours||'?'}h)
         ${o.mins_to_next > 0 ? ` | Prox pago: ${Math.round(o.mins_to_next)}min` : ''}
       </div>
+
+      <div class="mini-chart" id="mc-defi-${idx}" data-chart-symbol="${o.symbol}" data-chart-exchange="${se}"></div>
 
       <div class="opp-actions">
         <input type="number" id="cap-${idx}" placeholder="Capital $" class="inp-sm" style="width:90px">
@@ -224,6 +531,7 @@ function renderDefiOpps(data) {
       if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
     }
   });
+  setTimeout(initMiniChartObserver, 50);
 }
 
 function gradeFromScore(s) {
@@ -244,7 +552,7 @@ function fmtVol(v) {
 async function calcEst(oppId, idx) {
   const cap = parseFloat(document.getElementById('cap-' + idx).value);
   const lev = parseInt(document.getElementById('lev-' + idx).value) || 1;
-  if (!cap || cap <= 0) { alert('Ingresa capital'); return; }
+  if (!cap || cap <= 0) { showToast('Ingresa capital', 'warning'); return; }
 
   const el = document.getElementById('est-' + idx);
   el.textContent = 'Calculando...';
@@ -325,8 +633,8 @@ async function calcEst(oppId, idx) {
 async function enterPosition(oppId, idx) {
   const cap = parseFloat(document.getElementById('cap-' + idx).value);
   const lev = parseInt(document.getElementById('lev-' + idx).value) || 1;
-  if (!cap || cap <= 0) { alert('Ingresa capital primero'); return; }
-  if (!confirm(`Abrir posicion con $${cap} x${lev}?`)) return;
+  if (!cap || cap <= 0) { showToast('Ingresa capital primero', 'warning'); return; }
+  if (!await showConfirm(`Abrir posicion con $${cap} x${lev}?`)) return;
 
   try {
     const res = await fetch('/api/open_position', {
@@ -339,10 +647,10 @@ async function enterPosition(oppId, idx) {
       showStepsModal(data);
       loadCurrentOpps();
     } else {
-      alert(data.msg);
+      showToast(data.msg, 'error');
     }
   } catch (e) {
-    alert('Error al abrir posicion');
+    showToast('Error al abrir posicion', 'error');
   }
 }
 
@@ -370,6 +678,8 @@ function closeModal() {
 
 // ── Positions ─────────────────────────────────────────────────
 async function loadPositions() {
+  const posEl = document.getElementById('pos-list');
+  if (!posEl.children.length || posEl.querySelector('.skeleton-card')) showSkeletons(posEl, 2);
   try {
     const [posRes, histRes] = await Promise.all([
       fetch('/api/positions'),
@@ -389,6 +699,7 @@ function renderPositions(data) {
   const positions = data.positions || [];
   const summary = data.summary || {};
   const alerts = data.alerts || [];
+  renderEarningsChart(positions);
 
   // Capital bar
   document.getElementById('capital-bar').innerHTML = `
@@ -410,7 +721,11 @@ function renderPositions(data) {
   // Positions
   const el = document.getElementById('pos-list');
   if (!positions.length) {
-    el.innerHTML = '<div style="text-align:center;padding:40px;color:#555">Sin posiciones activas</div>';
+    el.innerHTML = `<div class="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M12 10v4m-2-2h4"/></svg>
+      <div class="empty-title">Sin posiciones activas</div>
+      <div class="empty-sub"><span class="empty-cta" onclick="switchTab('opportunities')">Ve a Oportunidades</span> para abrir una posicion</div>
+    </div>`;
     return;
   }
 
@@ -482,7 +797,7 @@ function renderPositions(data) {
 }
 
 async function closePos(posId, symbol) {
-  if (!confirm(`Cerrar posicion ${symbol}?`)) return;
+  if (!await showConfirm(`Cerrar posicion ${symbol}?`)) return;
   try {
     const res = await fetch('/api/close_position', {
       method: 'POST',
@@ -492,21 +807,48 @@ async function closePos(posId, symbol) {
     const data = await res.json();
     if (data.ok) {
       const r = data.result;
-      alert(`${r.symbol} cerrada\nGanancia: $${r.earned.toFixed(2)}\nFees: $${r.fees.toFixed(2)}\nNeto: $${r.net_earned.toFixed(2)}\nDuracion: ${r.hours.toFixed(1)}h`);
+      showToast(`${r.symbol} cerrada — Neto: $${r.net_earned.toFixed(2)} (${r.hours.toFixed(1)}h)`, r.net_earned >= 0 ? 'success' : 'warning', 6000);
       loadPositions();
     } else {
-      alert(data.msg);
+      showToast(data.msg, 'error');
     }
   } catch (e) {
-    alert('Error al cerrar');
+    showToast('Error al cerrar posicion', 'error');
   }
+}
+
+let _lastHistoryData = [];
+
+function exportCSV() {
+  if (!_lastHistoryData.length) { showToast('Sin historial para exportar', 'warning'); return; }
+  const headers = ['Simbolo','Exchange','Modo','Capital','Horas','Pagos','Ganancia','Fees','Neto','Tasa Promedio','Razon','Fecha Cierre'];
+  const rows = _lastHistoryData.map(h => [
+    h.symbol, h.exchange, h.mode || 'spot_perp',
+    h.capital_used?.toFixed(2) || '', h.hours?.toFixed(1) || '',
+    h.payment_count || h.intervals || '', h.earned?.toFixed(4) || '',
+    h.fees?.toFixed(4) || '', (h.net_earned || h.earned)?.toFixed(4) || '',
+    h.avg_rate ? (h.avg_rate * 100).toFixed(4) + '%' : '',
+    h.reason || '', h.closed_at || h.time || '',
+  ]);
+  const csv = '\uFEFF' + [headers, ...rows].map(r => r.map(c => `"${c}"`).join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'historial_funding.csv'; a.click();
+  URL.revokeObjectURL(url);
+  showToast('CSV exportado', 'success');
 }
 
 function renderHistory(data) {
   const history = data.history || [];
+  _lastHistoryData = history;
   const el = document.getElementById('history-list');
   if (!history.length) {
-    el.innerHTML = '<div style="font-size:11px;color:#555">Sin historial</div>';
+    el.innerHTML = `<div class="empty-state" style="padding:24px">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:32px;height:32px"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+      <div class="empty-title">Sin historial</div>
+      <div class="empty-sub">Las posiciones cerradas apareceran aqui</div>
+    </div>`;
     return;
   }
   el.innerHTML = history.slice().reverse().slice(0, 20).map(h => {
@@ -525,7 +867,7 @@ async function clearHistory(resetAll) {
   const msg = resetAll
     ? 'RESET TOTAL: Borrar historial + cerrar todas las posiciones. Continuar?'
     : 'Borrar todo el historial de posiciones cerradas?';
-  if (!confirm(msg)) return;
+  if (!await showConfirm(msg)) return;
   try {
     const res = await fetch('/api/clear_history', {
       method: 'POST',
@@ -533,10 +875,10 @@ async function clearHistory(resetAll) {
       body: JSON.stringify({ reset_all: resetAll }),
     });
     const data = await res.json();
-    alert(data.msg || 'Listo');
+    showToast(data.msg || 'Listo', 'success');
     loadPositions();
   } catch (e) {
-    alert('Error al borrar');
+    showToast('Error al borrar', 'error');
   }
 }
 
@@ -645,7 +987,7 @@ async function forceScan() {
 
 // ── Status bar ────────────────────────────────────────────────
 function updateStatus(data) {
-  if (data.status) document.getElementById('st-status').textContent = data.status;
+  if (data.status) document.getElementById('st-status').innerHTML = '<i class="status-dot"></i>' + data.status;
   if (data.scan_count !== undefined)
     document.getElementById('st-scan').textContent = 'Scan #' + data.scan_count;
   if (data.last_scan)
@@ -667,8 +1009,108 @@ function playBeep() {
   } catch (e) {}
 }
 
+// ── Account & Exchange Keys (SaaS) ───────────────────────────
+const EXCHANGES = ['Binance', 'Bybit', 'OKX', 'Bitget'];
+
+async function loadAccount() {
+  const el = document.getElementById('exchange-keys-list');
+  if (!el) return;
+  try {
+    const res = await fetch('/api/account');
+    if (res.status === 401) return;
+    const data = await res.json();
+    if (!data.ok) return;
+
+    const keyMap = {};
+    (data.exchange_keys || []).forEach(k => { keyMap[k.exchange] = k.has_key; });
+
+    el.innerHTML = EXCHANGES.map(ex => {
+      const hasKey = keyMap[ex] || false;
+      const statusIcon = hasKey ? '<span style="color:#22c55e">&#10003; Configurada</span>' : '<span style="color:#555">No configurada</span>';
+      return `
+        <div class="cfg-section" style="margin:6px 0;padding:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <strong style="font-size:12px;color:#fff">${ex}</strong>
+            ${statusIcon}
+          </div>
+          <div class="cfg-grid" style="grid-template-columns:1fr 1fr">
+            <label>API Key<input type="password" id="ek-key-${ex}" class="inp" placeholder="${hasKey ? '••••••••' : 'API Key'}"></label>
+            <label>API Secret<input type="password" id="ek-secret-${ex}" class="inp" placeholder="${hasKey ? '••••••••' : 'API Secret'}"></label>
+            ${ex === 'OKX' || ex === 'Bitget' ? `<label>Passphrase<input type="password" id="ek-pass-${ex}" class="inp" placeholder="${hasKey ? '••••••••' : 'Passphrase'}"></label>` : ''}
+          </div>
+          <div style="margin-top:8px;display:flex;gap:8px">
+            <button class="btn btn-primary" onclick="saveExchangeKey('${ex}')" style="font-size:11px;padding:4px 12px">Guardar</button>
+            ${hasKey ? `<button class="btn btn-danger" onclick="deleteExchangeKey('${ex}')" style="font-size:11px;padding:4px 12px">Eliminar</button>` : ''}
+          </div>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    console.error('loadAccount error:', e);
+  }
+}
+
+async function saveExchangeKey(exchange) {
+  const key = document.getElementById('ek-key-' + exchange)?.value || '';
+  const secret = document.getElementById('ek-secret-' + exchange)?.value || '';
+  const pass = document.getElementById('ek-pass-' + exchange)?.value || '';
+  if (!key && !secret) { showToast('Ingresa al menos API Key y Secret', 'warning'); return; }
+  try {
+    const res = await fetch('/api/account/exchange_keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exchange, api_key: key, api_secret: secret, passphrase: pass }),
+    });
+    const data = await res.json();
+    showToast(data.msg, data.ok ? 'success' : 'error');
+    if (data.ok) loadAccount();
+  } catch (e) {
+    showToast('Error al guardar keys', 'error');
+  }
+}
+
+async function deleteExchangeKey(exchange) {
+  if (!await showConfirm(`Eliminar API keys de ${exchange}?`)) return;
+  try {
+    const res = await fetch('/api/account/exchange_keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exchange, api_key: '', api_secret: '' }),
+    });
+    const data = await res.json();
+    showToast(data.msg, data.ok ? 'success' : 'error');
+    if (data.ok) loadAccount();
+  } catch (e) {
+    showToast('Error al eliminar keys', 'error');
+  }
+}
+
+async function deleteAccount() {
+  if (!await showConfirm('ELIMINAR CUENTA: Se borraran todos tus datos permanentemente. Continuar?')) return;
+  try {
+    const res = await fetch('/api/account', { method: 'DELETE' });
+    const data = await res.json();
+    if (data.ok) window.location.href = '/auth/login';
+    else showToast(data.msg, 'error');
+  } catch (e) {
+    showToast('Error al eliminar cuenta', 'error');
+  }
+}
+
+// ── Auth ─────────────────────────────────────────────────────
+async function doLogout() {
+  try {
+    await fetch('/auth/logout', { method: 'POST' });
+  } catch (e) {}
+  window.location.href = '/auth/login';
+}
+
 // ── Init ──────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   refresh();
   startRefresh();
+  loadExchangeStatus();
+  setInterval(loadExchangeStatus, 300000); // every 5 min
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeModal();
+  });
 });

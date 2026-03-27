@@ -1,8 +1,9 @@
-"""Flask API routes — v8.0 unified."""
+"""Flask API routes — v10.0 unified."""
 import time
 import threading
 import logging
-from flask import Blueprint, jsonify, request as flask_req, render_template
+from functools import wraps
+from flask import Blueprint, jsonify, request as flask_req, render_template, redirect
 from portfolio.manager import get_capital_summary, open_position, close_position
 from portfolio.actions import calculate_position_estimate
 
@@ -11,8 +12,21 @@ log = logging.getLogger("bot")
 api = Blueprint("api", __name__)
 
 
-def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
+def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, db_enabled=False):
     """Register all routes on the Flask app."""
+
+    # Auth decorator: only enforced if DB/auth is enabled
+    def auth_required(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if db_enabled:
+                from flask_login import current_user
+                if not current_user.is_authenticated:
+                    if flask_req.path.startswith("/api/"):
+                        return jsonify({"ok": False, "msg": "No autenticado"}), 401
+                    return redirect("/auth/login")
+            return f(*args, **kwargs)
+        return decorated
 
     @app.before_request
     def _before():
@@ -23,11 +37,12 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
         s = state_manager.state
         return jsonify({
             "ok": True, "scans": s["scan_count"],
-            "status": s["status"], "version": "8.0",
+            "status": s["status"], "version": "10.0",
         })
 
     # ── Config ─────────────────────────────────────────────────
     @app.route("/api/config", methods=["GET", "POST"])
+    @auth_required
     def api_config():
         if flask_req.method == "GET":
             with state_manager.lock:
@@ -82,6 +97,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
 
     # ── Opportunities ──────────────────────────────────────────
     @app.route("/api/opportunities")
+    @auth_required
     def api_opportunities():
         """Unified opportunity list sorted by score."""
         with state_manager.lock:
@@ -111,6 +127,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
 
     # ── DeFi Opportunities ──────────────────────────────────────
     @app.route("/api/defi_opportunities")
+    @auth_required
     def api_defi_opportunities():
         """DeFi opportunity list sorted by score."""
         with state_manager.lock:
@@ -133,6 +150,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
 
     # ── Calculate (preview before opening) ─────────────────────
     @app.route("/api/calculate", methods=["POST"])
+    @auth_required
     def api_calculate():
         """Calculate estimated returns + SL/TP for an opportunity."""
         data = flask_req.json or {}
@@ -157,6 +175,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
 
     # ── Open Position ──────────────────────────────────────────
     @app.route("/api/open_position", methods=["POST"])
+    @auth_required
     def api_open_position():
         """Open a new position from an opportunity."""
         data = flask_req.json or {}
@@ -182,6 +201,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
 
     # ── Positions ──────────────────────────────────────────────
     @app.route("/api/positions")
+    @auth_required
     def api_positions():
         """Active positions with real-time data."""
         with state_manager.lock:
@@ -282,6 +302,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
 
     # ── Close Position ─────────────────────────────────────────
     @app.route("/api/close_position", methods=["POST"])
+    @auth_required
     def api_close_position():
         """Close a position manually."""
         data = flask_req.json or {}
@@ -325,6 +346,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
 
     # ── History ────────────────────────────────────────────────
     @app.route("/api/history")
+    @auth_required
     def api_history():
         with state_manager.lock:
             s = state_manager.state
@@ -334,6 +356,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
             })
 
     @app.route("/api/clear_history", methods=["POST"])
+    @auth_required
     def api_clear_history():
         """Clear all history and optionally reset positions."""
         data = flask_req.json or {}
@@ -503,7 +526,95 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None):
         status = scanner_worker.exchange_manager.get_exchange_status()
         return jsonify({"exchanges": status})
 
+    # ── Funding History (for mini-charts) ─────────────────────
+    @app.route("/api/funding_history/<symbol>/<exchange>")
+    def api_funding_history(symbol, exchange):
+        try:
+            history = scanner_worker.exchange_manager.fetch_funding_history(
+                symbol, exchange, limit=30)
+            return jsonify({
+                "rates": history.rates,
+                "timestamps": history.timestamps,
+                "avg": history.avg,
+            })
+        except Exception as e:
+            return jsonify({"rates": [], "timestamps": [], "avg": 0, "error": str(e)})
+
+    # ── Account & Exchange Keys (SaaS mode) ─────────────────
+    if db_enabled:
+        @app.route("/api/account")
+        @auth_required
+        def api_account():
+            from flask_login import current_user
+            from core.db_models import UserExchangeKey
+            keys = UserExchangeKey.query.filter_by(user_id=current_user.id).all()
+            return jsonify({
+                "ok": True,
+                "user": {
+                    "email": current_user.email,
+                    "is_admin": current_user.is_admin,
+                    "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
+                },
+                "exchange_keys": [
+                    {"exchange": k.exchange_name, "has_key": bool(k.api_key_encrypted)}
+                    for k in keys
+                ],
+            })
+
+        @app.route("/api/account/exchange_keys", methods=["POST"])
+        @auth_required
+        def api_save_exchange_keys():
+            from flask_login import current_user
+            from core.database import db as _db
+            from core.db_models import UserExchangeKey
+            from core.encryption import encrypt_value
+
+            data = flask_req.get_json() or {}
+            exchange = data.get("exchange", "").strip()
+            api_key = data.get("api_key", "").strip()
+            api_secret = data.get("api_secret", "").strip()
+            passphrase = data.get("passphrase", "").strip()
+
+            if not exchange:
+                return jsonify({"ok": False, "msg": "Exchange requerido"}), 400
+
+            existing = UserExchangeKey.query.filter_by(
+                user_id=current_user.id, exchange_name=exchange).first()
+
+            if not api_key and not api_secret:
+                # Delete keys
+                if existing:
+                    _db.session.delete(existing)
+                    _db.session.commit()
+                return jsonify({"ok": True, "msg": f"Keys de {exchange} eliminadas"})
+
+            if not existing:
+                existing = UserExchangeKey(user_id=current_user.id, exchange_name=exchange)
+                _db.session.add(existing)
+
+            existing.api_key_encrypted = encrypt_value(api_key) if api_key else ""
+            existing.api_secret_encrypted = encrypt_value(api_secret) if api_secret else ""
+            existing.passphrase_encrypted = encrypt_value(passphrase) if passphrase else ""
+            _db.session.commit()
+
+            return jsonify({"ok": True, "msg": f"Keys de {exchange} guardadas"})
+
+        @app.route("/api/account", methods=["DELETE"])
+        @auth_required
+        def api_delete_account():
+            from flask_login import current_user, logout_user
+            from core.database import db as _db
+            _db.session.delete(current_user)
+            _db.session.commit()
+            logout_user()
+            return jsonify({"ok": True, "msg": "Cuenta eliminada"})
+
     # ── Index ──────────────────────────────────────────────────
     @app.route("/")
+    @auth_required
     def index():
-        return render_template("index.html")
+        user_email = ""
+        if db_enabled:
+            from flask_login import current_user
+            user_email = current_user.email if current_user.is_authenticated else ""
+        return render_template("index.html", db_enabled=db_enabled, user_email=user_email)

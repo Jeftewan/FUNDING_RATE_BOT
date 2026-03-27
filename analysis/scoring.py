@@ -1,9 +1,23 @@
-"""Opportunity scoring v9.0 — unified formula for spot-perp and cross-exchange.
+"""Opportunity scoring v10.0 — enhanced with predictive indicators.
 
-Single opportunity_score() replaces risk_score() and score_cross_exchange().
-Yield dimension uses avg(settlement_rates) instead of predicted/current rate.
+Unified formula for spot-perp and cross-exchange opportunities.
+v10 adds: momentum, z-score mean-reversion, rate percentile,
+volatility regime detection, and acceleration bonus.
+
+Dimensions (max 100 pts):
+  1. Stability      (25 pts) — CV + min_ratio
+  2. Consistency     (20 pts) — streak + favorable %
+  3. Liquidity       (15 pts) — 24h volume
+  4. Yield           (15 pts) — settlement-based (reduced from 20)
+  5. Fee Efficiency  (10 pts) — fee_drag ratio
+  6. Momentum         (8 pts) — ROC + EMA ratio + acceleration
+  7. Rate Percentile  (5 pts) — current vs historical range
+  8. Volatility Regime(5 pts) — recent vs overall stddev
+  9. Acceleration     (2 pts) — linear slope bonus
+ 10. Mean Reversion  (-5 pts) — z-score penalty for unsustainable rates
 """
 import math
+from analysis.indicators import compute_all_indicators
 
 
 def opportunity_score(params: dict) -> int:
@@ -22,9 +36,9 @@ def opportunity_score(params: dict) -> int:
       settlement_avg: float — avg absolute settlement rate per interval
       payments_per_day: float — payment frequency
       fee_drag:    float — fees / gross_revenue ratio (0-1)
-      current_rate: float — current predicted rate (for reality check)
-      # Trend
-      rates:       list  — chronological rate/diff series for trend calc
+      current_rate: float — current predicted rate (for reality check + indicators)
+      # Trend / Indicators
+      rates:       list  — chronological rate/diff series
     """
     sc = 0
 
@@ -83,38 +97,35 @@ def opportunity_score(params: dict) -> int:
     else:
         sc += 1
 
-    # ── 4. YIELD DIARIO — settlement-based (20 pts) ─────────────
-    # Use historical settlement average, NOT current predicted rate
+    # ── 4. YIELD DIARIO — settlement-based (15 pts, reduced from 20) ──
     yield_day_pct = settlement_avg * ppd * 100
 
-    # Reality check: if current rate > 2x historical avg, penalize
     reality_penalty = False
     if settlement_avg > 0 and current_rate > settlement_avg * 2:
         reality_penalty = True
 
     if reality_penalty:
-        # Cap yield points — current rate looks anomalous
         if yield_day_pct >= 0.15:
-            sc += 12
-        elif yield_day_pct >= 0.10:
-            sc += 9
-        elif yield_day_pct >= 0.06:
-            sc += 6
-        else:
-            sc += 3
-    else:
-        if yield_day_pct >= 0.15:
-            sc += 20
-        elif yield_day_pct >= 0.10:
-            sc += 17
-        elif yield_day_pct >= 0.06:
-            sc += 14
-        elif yield_day_pct >= 0.03:
             sc += 10
-        elif yield_day_pct >= 0.01:
-            sc += 6
+        elif yield_day_pct >= 0.10:
+            sc += 7
+        elif yield_day_pct >= 0.06:
+            sc += 5
         else:
             sc += 2
+    else:
+        if yield_day_pct >= 0.15:
+            sc += 15
+        elif yield_day_pct >= 0.10:
+            sc += 13
+        elif yield_day_pct >= 0.06:
+            sc += 10
+        elif yield_day_pct >= 0.03:
+            sc += 7
+        elif yield_day_pct >= 0.01:
+            sc += 4
+        else:
+            sc += 1
 
     # ── 5. FEE EFFICIENCY (10 pts) ───────────────────────────────
     if fee_drag < 0.1:
@@ -128,29 +139,20 @@ def opportunity_score(params: dict) -> int:
     else:
         sc += 1
 
-    # ── 6. TENDENCIA (10 pts) ────────────────────────────────────
-    if len(rates) >= 8:
-        mid = len(rates) // 2
-        older = rates[:mid]
-        recent = rates[mid:]
-        avg_old = sum(abs(r) for r in older) / len(older)
-        avg_rec = sum(abs(r) for r in recent) / len(recent)
-        if avg_old > 1e-10:
-            trend = avg_rec / avg_old
-            if trend >= 1.3:
-                sc += 10
-            elif trend >= 1.0:
-                sc += 8
-            elif trend >= 0.7:
-                sc += 4
-            else:
-                sc += 1
-        else:
-            sc += 5
-    else:
-        sc += 5
+    # ── 6-10. ADVANCED INDICATORS (20 pts max, -5 penalty) ──────
+    # Replaces the old simple trend dimension (was 10 pts)
+    indicators = compute_all_indicators(current_rate, rates)
 
-    return min(sc, 100)
+    sc += indicators["momentum"]["points"]        # 0-8 pts
+    sc += indicators["percentile"]["points"]       # 1-5 pts
+    sc += indicators["regime"]["points"]           # 1-5 pts
+    sc += indicators["acceleration"]["bonus"]      # 0-2 pts
+    sc += indicators["z_score"]["penalty"]         # 0 to -5 pts
+
+    # Store indicators in params for caller to access
+    params["_indicators"] = indicators
+
+    return max(0, min(sc, 100))
 
 
 def stability_grade(score: int) -> str:
@@ -176,10 +178,7 @@ def estimated_hold_days(hist: dict) -> int:
     if not rates:
         return 0
 
-    # Each rate is one interval. Convert streak to days.
-    # Assume ~3 payments/day on average (8h intervals)
     intervals_per_day = 3
-
     streak_days = streak / intervals_per_day
 
     if pct >= 90 and streak_days >= 5:
