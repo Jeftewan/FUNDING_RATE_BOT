@@ -114,10 +114,34 @@ function sortAndFilter(opps) {
 let _lastCexHash = '';
 let _lastDefiHash = '';
 let _lastPosHash = '';
+let _isFirstRender = true;
 
-function dataHash(obj) {
-  // Fast shallow hash — stringify key fields only
-  try { return JSON.stringify(obj).length + '_' + (obj.scan_count || 0); } catch (e) { return '' + Math.random(); }
+function oppHash(data) {
+  // Hash based on opportunity IDs + scores + scan_count (ignoring mins_to_next which changes every tick)
+  const opps = data.opportunities || [];
+  const key = opps.map(o => o._id + ':' + (o.score||0) + ':' + (o.apr||0).toFixed(1)).join('|');
+  return key + '#' + (data.scan_count || 0) + '#' + opps.length;
+}
+
+function posHash(data) {
+  const pos = data.positions || [];
+  const key = pos.map(p => p.symbol + ':' + (p.net_earned||0).toFixed(2) + ':' + (p.payment_count||0)).join('|');
+  return key + '#' + pos.length;
+}
+
+// Smooth DOM update: fade out briefly, swap, fade in
+function smoothUpdate(el, newHTML) {
+  if (_isFirstRender) {
+    el.innerHTML = newHTML;
+    return;
+  }
+  el.style.opacity = '0.6';
+  el.style.transition = 'opacity 0.15s';
+  setTimeout(() => {
+    el.innerHTML = newHTML;
+    el.style.opacity = '1';
+    setTimeout(() => { el.style.transition = ''; }, 150);
+  }, 80);
 }
 
 // ── Earnings chart ───────────────────────────────────────────
@@ -234,6 +258,13 @@ function startRefresh() {
   refreshTimer = setInterval(refresh, 30000);
 }
 
+// ── Live counter update (no DOM rebuild) ─────────────────────
+function updateLiveCounters(data) {
+  // Only update status bar on auto-refresh (no card rebuild)
+  updateStatus(data);
+  setScanUI(!!data.scanning);
+}
+
 // ── Opportunities ─────────────────────────────────────────────
 async function loadOpps() {
   const el = document.getElementById('opp-list-cex');
@@ -242,11 +273,14 @@ async function loadOpps() {
     const res = await fetch('/api/opportunities');
     const data = await res.json();
     _lastCexData = data;
-    // Anti-flicker: skip re-render if data unchanged
-    const h = dataHash(data);
+    // Anti-flicker: skip re-render if opportunities unchanged
+    const h = oppHash(data);
     if (h !== _lastCexHash || el.querySelector('.skeleton-card')) {
       _lastCexHash = h;
       renderOpps(data);
+    } else {
+      // Just update live counters (mins_to_next) without full re-render
+      updateLiveCounters(data);
     }
     updateStatus(data);
     setScanUI(!!data.scanning);
@@ -359,7 +393,7 @@ async function loadDefiOpps() {
     const res = await fetch('/api/defi_opportunities');
     const data = await res.json();
     _lastDefiData = data;
-    const h = dataHash(data);
+    const h = oppHash(data);
     if (h !== _lastDefiHash || el.querySelector('.skeleton-card')) {
       _lastDefiHash = h;
       renderDefiOpps(data);
@@ -616,7 +650,7 @@ async function loadPositions() {
     ]);
     const posData = await posRes.json();
     const histData = await histRes.json();
-    const h = dataHash(posData);
+    const h = posHash(posData);
     if (h !== _lastPosHash || posEl.querySelector('.skeleton-card')) {
       _lastPosHash = h;
       renderPositions(posData);
@@ -1038,9 +1072,11 @@ async function doLogout() {
 // ── Init ──────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   refresh();
+  // Mark first render done after initial load completes
+  setTimeout(() => { _isFirstRender = false; }, 2000);
   startRefresh();
   loadExchangeStatus();
-  setInterval(loadExchangeStatus, 300000); // every 5 min
+  setInterval(loadExchangeStatus, 300000);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeModal();
   });

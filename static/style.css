@@ -350,13 +350,10 @@ body {
   border-radius: var(--radius);
   padding: 12px;
   margin-bottom: 8px;
-  transition: border-color .15s;
-  animation: card-in .25s ease-out;
+  transition: border-color .15s, opacity .15s;
 }
 .opp-card:hover { border-color: var(--border-hover); }
 .opp-card.grade-a { border-left: 3px solid #22c55e44; }
-
-@keyframes card-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
 
 /* Card header */
 .opp-header {
@@ -476,7 +473,7 @@ body {
   border-radius: var(--radius);
   padding: 12px;
   margin-bottom: 8px;
-  animation: card-in .25s ease-out;
+  transition: opacity .15s;
 }
 
 .pos-header {

@@ -15,6 +15,27 @@ api = Blueprint("api", __name__)
 def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, db_enabled=False):
     """Register all routes on the Flask app."""
 
+    # DB persistence helper (lazy init)
+    _db_persist = None
+    def get_db_persist():
+        nonlocal _db_persist
+        if _db_persist is None and db_enabled:
+            from core.db_persistence import DBPersistence
+            _db_persist = DBPersistence()
+        return _db_persist
+
+    def get_current_user_id():
+        """Get logged-in user ID, or None."""
+        if not db_enabled:
+            return None
+        try:
+            from flask_login import current_user
+            if current_user.is_authenticated:
+                return current_user.id
+        except Exception:
+            pass
+        return None
+
     # Auth decorator: only enforced if DB/auth is enabled
     def auth_required(f):
         @wraps(f)
@@ -45,6 +66,23 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @auth_required
     def api_config():
         if flask_req.method == "GET":
+            # In SaaS mode, load config from DB for logged-in user
+            uid = get_current_user_id()
+            if uid and get_db_persist():
+                us = get_db_persist().load_user_state(uid)
+                return jsonify({
+                    "total_capital": us.get("total_capital", 1000),
+                    "scan_minutes": us.get("scan_interval", 300) // 60,
+                    "min_volume": us.get("min_volume", 1000000),
+                    "min_apr": us.get("min_apr", 10),
+                    "min_score": us.get("min_score", 40),
+                    "min_stability_days": us.get("min_stability_days", 3),
+                    "max_positions": us.get("max_positions", 5),
+                    "alert_minutes_before": us.get("alert_minutes_before", 5),
+                    "email_enabled": us.get("email_enabled", False),
+                    "wa_phone": us.get("wa_phone", ""),
+                    "wa_apikey": us.get("wa_apikey", ""),
+                })
             with state_manager.lock:
                 s = state_manager.state
                 return jsonify({
@@ -93,6 +131,24 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 scanner_worker.email_notifier._sync_from_state()
 
             state_manager.save()
+
+            # Also persist to DB in SaaS mode
+            uid = get_current_user_id()
+            if uid and get_db_persist():
+                db_data = {
+                    "total_capital": s["total_capital"],
+                    "scan_interval": s["scan_interval"],
+                    "min_volume": s["min_volume"],
+                    "min_apr": s.get("min_apr", 10),
+                    "min_score": s.get("min_score", 40),
+                    "min_stability_days": s.get("min_stability_days", 3),
+                    "max_positions": s.get("max_positions", 5),
+                    "alert_minutes_before": s.get("alert_minutes_before", 5),
+                    "email_enabled": s.get("email_enabled", False),
+                    "wa_phone": s.get("wa_phone", ""),
+                }
+                get_db_persist().save_user_config(uid, db_data)
+
             return jsonify({"ok": True, "msg": "Configuracion guardada"})
 
     # ── Opportunities ──────────────────────────────────────────
@@ -207,11 +263,26 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         with state_manager.lock:
             s = state_manager.state
             all_data = s.get("all_data", [])
-            summary = get_capital_summary(s)
+
+            # In SaaS mode, load positions from DB for logged-in user
+            uid = get_current_user_id()
+            if uid and get_db_persist():
+                user_state = get_db_persist().load_user_state(uid)
+                positions_list = user_state.get("positions", [])
+                # Build a merged state for capital summary
+                merged = dict(s)
+                merged["positions"] = positions_list
+                merged["total_capital"] = user_state.get("total_capital", s.get("total_capital", 1000))
+                merged["max_positions"] = user_state.get("max_positions", s.get("max_positions", 5))
+                summary = get_capital_summary(merged)
+            else:
+                positions_list = s.get("positions", [])
+                summary = get_capital_summary(s)
+
             pdata = []
             now = time.time()
 
-            for pos in s["positions"]:
+            for pos in positions_list:
                 is_cross = pos.get("mode") == "cross_exchange"
 
                 if is_cross:
@@ -348,6 +419,13 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @app.route("/api/history")
     @auth_required
     def api_history():
+        uid = get_current_user_id()
+        if uid and get_db_persist():
+            user_state = get_db_persist().load_user_state(uid)
+            return jsonify({
+                "history": user_state.get("history", []),
+                "total_earned": user_state.get("total_earned", 0),
+            })
         with state_manager.lock:
             s = state_manager.state
             return jsonify({
