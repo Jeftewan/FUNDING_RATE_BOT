@@ -1089,7 +1089,7 @@ async function deleteAccount() {
   try {
     const res = await fetch('/api/account', { method: 'DELETE' });
     const data = await res.json();
-    if (data.ok) window.location.href = '/auth/login';
+    if (data.ok) window.location.href = '/auth/page';
     else showToast(data.msg, 'error');
   } catch (e) {
     showToast('Error al eliminar cuenta', 'error');
@@ -1101,7 +1101,7 @@ async function doLogout() {
   try {
     await fetch('/auth/logout', { method: 'POST' });
   } catch (e) {}
-  window.location.href = '/auth/login';
+  window.location.href = '/auth/page';
 }
 
 // ── Init ──────────────────────────────────────────────────────

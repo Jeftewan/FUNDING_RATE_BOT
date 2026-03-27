@@ -1,92 +1,85 @@
-"""Authentication routes: magic link login."""
+"""Authentication routes: email + password login/register."""
 import logging
 import re
-from datetime import datetime, timezone, timedelta
-from flask import Blueprint, request, jsonify, redirect, url_for, render_template
+from flask import Blueprint, request, jsonify, redirect, render_template
 from flask_login import login_user, logout_user, login_required, current_user
-from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
+from werkzeug.security import generate_password_hash, check_password_hash
 
 log = logging.getLogger("bot.auth")
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 
-# Will be set by init_auth()
-_serializer = None
 _config = None
 
 
 def init_auth(app, config):
     """Initialize auth blueprint with app context."""
-    global _serializer, _config
+    global _config
     _config = config
-    _serializer = URLSafeTimedSerializer(app.secret_key)
     app.register_blueprint(auth_bp)
 
 
-def _generate_token(email: str) -> str:
-    return _serializer.dumps(email, salt="magic-link")
-
-
-def _verify_token(token: str, max_age: int = 900) -> str | None:
-    """Verify token, return email or None. Default max_age: 15 minutes."""
-    try:
-        return _serializer.loads(token, salt="magic-link", max_age=max_age)
-    except (SignatureExpired, BadSignature):
-        return None
-
-
-@auth_bp.route("/request-link", methods=["POST"])
-def request_link():
-    """Request a magic link email."""
+@auth_bp.route("/register", methods=["POST"])
+def register():
+    """Create a new account with email + password."""
     data = request.get_json() or {}
     email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
 
     if not email or not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
         return jsonify({"ok": False, "msg": "Email invalido"}), 400
 
-    token = _generate_token(email)
-    base_url = request.host_url.rstrip("/")
-    link = f"{base_url}/auth/verify?token={token}"
-
-    from auth.email_service import send_magic_link
-    sent = send_magic_link(email, link, _config)
-
-    if sent:
-        return jsonify({"ok": True, "msg": "Enlace enviado a tu correo"})
-    else:
-        return jsonify({"ok": False, "msg": "Error al enviar email. Verifica la configuracion."}), 500
-
-
-@auth_bp.route("/verify")
-def verify():
-    """Verify magic link token and log user in."""
-    token = request.args.get("token", "")
-    email = _verify_token(token)
-
-    if not email:
-        return render_template("login.html", error="Enlace invalido o expirado"), 401
+    if len(password) < 6:
+        return jsonify({"ok": False, "msg": "La contrasena debe tener al menos 6 caracteres"}), 400
 
     from core.database import db
     from core.db_models import User, UserConfig
 
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        # Auto-create user on first login
-        user = User(email=email)
-        db.session.add(user)
-        db.session.flush()  # Get user.id
+    existing = User.query.filter_by(email=email).first()
+    if existing:
+        return jsonify({"ok": False, "msg": "Ya existe una cuenta con ese email"}), 409
 
-        # Create default config
-        user_config = UserConfig(user_id=user.id)
-        db.session.add(user_config)
-        db.session.commit()
-        log.info(f"New user created: {email}")
-    elif not user.is_active:
-        return render_template("login.html", error="Cuenta desactivada"), 403
+    user = User(
+        email=email,
+        password_hash=generate_password_hash(password),
+    )
+    db.session.add(user)
+    db.session.flush()
+
+    user_config = UserConfig(user_id=user.id)
+    db.session.add(user_config)
+    db.session.commit()
+
+    login_user(user, remember=True)
+    log.info(f"New user registered: {email}")
+    return jsonify({"ok": True, "msg": "Cuenta creada"})
+
+
+@auth_bp.route("/login", methods=["POST"])
+def login():
+    """Log in with email + password."""
+    data = request.get_json() or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if not email or not password:
+        return jsonify({"ok": False, "msg": "Email y contrasena requeridos"}), 400
+
+    from core.db_models import User
+
+    user = User.query.filter_by(email=email).first()
+    if not user or not user.password_hash:
+        return jsonify({"ok": False, "msg": "Email o contrasena incorrectos"}), 401
+
+    if not check_password_hash(user.password_hash, password):
+        return jsonify({"ok": False, "msg": "Email o contrasena incorrectos"}), 401
+
+    if not user.is_active:
+        return jsonify({"ok": False, "msg": "Cuenta desactivada"}), 403
 
     login_user(user, remember=True)
     log.info(f"User logged in: {email}")
-    return redirect("/")
+    return jsonify({"ok": True, "msg": "Sesion iniciada"})
 
 
 @auth_bp.route("/logout", methods=["POST"])

@@ -1,78 +1,222 @@
 <!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Login — Funding Rate Bot</title>
-<link rel="stylesheet" href="/static/style.css">
+<title>YieldPilot — Ingresos Pasivos con Funding Rate</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
 <style>
-  .login-page{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-  .login-box{background:#111318;border:1px solid #1a1d23;border-radius:12px;padding:32px;
-             max-width:400px;width:100%;text-align:center}
-  .login-box h1{font-size:20px;color:#fff;margin-bottom:6px;font-weight:500}
-  .login-box .subtitle{color:#555;font-size:12px;margin-bottom:24px}
-  .login-box .inp{margin-bottom:16px;text-align:center;font-size:14px;padding:10px 16px}
-  .login-box .btn-primary{width:100%;padding:12px;font-size:14px}
-  .login-msg{font-size:12px;margin-top:16px;padding:10px;border-radius:6px}
-  .login-msg.success{background:#22c55e22;color:#22c55e;border:1px solid #22c55e44}
-  .login-msg.error{background:#ef444422;color:#ef4444;border:1px solid #ef444444}
-  .login-help{font-size:10px;color:#555;margin-top:20px;line-height:1.5}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:'JetBrains Mono',monospace;background:#0a0b0d;color:#c8ccd0;min-height:100vh;
+       display:flex;align-items:center;justify-content:center;padding:20px}
+  .page{max-width:900px;width:100%;display:flex;gap:40px;align-items:center}
+
+  /* Left: branding */
+  .brand{flex:1;min-width:0}
+  .logo{display:flex;align-items:center;gap:12px;margin-bottom:20px}
+  .logo svg{width:44px;height:44px;flex-shrink:0}
+  .logo-text{font-size:26px;font-weight:700;color:#fff;letter-spacing:-0.5px}
+  .logo-text span{color:#22c55e}
+  .tagline{font-size:14px;color:#22c55e;margin-bottom:16px;font-weight:500}
+  .desc{font-size:12px;color:#888;line-height:1.7;margin-bottom:24px}
+  .features{list-style:none;display:flex;flex-direction:column;gap:10px}
+  .features li{display:flex;align-items:flex-start;gap:10px;font-size:11px;color:#aaa;line-height:1.5}
+  .features li svg{width:18px;height:18px;flex-shrink:0;color:#22c55e;margin-top:1px}
+  .stats-row{display:flex;gap:16px;margin-top:24px}
+  .stat-card{background:#111318;border:1px solid #1a1d23;border-radius:8px;padding:12px 16px;flex:1;text-align:center}
+  .stat-card .num{font-size:18px;font-weight:700;color:#22c55e}
+  .stat-card .lbl{font-size:9px;color:#555;margin-top:2px;text-transform:uppercase;letter-spacing:0.5px}
+
+  /* Right: auth form */
+  .auth-box{width:360px;flex-shrink:0;background:#111318;border:1px solid #1a1d23;border-radius:12px;padding:32px}
+  .auth-box h2{font-size:16px;color:#fff;font-weight:500;margin-bottom:4px;text-align:center}
+  .auth-box .sub{font-size:11px;color:#555;margin-bottom:20px;text-align:center}
+  .tabs-auth{display:flex;gap:0;margin-bottom:20px;border-radius:8px;overflow:hidden;border:1px solid #1a1d23}
+  .tab-auth{flex:1;padding:8px;text-align:center;font-size:11px;cursor:pointer;background:#0a0b0d;color:#888;
+            border:none;font-family:inherit;font-weight:500;transition:all .2s}
+  .tab-auth.active{background:#22c55e18;color:#22c55e;font-weight:700}
+  .field{margin-bottom:14px}
+  .field label{display:block;font-size:10px;color:#555;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px}
+  .field input{width:100%;padding:10px 12px;background:#0a0b0d;border:1px solid #1a1d23;border-radius:6px;
+               color:#fff;font-family:inherit;font-size:13px;outline:none;transition:border-color .2s}
+  .field input:focus{border-color:#22c55e55}
+  .btn-go{width:100%;padding:12px;font-size:13px;font-weight:700;border:none;border-radius:8px;cursor:pointer;
+          font-family:inherit;background:linear-gradient(135deg,#22c55e,#16a34a);color:#000;transition:opacity .2s}
+  .btn-go:hover{opacity:.9}
+  .btn-go:disabled{opacity:.5;cursor:not-allowed}
+  .msg{font-size:11px;margin-top:14px;padding:10px;border-radius:6px;text-align:center;display:none}
+  .msg.success{background:#22c55e15;color:#22c55e;border:1px solid #22c55e33;display:block}
+  .msg.error{background:#ef444415;color:#ef4444;border:1px solid #ef444433;display:block}
+  .auth-footer{font-size:9px;color:#444;text-align:center;margin-top:18px;line-height:1.5}
+
+  /* Responsive */
+  @media(max-width:768px){
+    .page{flex-direction:column;gap:24px}
+    .auth-box{width:100%;max-width:400px}
+    .stats-row{gap:8px}
+    .stat-card .num{font-size:14px}
+  }
 </style>
 </head><body>
-<div class="login-page">
-  <div class="login-box">
-    <h1>Funding Rate Bot</h1>
-    <div class="subtitle">Ingresa tu email para recibir un enlace de acceso</div>
+<div class="page">
 
-    <form id="login-form" onsubmit="requestLink(event)">
-      <input type="email" id="login-email" class="inp" placeholder="tu@email.com" required autofocus>
-      <button type="submit" class="btn btn-primary" id="login-btn">Enviar enlace magico</button>
-    </form>
+  <!-- Left: branding -->
+  <div class="brand">
+    <div class="logo">
+      <svg viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect width="44" height="44" rx="10" fill="#22c55e" fill-opacity="0.12"/>
+        <path d="M12 28L17 20L22 24L27 15L32 18" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="32" cy="18" r="2.5" fill="#22c55e"/>
+        <path d="M12 32H32" stroke="#22c55e33" stroke-width="1.5"/>
+        <path d="M14 11V13" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M19 9V13" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M24 11V13" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <div class="logo-text">Yield<span>Pilot</span></div>
+    </div>
 
-    <div id="login-msg" class="login-msg" style="display:none"></div>
+    <div class="tagline">Genera ingresos pasivos con funding rates de criptomonedas</div>
 
-    {% if error %}
-    <div class="login-msg error">{{ error }}</div>
-    {% endif %}
+    <div class="desc">
+      YieldPilot escanea automaticamente las tasas de financiacion en los principales exchanges,
+      detecta oportunidades de arbitraje y te alerta cuando encontrar rentabilidades optimas.
+      Sin operar manualmente — deja que los datos trabajen por ti.
+    </div>
 
-    <div class="login-help">
-      Se enviara un enlace de un solo uso a tu correo.<br>
-      No necesitas contrasena — el enlace expira en 15 minutos.
+    <ul class="features">
+      <li>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+        <span><strong style="color:#fff">9 exchanges en tiempo real</strong> — Binance, Bybit, OKX, Bitget + Hyperliquid, GMX y mas DeFi</span>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+        <span><strong style="color:#fff">Scoring inteligente v10</strong> — Momentum, z-score, regimen de volatilidad y deteccion de spikes</span>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+        <span><strong style="color:#fff">Arbitraje spot-perp y cross-exchange</strong> — Detecta diferenciales rentables entre exchanges</span>
+      </li>
+      <li>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+        <span><strong style="color:#fff">Portfolio tracker</strong> — Monitorea tus posiciones, ganancias y pagos en tiempo real</span>
+      </li>
+    </ul>
+
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="num">9</div>
+        <div class="lbl">Exchanges</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">500+</div>
+        <div class="lbl">Pares analizados</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">24/7</div>
+        <div class="lbl">Monitoreo</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">v10</div>
+        <div class="lbl">Scoring IA</div>
+      </div>
     </div>
   </div>
+
+  <!-- Right: auth form -->
+  <div class="auth-box">
+    <h2>Comienza gratis</h2>
+    <div class="sub">Crea tu cuenta o inicia sesion</div>
+
+    <div class="tabs-auth">
+      <button class="tab-auth active" onclick="switchTab('login')">Iniciar sesion</button>
+      <button class="tab-auth" onclick="switchTab('register')">Crear cuenta</button>
+    </div>
+
+    <form id="auth-form" onsubmit="doAuth(event)">
+      <div class="field">
+        <label>Email</label>
+        <input type="email" id="auth-email" placeholder="tu@email.com" required autofocus>
+      </div>
+      <div class="field">
+        <label>Contrasena</label>
+        <input type="password" id="auth-pass" placeholder="Min. 6 caracteres" required minlength="6">
+      </div>
+      <div class="field" id="confirm-field" style="display:none">
+        <label>Confirmar contrasena</label>
+        <input type="password" id="auth-pass2" placeholder="Repite la contrasena">
+      </div>
+      <button type="submit" class="btn-go" id="auth-btn">Iniciar sesion</button>
+    </form>
+
+    <div id="auth-msg" class="msg"></div>
+
+    {% if error %}
+    <div class="msg error" style="display:block">{{ error }}</div>
+    {% endif %}
+
+    <div class="auth-footer">
+      Tus datos estan seguros. Las API keys se encriptan con Fernet.<br>
+      No compartimos tu informacion con terceros.
+    </div>
+  </div>
+
 </div>
 
 <script>
-async function requestLink(e) {
+let authMode = 'login';
+
+function switchTab(mode) {
+  authMode = mode;
+  document.querySelectorAll('.tab-auth').forEach((t, i) => {
+    t.classList.toggle('active', (mode === 'login' && i === 0) || (mode === 'register' && i === 1));
+  });
+  document.getElementById('confirm-field').style.display = mode === 'register' ? '' : 'none';
+  document.getElementById('auth-btn').textContent = mode === 'login' ? 'Iniciar sesion' : 'Crear cuenta';
+  document.getElementById('auth-msg').style.display = 'none';
+}
+
+async function doAuth(e) {
   e.preventDefault();
-  const email = document.getElementById('login-email').value.trim();
-  const btn = document.getElementById('login-btn');
-  const msg = document.getElementById('login-msg');
+  const email = document.getElementById('auth-email').value.trim();
+  const pass = document.getElementById('auth-pass').value;
+  const btn = document.getElementById('auth-btn');
+  const msg = document.getElementById('auth-msg');
+
+  if (authMode === 'register') {
+    const pass2 = document.getElementById('auth-pass2').value;
+    if (pass !== pass2) {
+      msg.textContent = 'Las contrasenas no coinciden';
+      msg.className = 'msg error';
+      return;
+    }
+  }
 
   btn.disabled = true;
-  btn.textContent = 'Enviando...';
+  btn.textContent = authMode === 'login' ? 'Ingresando...' : 'Creando cuenta...';
   msg.style.display = 'none';
 
   try {
-    const res = await fetch('/auth/request-link', {
+    const endpoint = authMode === 'login' ? '/auth/login' : '/auth/register';
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, password: pass }),
     });
     const data = await res.json();
-    msg.textContent = data.msg;
-    msg.className = 'login-msg ' + (data.ok ? 'success' : 'error');
-    msg.style.display = '';
+
     if (data.ok) {
-      btn.textContent = 'Enlace enviado';
+      msg.textContent = authMode === 'login' ? 'Redirigiendo...' : 'Cuenta creada. Redirigiendo...';
+      msg.className = 'msg success';
+      setTimeout(() => window.location.href = '/', 500);
     } else {
+      msg.textContent = data.msg;
+      msg.className = 'msg error';
       btn.disabled = false;
-      btn.textContent = 'Enviar enlace magico';
+      btn.textContent = authMode === 'login' ? 'Iniciar sesion' : 'Crear cuenta';
     }
   } catch (err) {
     msg.textContent = 'Error de conexion';
-    msg.className = 'login-msg error';
-    msg.style.display = '';
+    msg.className = 'msg error';
     btn.disabled = false;
-    btn.textContent = 'Enviar enlace magico';
+    btn.textContent = authMode === 'login' ? 'Iniciar sesion' : 'Crear cuenta';
   }
 }
 </script>
