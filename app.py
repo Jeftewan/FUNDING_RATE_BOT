@@ -93,7 +93,7 @@ if Config.USE_DB and Config.DATABASE_URL:
 
             login_manager = LoginManager()
             login_manager.init_app(app)
-            login_manager.login_view = "auth.login_page"
+            login_manager.login_view = "auth.login_page"  # auth/page
 
             @login_manager.user_loader
             def load_user(user_id):
@@ -104,18 +104,18 @@ if Config.USE_DB and Config.DATABASE_URL:
                 from flask import request as req, jsonify as jfy, redirect as rdr
                 if req.path.startswith("/api/"):
                     return jfy({"ok": False, "msg": "No autenticado"}), 401
-                return rdr("/auth/login")
+                return rdr("/auth/page")
 
             from auth.routes import init_auth, auth_bp
 
-            # Add login page route to auth blueprint
-            @auth_bp.route("/login")
+            # Login page (GET only — POST /auth/login is the API endpoint)
+            @auth_bp.route("/page")
             def login_page():
                 from flask import render_template
                 return render_template("login.html", error=None)
 
             init_auth(app, Config)
-            log.info("SaaS mode enabled: PostgreSQL + magic link auth")
+            log.info("SaaS mode enabled: PostgreSQL + email/password auth")
     except Exception as e:
         log.error(f"Failed to initialize SaaS mode: {e}")
         db_enabled = False
