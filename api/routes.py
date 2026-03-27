@@ -24,7 +24,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 if not current_user.is_authenticated:
                     if flask_req.path.startswith("/api/"):
                         return jsonify({"ok": False, "msg": "No autenticado"}), 401
-                    return redirect("/auth/login")
+                    return redirect("/auth/page")
             return f(*args, **kwargs)
         return decorated
 
