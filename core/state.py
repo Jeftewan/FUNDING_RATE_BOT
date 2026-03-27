@@ -32,8 +32,11 @@ class StateManager:
             "total_earned": 0,
             "scan_count": 0,
             "all_data": [],
+            "defi_data": [],
             "opportunities": [],        # Unified opportunity list
+            "defi_opportunities": [],
             "coinglass_data": [],
+            "scanning": False,
             "alerts": [],
             "status": "Iniciando...",
             "last_error": "",

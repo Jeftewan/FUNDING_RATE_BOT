@@ -375,10 +375,7 @@ class ScannerWorker:
         # Sort by score DESC
         opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
 
-        # 6.5 Store funding rate snapshots for data accumulation (if DB enabled)
-        self._store_rate_snapshots(all_data + defi_data)
-
-        # 7. Update state
+        # 7. Update state (BEFORE snapshot storage — snapshots are slow and non-critical)
         status_parts = [f"{len(r)}{n[:2].upper()}" for n, r in all_rates.items() if r]
         status_str = "+".join(status_parts)
         defi_parts = [f"{len(r)}{n[:2].upper()}" for n, r in defi_rates.items() if r]
@@ -414,13 +411,21 @@ class ScannerWorker:
             f"{len(all_data)} pairs, {n_sp} spot-perp, {n_cx} cross-exchange"
         )
 
+        # 8. Store funding rate snapshots in background (non-blocking)
+        snapshot_data = all_data + defi_data
+        threading.Thread(
+            target=self._store_rate_snapshots,
+            args=(snapshot_data,),
+            daemon=True,
+        ).start()
+
     # ── Rate Snapshot Storage (data accumulation for ML) ─────
 
     def _store_rate_snapshots(self, all_data: list):
         """Store funding rate snapshots to PostgreSQL for future analysis.
 
-        Only runs if flask_app is set (DB enabled). Non-blocking — errors
-        are logged but never disrupt the scan pipeline.
+        Runs in a background thread. Uses bulk INSERT with ON CONFLICT
+        to avoid individual SELECT queries per row.
         """
         if not self._flask_app:
             return
@@ -432,41 +437,40 @@ class ScannerWorker:
                 from datetime import datetime, timezone
 
                 now = datetime.now(timezone.utc)
-                inserted = 0
 
+                # Build batch of rows to insert
+                rows = []
                 for d in all_data:
                     funding_ts = d.get("next_funding_ts", 0)
                     if not funding_ts:
                         continue
+                    rows.append({
+                        "symbol": d.get("symbol", ""),
+                        "exchange": d.get("exchange", ""),
+                        "rate": d.get("fr", 0),
+                        "volume_24h": d.get("vol24h", 0),
+                        "mark_price": d.get("price", 0),
+                        "interval_hours": int(d.get("ih", 8)),
+                        "funding_ts": int(funding_ts),
+                        "captured_at": now,
+                    })
 
-                    sym = d.get("symbol", "")
-                    exch = d.get("exchange", "")
-                    fts = int(funding_ts)
+                if not rows:
+                    return
 
-                    # Skip if this exact snapshot already exists
-                    exists = FundingRateSnapshot.query.filter_by(
-                        symbol=sym, exchange=exch, funding_ts=fts
-                    ).first()
-                    if exists:
-                        continue
-
-                    snapshot = FundingRateSnapshot(
-                        symbol=sym, exchange=exch,
-                        rate=d.get("fr", 0),
-                        volume_24h=d.get("vol24h", 0),
-                        mark_price=d.get("price", 0),
-                        interval_hours=int(d.get("ih", 8)),
-                        funding_ts=fts, captured_at=now,
-                    )
-                    db.session.add(snapshot)
-                    inserted += 1
-
-                if inserted:
-                    db.session.commit()
+                # Bulk insert, skip duplicates via ON CONFLICT DO NOTHING
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
+                stmt = pg_insert(FundingRateSnapshot.__table__).values(rows)
+                stmt = stmt.on_conflict_do_nothing(
+                    constraint="uq_snapshot_symbol_exchange_ts"
+                )
+                result = db.session.execute(stmt)
+                db.session.commit()
+                inserted = result.rowcount if result.rowcount else 0
 
                 # Cleanup old snapshots (>90 days) — run occasionally
                 scan_count = self.state_manager.get("scan_count", 0)
-                if scan_count % 50 == 0:  # Every ~50 scans
+                if scan_count % 50 == 0:
                     from datetime import timedelta
                     cutoff = now - timedelta(days=90)
                     deleted = FundingRateSnapshot.query.filter(
@@ -476,7 +480,7 @@ class ScannerWorker:
                     if deleted:
                         log.info(f"Cleaned {deleted} old rate snapshots")
 
-                log.info(f"Stored {inserted} rate snapshots")
+                log.info(f"Stored {inserted} rate snapshots (batch of {len(rows)})")
 
         except Exception as e:
             log.warning(f"Rate snapshot storage failed (non-critical): {e}")
