@@ -1,27 +1,42 @@
 <!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>YieldPilot — Funding Rate Scanner</title>
 <link rel="stylesheet" href="/static/style.css">
 </head><body>
 <div class="c">
   <div class="hdr">
-    <h1>YieldPilot <span class="v">v10.0</span>
+    <div class="hdr-top">
+      <h1>
+        <svg class="logo-icon" viewBox="0 0 28 28" fill="none">
+          <rect width="28" height="28" rx="6" fill="#22c55e" fill-opacity=".15"/>
+          <path d="M7 18l3.5-5.5 3 2.5 3.5-6L21 12" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="21" cy="12" r="1.5" fill="#22c55e"/>
+        </svg>
+        Yield<span style="color:#22c55e">Pilot</span>
+        <span class="v">v10</span>
+      </h1>
       {% if db_enabled and user_email %}
-      <span style="font-size:10px;color:#555;margin-left:12px">{{ user_email }}</span>
-      <button class="btn" onclick="doLogout()" style="font-size:10px;padding:2px 8px;margin-left:6px">Salir</button>
+      <div class="user-info">
+        <span>{{ user_email }}</span>
+        <button class="btn" onclick="doLogout()">Salir</button>
+      </div>
       {% endif %}
-    </h1>
+    </div>
+
     <div class="tabs">
       <button class="tab active" onclick="switchTab('opportunities')" id="tab-opportunities">Oportunidades</button>
       <button class="tab" onclick="switchTab('positions')" id="tab-positions">Posiciones</button>
-      <button class="tab" onclick="switchTab('config')" id="tab-config">Configuracion</button>
+      <button class="tab" onclick="switchTab('config')" id="tab-config">Config</button>
       {% if db_enabled %}<button class="tab" onclick="switchTab('account')" id="tab-account">Cuenta</button>{% endif %}
     </div>
+
     <div class="status-bar" id="status-bar">
       <span id="st-status">Cargando...</span>
       <span id="st-scan">Scan #0</span>
-      <span id="st-time">—</span>
+      <span id="st-time">&mdash;</span>
       <span id="st-exchanges" class="exchange-status"></span>
     </div>
   </div>
@@ -32,27 +47,27 @@
       <button class="btn btn-scan" id="btn-scan" onclick="forceScan()">Escanear</button>
       <div class="scan-progress" id="scan-progress" style="display:none">
         <div class="scan-progress-bar"></div>
-        <span class="scan-progress-text">Escaneando exchanges...</span>
+        <span class="scan-progress-text">Escaneando...</span>
       </div>
       <div class="sub-tabs">
         <button class="sub-tab active" id="subtab-cex" onclick="switchSubTab('cex')">CEX</button>
         <button class="sub-tab" id="subtab-defi" onclick="switchSubTab('defi')">DeFi</button>
       </div>
       <div class="filter-bar">
-        <label>APR min <input type="number" id="f-apr" value="10" class="inp-sm" onchange="loadCurrentOpps()">%</label>
-        <label>Score min <input type="number" id="f-score" value="40" class="inp-sm" onchange="loadCurrentOpps()"></label>
+        <label>APR<input type="number" id="f-apr" value="10" class="inp-sm" onchange="loadCurrentOpps()">%</label>
+        <label>Score<input type="number" id="f-score" value="40" class="inp-sm" onchange="loadCurrentOpps()"></label>
       </div>
-      <span class="count" id="opp-count">0 oportunidades</span>
+      <span class="count" id="opp-count">0</span>
     </div>
+
     <div class="sort-bar" id="sort-bar">
-      <input type="text" id="search-symbol" placeholder="Buscar simbolo..." class="inp-sm" style="width:130px" oninput="applyFilters()">
-      <span style="color:#555;font-size:10px">Ordenar:</span>
+      <input type="text" id="search-symbol" placeholder="Buscar..." class="inp-sm" style="width:90px" oninput="applyFilters()">
       <button class="sort-btn active" data-sort="score" onclick="setSort('score')">Score &#9660;</button>
       <button class="sort-btn" data-sort="apr" onclick="setSort('apr')">APR</button>
       <button class="sort-btn" data-sort="fr" onclick="setSort('fr')">FR</button>
       <button class="sort-btn" data-sort="net3d" onclick="setSort('net3d')">Neto 3d</button>
-      <button class="sort-btn" data-sort="volume" onclick="setSort('volume')">Volumen</button>
-      <button class="sort-btn" data-sort="be" onclick="setSort('be')">Break-even</button>
+      <button class="sort-btn" data-sort="volume" onclick="setSort('volume')">Vol</button>
+      <button class="sort-btn" data-sort="be" onclick="setSort('be')">BE</button>
     </div>
 
     <div id="opp-list-cex"></div>
@@ -64,16 +79,16 @@
     <div class="capital-bar" id="capital-bar"></div>
     <div id="alerts-bar"></div>
     <div class="earnings-chart-container" id="earnings-chart-container" style="display:none">
-      <canvas id="earnings-chart" height="200"></canvas>
+      <canvas id="earnings-chart" height="180"></canvas>
     </div>
     <div id="pos-list"></div>
     <div class="history-section" id="history-section">
-      <h3 style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
         Historial
-        <span style="display:flex;gap:6px">
-          <button class="btn btn-secondary" onclick="exportCSV()" style="font-size:11px;padding:4px 10px">Exportar CSV</button>
-          <button class="btn" onclick="clearHistory(false)" style="font-size:11px;padding:4px 10px">Borrar historial</button>
-          <button class="btn btn-danger" onclick="clearHistory(true)" style="font-size:11px;padding:4px 10px">Reset total</button>
+        <span style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn btn-secondary" onclick="exportCSV()" style="font-size:10px;padding:4px 10px">CSV</button>
+          <button class="btn" onclick="clearHistory(false)" style="font-size:10px;padding:4px 10px">Borrar</button>
+          <button class="btn btn-danger" onclick="clearHistory(true)" style="font-size:10px;padding:4px 10px">Reset</button>
         </span>
       </h3>
       <div id="history-list"></div>
@@ -96,26 +111,24 @@
       </div>
     </div>
     <div class="cfg-section">
-      <h3>WhatsApp Notificaciones</h3>
+      <h3>WhatsApp</h3>
       <div class="cfg-grid">
         <label class="full"><input type="checkbox" id="cfg-email-on"> Notificaciones habilitadas</label>
-        <label>Telefono (con codigo pais)<input type="text" id="cfg-wa-phone" class="inp" placeholder="5491155551234"></label>
-        <label>API Key (CallMeBot)<input type="text" id="cfg-wa-apikey" class="inp" placeholder="123456"></label>
+        <label>Telefono<input type="text" id="cfg-wa-phone" class="inp" placeholder="5491155551234"></label>
+        <label>API Key<input type="text" id="cfg-wa-apikey" class="inp" placeholder="123456"></label>
       </div>
-      <p style="font-size:11px;color:#666;margin:8px 0 4px;line-height:1.5">
-        <b>Como configurar:</b><br>
-        1. Guarda el numero <b>+34 644 31 89 93</b> en tus contactos<br>
-        2. Envia "<b>I allow callmebot to send me messages</b>" a ese numero en WhatsApp<br>
-        3. Espera la respuesta con tu API key<br>
-        4. Ingresa tu telefono (sin +, ej: 5491155551234) y el API key aqui
+      <p style="font-size:10px;color:#555;margin:8px 0 4px;line-height:1.6">
+        1. Guarda <b>+34 644 31 89 93</b> en contactos<br>
+        2. Envia "<b>I allow callmebot to send me messages</b>" a ese numero<br>
+        3. Espera tu API key e ingresala aqui
       </p>
       <div class="cfg-actions">
-        <button class="btn btn-secondary" onclick="testEmail()">Enviar prueba WhatsApp</button>
+        <button class="btn btn-secondary" onclick="testEmail()">Prueba WhatsApp</button>
         <span id="email-status"></span>
       </div>
     </div>
     <div class="cfg-actions">
-      <button class="btn btn-primary" onclick="saveConfig()">Guardar configuracion</button>
+      <button class="btn btn-primary" onclick="saveConfig()">Guardar</button>
       <span id="cfg-status"></span>
     </div>
   </div>
@@ -125,26 +138,24 @@
   <div id="page-account" class="page">
     <div class="cfg-section">
       <h3>Perfil</h3>
-      <div style="font-size:12px;color:#888;margin:8px 0">
+      <div style="font-size:12px;color:var(--text-secondary);margin:8px 0">
         Email: <strong style="color:#fff">{{ user_email }}</strong>
       </div>
     </div>
     <div class="cfg-section">
-      <h3>API Keys de Exchanges</h3>
-      <p style="font-size:11px;color:#666;margin-bottom:12px">
-        Tus keys se almacenan encriptadas. Nunca se muestran despues de guardarlas.
-      </p>
+      <h3>API Keys</h3>
+      <p style="font-size:10px;color:#555;margin-bottom:10px">Tus keys se almacenan encriptadas.</p>
       <div id="exchange-keys-list"></div>
     </div>
     <div class="cfg-section">
       <h3 style="color:#ef4444">Zona peligrosa</h3>
-      <button class="btn btn-danger" onclick="deleteAccount()">Eliminar mi cuenta</button>
+      <button class="btn btn-danger" onclick="deleteAccount()">Eliminar cuenta</button>
     </div>
   </div>
   {% endif %}
 </div>
 
-<!-- Modal for position steps -->
+<!-- Modal -->
 <div id="modal" class="modal" onclick="if(event.target===this)closeModal()">
   <div class="modal-content">
     <div class="modal-header">
@@ -154,6 +165,28 @@
     <div id="modal-body"></div>
   </div>
 </div>
+
+<!-- Bottom Navigation (mobile) -->
+<nav class="bottom-nav">
+  <button class="nav-item active" id="bnav-opportunities" onclick="switchTab('opportunities')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 4-5"/></svg>
+    <span>Opps</span>
+  </button>
+  <button class="nav-item" id="bnav-positions" onclick="switchTab('positions')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M12 9v4m-2-2h4"/></svg>
+    <span>Posiciones</span>
+  </button>
+  <button class="nav-item" id="bnav-config" onclick="switchTab('config')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+    <span>Config</span>
+  </button>
+  {% if db_enabled %}
+  <button class="nav-item" id="bnav-account" onclick="switchTab('account')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>
+    <span>Cuenta</span>
+  </button>
+  {% endif %}
+</nav>
 
 <div id="toast-container" class="toast-container"></div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>

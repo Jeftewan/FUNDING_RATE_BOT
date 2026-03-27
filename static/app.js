@@ -86,6 +86,8 @@ function setSort(field) {
 }
 
 function applyFilters() {
+  // Invalidate hash so render always happens on user-triggered filter
+  _lastCexHash = ''; _lastDefiHash = '';
   if (currentSubTab === 'cex' && _lastCexData) renderOpps(_lastCexData);
   else if (currentSubTab === 'defi' && _lastDefiData) renderDefiOpps(_lastDefiData);
 }
@@ -108,96 +110,14 @@ function sortAndFilter(opps) {
   return filtered;
 }
 
-// ── Mini-charts ──────────────────────────────────────────────
-const _chartCache = {};     // symbol_exchange -> { rates, timestamps }
-const _chartInstances = {}; // canvasId -> Chart instance
-let _chartQueue = [];
-let _chartActive = 0;
-const MAX_CONCURRENT_CHARTS = 3;
+// ── Data hash for anti-flicker ───────────────────────────────
+let _lastCexHash = '';
+let _lastDefiHash = '';
+let _lastPosHash = '';
 
-function initMiniChartObserver() {
-  if (!window.IntersectionObserver || typeof Chart === 'undefined') return;
-  const observer = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        const el = entry.target;
-        const symbol = el.dataset.chartSymbol;
-        const exchange = el.dataset.chartExchange;
-        if (symbol && exchange) {
-          observer.unobserve(el);
-          enqueueChart(el, symbol, exchange);
-        }
-      }
-    });
-  }, { rootMargin: '100px' });
-
-  document.querySelectorAll('.mini-chart[data-chart-symbol]').forEach(el => observer.observe(el));
-}
-
-function enqueueChart(el, symbol, exchange) {
-  _chartQueue.push({ el, symbol, exchange });
-  processChartQueue();
-}
-
-async function processChartQueue() {
-  while (_chartQueue.length && _chartActive < MAX_CONCURRENT_CHARTS) {
-    _chartActive++;
-    const { el, symbol, exchange } = _chartQueue.shift();
-    try { await loadMiniChart(el, symbol, exchange); } catch (e) {}
-    _chartActive--;
-  }
-}
-
-async function loadMiniChart(el, symbol, exchange) {
-  const key = `${symbol}_${exchange}`;
-  let data = _chartCache[key];
-  if (!data) {
-    try {
-      const res = await fetch(`/api/funding_history/${encodeURIComponent(symbol)}/${encodeURIComponent(exchange)}`);
-      data = await res.json();
-      if (data.rates?.length) _chartCache[key] = data;
-    } catch (e) { return; }
-  }
-  if (!data?.rates?.length) { el.innerHTML = ''; return; }
-  renderMiniChart(el, data.rates, data.timestamps);
-}
-
-function renderMiniChart(container, rates, timestamps) {
-  const canvas = document.createElement('canvas');
-  container.innerHTML = '';
-  container.appendChild(canvas);
-
-  const avgRate = rates.reduce((a, b) => a + b, 0) / rates.length;
-  const color = avgRate >= 0 ? '#22c55e' : '#ef4444';
-
-  const id = container.id || 'mc-' + Math.random().toString(36).slice(2);
-  if (_chartInstances[id]) { _chartInstances[id].destroy(); delete _chartInstances[id]; }
-
-  _chartInstances[id] = new Chart(canvas, {
-    type: 'line',
-    data: {
-      labels: timestamps.map(t => ''),
-      datasets: [{
-        data: rates.map(r => r * 100),
-        borderColor: color,
-        backgroundColor: color + '11',
-        fill: true,
-        borderWidth: 1.5,
-        pointRadius: 0,
-        tension: 0.3,
-      }],
-    },
-    options: {
-      responsive: false,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { enabled: false } },
-      scales: {
-        x: { display: false },
-        y: { display: false },
-      },
-      animation: { duration: 300 },
-    },
-  });
+function dataHash(obj) {
+  // Fast shallow hash — stringify key fields only
+  try { return JSON.stringify(obj).length + '_' + (obj.scan_count || 0); } catch (e) { return '' + Math.random(); }
 }
 
 // ── Earnings chart ───────────────────────────────────────────
@@ -270,10 +190,20 @@ async function loadExchangeStatus() {
 // ── Tab switching ─────────────────────────────────────────────
 function switchTab(tab) {
   currentTab = tab;
+  // Update pages
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById('page-' + tab).classList.add('active');
-  document.getElementById('tab-' + tab).classList.add('active');
+  // Update top tabs (desktop)
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  const topTab = document.getElementById('tab-' + tab);
+  if (topTab) topTab.classList.add('active');
+  // Update bottom nav (mobile)
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  const botNav = document.getElementById('bnav-' + tab);
+  if (botNav) botNav.classList.add('active');
+  // Force fresh render on tab switch
+  if (tab === 'opportunities') { _lastCexHash = ''; _lastDefiHash = ''; }
+  else if (tab === 'positions') { _lastPosHash = ''; }
   refresh();
 }
 
@@ -312,7 +242,12 @@ async function loadOpps() {
     const res = await fetch('/api/opportunities');
     const data = await res.json();
     _lastCexData = data;
-    renderOpps(data);
+    // Anti-flicker: skip re-render if data unchanged
+    const h = dataHash(data);
+    if (h !== _lastCexHash || el.querySelector('.skeleton-card')) {
+      _lastCexHash = h;
+      renderOpps(data);
+    }
     updateStatus(data);
     setScanUI(!!data.scanning);
   } catch (e) {
@@ -325,7 +260,7 @@ function renderOpps(data) {
   const opps = sortAndFilter(rawOpps);
   const el = document.getElementById('opp-list-cex');
   document.getElementById('opp-count').textContent =
-    `${opps.length} oportunidades (${data.total_unfiltered || 0} total)`;
+    `${opps.length} / ${data.total_unfiltered || 0}`;
 
   if (!opps.length) {
     el.innerHTML = `<div class="empty-state">
@@ -337,10 +272,10 @@ function renderOpps(data) {
   }
 
   el.innerHTML = opps.map((o, i) => {
-    const mode = o.mode === 'spot_perp' ? 'Spot-Perp' : 'Cross-Exchange';
+    const mode = o.mode === 'spot_perp' ? 'Spot-Perp' : 'Cross-Ex';
     const isCross = o.mode === 'cross_exchange';
     const exchange = !isCross ? o.exchange :
-      `${o.long_exchange} (${o.long_interval_hours||'?'}h) / ${o.short_exchange} (${o.short_interval_hours||'?'}h)`;
+      `${o.long_exchange}/${o.short_exchange}`;
     const grade = o.stability_grade || gradeFromScore(o.score);
     const fr = !isCross ? o.funding_rate : o.rate_differential;
     const frPct = (fr * 100).toFixed(4);
@@ -349,55 +284,53 @@ function renderOpps(data) {
     const momSignal = ind.momentum_signal || '';
     const momArrow = momSignal === 'accelerating' ? '⬆' : momSignal === 'decelerating' ? '⬇' : momSignal === 'negative' ? '↓' : '→';
     const momClass = momSignal === 'accelerating' ? 'ind-up' : momSignal === 'negative' ? 'ind-down' : 'ind-flat';
-    const regimeBadge = ind.regime === 'high_vol' ? '<span class="ind-badge ind-bonanza" title="Alta volatilidad — periodo de bonanza">BONANZA</span>' :
-                        ind.regime === 'low_vol' ? '<span class="ind-badge ind-lowvol" title="Baja volatilidad">BAJA VOL</span>' : '';
-    const spikeBadge = ind.is_spike_incoming ? '<span class="ind-badge ind-spike" title="Momentum positivo + tasa sostenible">SPIKE ↑</span>' :
-                       ind.is_spike_ending ? '<span class="ind-badge ind-warn" title="Tasa extrema — riesgo de reversion">REVERSION ⚠</span>' : '';
-    const zBadge = ind.z_risk === 'extreme' ? '<span class="ind-badge ind-danger" title="Z-score extremo — tasa insostenible">Z:'+ind.z_score+'</span>' :
-                   ind.z_risk === 'high' ? '<span class="ind-badge ind-warn" title="Z-score alto — riesgo de reversion">Z:'+ind.z_score+'</span>' : '';
+    const regimeBadge = ind.regime === 'high_vol' ? '<span class="ind-badge ind-bonanza">BONANZA</span>' :
+                        ind.regime === 'low_vol' ? '<span class="ind-badge ind-lowvol">BAJA VOL</span>' : '';
+    const spikeBadge = ind.is_spike_incoming ? '<span class="ind-badge ind-spike">SPIKE ↑</span>' :
+                       ind.is_spike_ending ? '<span class="ind-badge ind-warn">REVERSION</span>' : '';
+    const zBadge = ind.z_risk === 'extreme' ? '<span class="ind-badge ind-danger">Z:'+ind.z_score+'</span>' :
+                   ind.z_risk === 'high' ? '<span class="ind-badge ind-warn">Z:'+ind.z_score+'</span>' : '';
 
     return `
     <div class="opp-card${grade === 'A' ? ' grade-a' : ''}">
       <div class="opp-header">
-        <div>
-          <span class="opp-symbol">${o.symbol}/USDT</span>
+        <div class="opp-header-left">
+          <span class="opp-symbol">${o.symbol}</span>
           <span class="opp-mode">${mode}</span>
-          <span style="font-size:11px;color:#888;margin-left:6px">${exchange}</span>
-        </div>
-        <div style="display:flex;gap:6px;align-items:center">
+          <span class="opp-exchange">${exchange}</span>
           ${spikeBadge}${regimeBadge}${zBadge}
+        </div>
+        <div class="opp-header-right">
           <span class="opp-badge ${grade}">${grade}</span>
-          <span style="font-size:12px;color:#fff;font-weight:700">${o.score}/100</span>
+          <span class="opp-score">${o.score}</span>
         </div>
       </div>
 
       <div class="opp-stats">
-        <div class="opp-stat"><span class="label" data-tooltip="Tasa de financiacion actual del contrato perpetuo">FR</span><span class="value green">${frPct}%</span></div>
-        <div class="opp-stat"><span class="label" data-tooltip="Tasa anualizada basada en la tasa actual">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
-        <div class="opp-stat"><span class="label" data-tooltip="Tasa acumulada en los ultimos 3 dias">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
-        <div class="opp-stat"><span class="label" data-tooltip="Ingreso diario estimado por cada $1,000">$/dia (1K)</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
-        <div class="opp-stat"><span class="label" data-tooltip="Ganancia neta en 3 dias por $1,000 (menos fees)">Neto 3d (1K)</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
-        <div class="opp-stat"><span class="label" data-tooltip="Costos de entrada + salida estimados">Fees</span><span class="value">$${o.fees_total?.toFixed(2) || o.total_fees?.toFixed(2)}</span></div>
-        <div class="opp-stat"><span class="label" data-tooltip="Horas necesarias para cubrir los costos de entrada y salida">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
-        <div class="opp-stat"><span class="label" data-tooltip="Dias estimados de hold recomendado">Est. dias</span><span class="value">${days}d</span></div>
-        ${ind.momentum_signal ? `<div class="opp-stat"><span class="label" data-tooltip="Momentum: ${momSignal} (ROC: ${ind.momentum_roc||0})">Mom</span><span class="value ${momClass}">${momArrow}</span></div>` : ''}
-        ${ind.percentile !== undefined ? `<div class="opp-stat"><span class="label" data-tooltip="Percentil de la tasa actual vs historico reciente">Pctl</span><span class="value">${Math.round(ind.percentile||0)}%</span></div>` : ''}
+        <div class="opp-stat"><span class="label">FR</span><span class="value green">${frPct}%</span></div>
+        <div class="opp-stat"><span class="label">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
+        <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
+        <div class="opp-stat"><span class="label">$/dia 1K</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Neto 3d</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Fees</span><span class="value">$${o.fees_total?.toFixed(2) || o.total_fees?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
+        <div class="opp-stat"><span class="label">Hold</span><span class="value">${days}d</span></div>
+        ${ind.momentum_signal ? `<div class="opp-stat"><span class="label">Mom</span><span class="value ${momClass}">${momArrow}</span></div>` : ''}
+        ${ind.percentile !== undefined ? `<div class="opp-stat"><span class="label">Pctl</span><span class="value">${Math.round(ind.percentile||0)}%</span></div>` : ''}
       </div>
 
       <div class="opp-meta">
-        Vol: $${fmtVol(o.volume_24h)} |
+        Vol $${fmtVol(o.volume_24h)}
         ${isCross
-          ? `Long ${o.long_rate ? (o.long_rate*100).toFixed(4)+'%' : '?'} (${o.long_interval_hours||'?'}h) · Short ${o.short_rate ? (o.short_rate*100).toFixed(4)+'%' : '?'} (${o.short_interval_hours||'?'}h)`
-          : `Intervalo: ${o.interval_hours || '?'}h`} |
-        ${o.mins_to_next > 0 ? `Prox pago: ${Math.round(o.mins_to_next)}min` : ''}
+          ? ` · L:${o.long_rate ? (o.long_rate*100).toFixed(4)+'%' : '?'} (${o.long_interval_hours||'?'}h) · S:${o.short_rate ? (o.short_rate*100).toFixed(4)+'%' : '?'} (${o.short_interval_hours||'?'}h)`
+          : ` · ${o.interval_hours || '?'}h`}
+        ${o.mins_to_next > 0 ? ` · ${Math.round(o.mins_to_next)}min` : ''}
       </div>
 
-      <div class="mini-chart" id="mc-cex-${i}" data-chart-symbol="${o.symbol}" data-chart-exchange="${!isCross ? o.exchange : o.short_exchange}"></div>
-
       <div class="opp-actions">
-        <input type="number" id="cap-${i}" placeholder="Capital $" class="inp-sm" style="width:90px">
-        <input type="number" id="lev-${i}" placeholder="Lev" value="1" min="1" max="50" class="inp-sm" style="width:55px" title="Apalancamiento">
-        <button class="btn btn-calc" onclick="calcEst('${o._id}',${i})">Calcular</button>
+        <input type="number" id="cap-${i}" placeholder="$" class="inp-sm" style="width:70px">
+        <input type="number" id="lev-${i}" placeholder="x" value="1" min="1" max="50" class="inp-sm" style="width:40px">
+        <button class="btn btn-calc" onclick="calcEst('${o._id}',${i})">Calc</button>
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${i})">Entrar</button>
       </div>
       <div class="opp-est" id="est-${i}"></div>
@@ -416,7 +349,6 @@ function renderOpps(data) {
       if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
     }
   });
-  setTimeout(initMiniChartObserver, 50);
 }
 
 // ── DeFi Opportunities ────────────────────────────────────────
@@ -427,7 +359,11 @@ async function loadDefiOpps() {
     const res = await fetch('/api/defi_opportunities');
     const data = await res.json();
     _lastDefiData = data;
-    renderDefiOpps(data);
+    const h = dataHash(data);
+    if (h !== _lastDefiHash || el.querySelector('.skeleton-card')) {
+      _lastDefiHash = h;
+      renderDefiOpps(data);
+    }
     updateStatus(data);
     setScanUI(!!data.scanning);
   } catch (e) {
@@ -440,53 +376,50 @@ function renderDefiOpps(data) {
   const opps = sortAndFilter(rawOpps);
   const el = document.getElementById('opp-list-defi');
   document.getElementById('opp-count').textContent =
-    `${opps.length} oportunidades DeFi (${data.total_unfiltered || 0} total)`;
+    `${opps.length} DeFi / ${data.total_unfiltered || 0}`;
 
   if (!opps.length) {
     el.innerHTML = `<div class="empty-state">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M7 16l4-4 3 3 4-5"/></svg>
       <div class="empty-title">Sin oportunidades DeFi</div>
-      <div class="empty-sub">Esperando escaneo de protocolos DeFi...</div>
+      <div class="empty-sub">Esperando escaneo de protocolos...</div>
     </div>`;
     return;
   }
 
-  // DeFi opps are cross-exchange, use index offset to avoid ID collision with CEX
   const base = 1000;
   el.innerHTML = opps.map((o, i) => {
     const idx = base + i;
-    const isCross = true; // DeFi opps are always cross-exchange
-    const exchange = `${o.long_exchange} / ${o.short_exchange}`;
     const grade = o.stability_grade || gradeFromScore(o.score);
     const fr = o.rate_differential || 0;
     const frPct = (fr * 100).toFixed(4);
 
-    // Detect mixed CEX+DeFi
     const defiExs = ['Hyperliquid','GMX','Aster','Lighter','Extended'];
     const le = o.long_exchange || '';
     const se = o.short_exchange || '';
     const isMixed = (defiExs.includes(le)) !== (defiExs.includes(se));
-    const modeLabel = isMixed ? 'CEX+DeFi' : 'DeFi-DeFi';
+    const modeLabel = isMixed ? 'CEX+DeFi' : 'DeFi';
+    const borderColor = isMixed ? 'var(--orange)' : 'var(--purple)';
 
     const dInd = o.indicators || {};
     const dSpikeBadge = dInd.is_spike_incoming ? '<span class="ind-badge ind-spike">SPIKE ↑</span>' :
-                        dInd.is_spike_ending ? '<span class="ind-badge ind-warn">REVERSION ⚠</span>' : '';
+                        dInd.is_spike_ending ? '<span class="ind-badge ind-warn">REVERSION</span>' : '';
     const dRegimeBadge = dInd.regime === 'high_vol' ? '<span class="ind-badge ind-bonanza">BONANZA</span>' :
                          dInd.regime === 'low_vol' ? '<span class="ind-badge ind-lowvol">BAJA VOL</span>' : '';
     const dZBadge = (dInd.z_risk === 'extreme' || dInd.z_risk === 'high') ? '<span class="ind-badge ind-danger">Z:'+dInd.z_score+'</span>' : '';
 
     return `
-    <div class="opp-card" style="border-left:3px solid ${isMixed ? '#f59e0b' : '#8b5cf6'}">
+    <div class="opp-card" style="border-left:3px solid ${borderColor}">
       <div class="opp-header">
-        <div>
-          <span class="opp-symbol">${o.symbol}/USDT</span>
-          <span class="opp-mode" style="background:${isMixed ? '#422006' : '#1e1b4b'};color:${isMixed ? '#f59e0b' : '#a78bfa'}">${modeLabel}</span>
-          <span style="font-size:11px;color:#888;margin-left:6px">${exchange}</span>
-        </div>
-        <div style="display:flex;gap:6px;align-items:center">
+        <div class="opp-header-left">
+          <span class="opp-symbol">${o.symbol}</span>
+          <span class="opp-mode">${modeLabel}</span>
+          <span class="opp-exchange">${le}/${se}</span>
           ${dSpikeBadge}${dRegimeBadge}${dZBadge}
+        </div>
+        <div class="opp-header-right">
           <span class="opp-badge ${grade}">${grade}</span>
-          <span style="font-size:12px;color:#fff;font-weight:700">${o.score}/100</span>
+          <span class="opp-score">${o.score}</span>
         </div>
       </div>
 
@@ -494,31 +427,28 @@ function renderDefiOpps(data) {
         <div class="opp-stat"><span class="label">Diff</span><span class="value green">${frPct}%</span></div>
         <div class="opp-stat"><span class="label">APR</span><span class="value green">${o.apr?.toFixed(1)}%</span></div>
         <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
-        <div class="opp-stat"><span class="label">$/dia (1K)</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
-        <div class="opp-stat"><span class="label">Neto 3d (1K)</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">$/dia 1K</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Neto 3d</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
         <div class="opp-stat"><span class="label">Fees</span><span class="value">$${(o.fees_total || o.total_fees)?.toFixed(2)}</span></div>
         <div class="opp-stat"><span class="label">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
       </div>
 
       <div class="opp-meta">
-        Long: ${le} ${o.long_rate ? (o.long_rate*100).toFixed(4)+'%' : '?'} (${o.long_interval_hours||'?'}h) ·
-        Short: ${se} ${o.short_rate ? (o.short_rate*100).toFixed(4)+'%' : '?'} (${o.short_interval_hours||'?'}h)
-        ${o.mins_to_next > 0 ? ` | Prox pago: ${Math.round(o.mins_to_next)}min` : ''}
+        L:${le} ${o.long_rate ? (o.long_rate*100).toFixed(4)+'%' : '?'} (${o.long_interval_hours||'?'}h) ·
+        S:${se} ${o.short_rate ? (o.short_rate*100).toFixed(4)+'%' : '?'} (${o.short_interval_hours||'?'}h)
+        ${o.mins_to_next > 0 ? ` · ${Math.round(o.mins_to_next)}min` : ''}
       </div>
 
-      <div class="mini-chart" id="mc-defi-${idx}" data-chart-symbol="${o.symbol}" data-chart-exchange="${se}"></div>
-
       <div class="opp-actions">
-        <input type="number" id="cap-${idx}" placeholder="Capital $" class="inp-sm" style="width:90px">
-        <input type="number" id="lev-${idx}" placeholder="Lev" value="1" min="1" max="50" class="inp-sm" style="width:55px" title="Apalancamiento">
-        <button class="btn btn-calc" onclick="calcEst('${o._id}',${idx})">Calcular</button>
+        <input type="number" id="cap-${idx}" placeholder="$" class="inp-sm" style="width:70px">
+        <input type="number" id="lev-${idx}" placeholder="x" value="1" min="1" max="50" class="inp-sm" style="width:40px">
+        <button class="btn btn-calc" onclick="calcEst('${o._id}',${idx})">Calc</button>
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${idx})">Entrar</button>
       </div>
       <div class="opp-est" id="est-${idx}"></div>
     </div>`;
   }).join('');
 
-  // Restore cached calculation results and input values
   opps.forEach((o, i) => {
     const idx = base + i;
     const cached = calcCache[o._id];
@@ -531,7 +461,6 @@ function renderDefiOpps(data) {
       if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
     }
   });
-  setTimeout(initMiniChartObserver, 50);
 }
 
 function gradeFromScore(s) {
@@ -687,8 +616,12 @@ async function loadPositions() {
     ]);
     const posData = await posRes.json();
     const histData = await histRes.json();
-    renderPositions(posData);
-    renderHistory(histData);
+    const h = dataHash(posData);
+    if (h !== _lastPosHash || posEl.querySelector('.skeleton-card')) {
+      _lastPosHash = h;
+      renderPositions(posData);
+      renderHistory(histData);
+    }
     updateStatus(posData);
   } catch (e) {
     console.error('loadPositions error:', e);
@@ -703,43 +636,41 @@ function renderPositions(data) {
 
   // Capital bar
   document.getElementById('capital-bar').innerHTML = `
-    <div class="cap-item"><div class="cap-val">$${summary.total?.toFixed(0) || 0}</div><div class="cap-label">Capital total</div></div>
-    <div class="cap-item"><div class="cap-val" style="color:#3b82f6">$${summary.used?.toFixed(0) || 0}</div><div class="cap-label">En uso</div></div>
-    <div class="cap-item"><div class="cap-val" style="color:#22c55e">$${summary.available?.toFixed(0) || 0}</div><div class="cap-label">Disponible</div></div>
-    <div class="cap-item"><div class="cap-val" style="color:#22c55e">$${data.total_earned?.toFixed(2) || 0}</div><div class="cap-label">Ganancia total</div></div>
-    <div class="cap-item"><div class="cap-val">${summary.count || 0}/${summary.max_positions || 5}</div><div class="cap-label">Posiciones</div></div>`;
+    <div class="cap-item"><div class="cap-val">$${summary.total?.toFixed(0) || 0}</div><div class="cap-label">Total</div></div>
+    <div class="cap-item"><div class="cap-val" style="color:var(--blue)">$${summary.used?.toFixed(0) || 0}</div><div class="cap-label">En uso</div></div>
+    <div class="cap-item"><div class="cap-val" style="color:var(--green)">$${summary.available?.toFixed(0) || 0}</div><div class="cap-label">Disponible</div></div>
+    <div class="cap-item"><div class="cap-val" style="color:var(--green)">$${data.total_earned?.toFixed(2) || 0}</div><div class="cap-label">Ganancia</div></div>
+    <div class="cap-item"><div class="cap-val">${summary.count || 0}/${summary.max_positions || 5}</div><div class="cap-label">Pos</div></div>`;
 
   // Alerts
   document.getElementById('alerts-bar').innerHTML = alerts.map(a => `
     <div class="alert-item ${a.severity === 'WARNING' ? 'warning' : ''}">
-      ${a.severity === 'CRITICAL' ? '🚨' : '⚠️'} ${a.symbol} (${a.exchange}): ${a.message}
+      ${a.symbol} (${a.exchange}): ${a.message}
     </div>`).join('');
 
-  // Play sound for critical alerts
   if (alerts.some(a => a.severity === 'CRITICAL')) playBeep();
 
-  // Positions
   const el = document.getElementById('pos-list');
   if (!positions.length) {
     el.innerHTML = `<div class="empty-state">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M12 10v4m-2-2h4"/></svg>
       <div class="empty-title">Sin posiciones activas</div>
-      <div class="empty-sub"><span class="empty-cta" onclick="switchTab('opportunities')">Ve a Oportunidades</span> para abrir una posicion</div>
+      <div class="empty-sub"><span class="empty-cta" onclick="switchTab('opportunities')">Ir a Oportunidades</span></div>
     </div>`;
     return;
   }
 
   el.innerHTML = positions.map((p, idx) => {
-    const mode = p.mode === 'spot_perp' ? 'Spot-Perp' : 'Cross-Exchange';
+    const mode = p.mode === 'spot_perp' ? 'Spot-Perp' : 'Cross-Ex';
     const exchange = p.mode === 'cross_exchange'
-      ? `${p.long_exchange} / ${p.short_exchange}` : p.exchange;
-    const frColor = p.current_fr > 0 ? '#22c55e' : '#ef4444';
-    const earnColor = p.net_earned >= 0 ? '#22c55e' : '#ef4444';
+      ? `${p.long_exchange}/${p.short_exchange}` : p.exchange;
+    const frColor = p.current_fr > 0 ? 'var(--green)' : 'var(--red)';
+    const earnColor = p.net_earned >= 0 ? 'var(--green)' : 'var(--red)';
     const posId = p.id || String(idx);
 
     let alertHtml = '';
     if (p.fr_reversed) {
-      alertHtml = '<div class="pos-alert">FUNDING CAMBIO DE SIGNO — CERRAR POSICION</div>';
+      alertHtml = '<div class="pos-alert">FR CAMBIO DE SIGNO — CERRAR</div>';
     }
 
     const payments = p.payments || [];
@@ -748,18 +679,18 @@ function renderPositions(data) {
     if (lastPayments.length) {
       payTable = `
         <div class="pay-toggle" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
-          Ver ultimos ${lastPayments.length} pagos
+          ${lastPayments.length} pagos recientes
         </div>
         <div style="display:none">
           <table class="pay-table">
-            <tr><th>#</th><th>Hora</th><th>Tasa</th><th>Ganancia</th><th>Acum</th></tr>
+            <tr><th>#</th><th>Hora</th><th>Tasa</th><th>+/-</th><th>Acum</th></tr>
             ${lastPayments.map((pay, i) => `
               <tr>
                 <td>${payments.length - i}</td>
                 <td>${new Date(pay.ts * 1000).toLocaleTimeString()}</td>
                 <td>${(pay.rate * 100).toFixed(4)}%</td>
-                <td style="color:${pay.earned >= 0 ? '#22c55e' : '#ef4444'}">$${pay.earned.toFixed(4)}</td>
-                <td style="color:${pay.cumulative >= 0 ? '#22c55e' : '#ef4444'}">$${pay.cumulative.toFixed(2)}</td>
+                <td style="color:${pay.earned >= 0 ? 'var(--green)' : 'var(--red)'}">$${pay.earned.toFixed(4)}</td>
+                <td style="color:${pay.cumulative >= 0 ? 'var(--green)' : 'var(--red)'}">$${pay.cumulative.toFixed(2)}</td>
               </tr>`).join('')}
           </table>
         </div>`;
@@ -769,26 +700,26 @@ function renderPositions(data) {
     <div class="pos-card">
       ${alertHtml}
       <div class="pos-header">
-        <div>
-          <span class="pos-symbol">${p.symbol}/USDT</span>
+        <div class="pos-header-left">
+          <span class="pos-symbol">${p.symbol}</span>
           <span class="opp-mode">${mode}</span>
-          <span style="font-size:11px;color:#888;margin-left:6px">${exchange}</span>
+          <span class="opp-exchange">${exchange}</span>
         </div>
-        <button class="btn btn-danger" onclick="closePos('${posId}','${p.symbol}')">Cerrar posicion</button>
+        <button class="btn btn-danger" onclick="closePos('${posId}','${p.symbol}')">Cerrar</button>
       </div>
 
       <div class="pos-grid">
         <div class="pos-field"><span class="label">Capital</span><span class="value">$${p.capital_used.toFixed(0)}</span></div>
-        <div class="pos-field"><span class="label">Tiempo</span><span class="value">${p.elapsed_h?.toFixed(1)}h (${(p.elapsed_h/24).toFixed(1)}d)</span></div>
-        <div class="pos-field"><span class="label">Pagos recibidos</span><span class="value">${p.payment_count || p.intervals || 0}</span></div>
+        <div class="pos-field"><span class="label">Tiempo</span><span class="value">${p.elapsed_h?.toFixed(1)}h</span></div>
+        <div class="pos-field"><span class="label">Pagos</span><span class="value">${p.payment_count || p.intervals || 0}</span></div>
         <div class="pos-field"><span class="label">Prox pago</span><span class="value">${p.mins_next > 0 ? Math.round(p.mins_next) + 'min' : '—'}</span></div>
         <div class="pos-field"><span class="label">FR entrada</span><span class="value">${(p.entry_fr*100).toFixed(4)}%</span></div>
         <div class="pos-field"><span class="label">FR actual</span><span class="value" style="color:${frColor}">${(p.current_fr*100).toFixed(4)}%</span></div>
-        <div class="pos-field"><span class="label">APR actual</span><span class="value" style="color:${frColor}">${p.current_apr?.toFixed(1)}%</span></div>
-        <div class="pos-field"><span class="label">Tasa promedio</span><span class="value">${p.avg_rate ? (p.avg_rate*100).toFixed(4) + '%' : '—'}</span></div>
-        <div class="pos-field"><span class="label">Ganancia acum</span><span class="value" style="color:#22c55e">$${p.est_earned?.toFixed(2)}</span></div>
-        <div class="pos-field"><span class="label">Fees est (E+S)</span><span class="value" style="color:#ef4444">$${p.est_fees_total?.toFixed(2)}</span></div>
-        <div class="pos-field"><span class="label">Ganancia neta</span><span class="value" style="color:${earnColor};font-weight:700">$${p.net_earned?.toFixed(2)}</span></div>
+        <div class="pos-field"><span class="label">APR</span><span class="value" style="color:${frColor}">${p.current_apr?.toFixed(1)}%</span></div>
+        <div class="pos-field"><span class="label">Prom</span><span class="value">${p.avg_rate ? (p.avg_rate*100).toFixed(4) + '%' : '—'}</span></div>
+        <div class="pos-field"><span class="label">Ganancia</span><span class="value" style="color:var(--green)">$${p.est_earned?.toFixed(2)}</span></div>
+        <div class="pos-field"><span class="label">Fees</span><span class="value" style="color:var(--red)">$${p.est_fees_total?.toFixed(2)}</span></div>
+        <div class="pos-field"><span class="label">Neto</span><span class="value" style="color:${earnColor};font-weight:700">$${p.net_earned?.toFixed(2)}</span></div>
       </div>
 
       ${payTable}
