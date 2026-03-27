@@ -34,6 +34,27 @@ def init_db(app):
         # Import models so they are registered with SQLAlchemy
         from core import db_models  # noqa: F401
         db.create_all()
+
+        # Auto-migrate: add columns that db.create_all() won't add to existing tables
+        _run_migrations(db)
         log.info("Database initialized successfully")
 
     return True
+
+
+def _run_migrations(db):
+    """Add missing columns to existing tables.
+
+    db.create_all() creates new tables but won't alter existing ones.
+    This runs safe ALTER TABLE ADD COLUMN IF NOT EXISTS statements.
+    """
+    migrations = [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(256)",
+        "ALTER TABLE funding_rate_snapshots ADD COLUMN IF NOT EXISTS open_interest FLOAT",
+    ]
+    for sql in migrations:
+        try:
+            db.session.execute(db.text(sql))
+        except Exception as e:
+            log.debug(f"Migration skipped (likely already applied): {e}")
+    db.session.commit()
