@@ -341,16 +341,16 @@ function renderOpps(data) {
       </div>
 
       <div class="opp-stats">
-        <div class="opp-stat" data-tip="Funding Rate: tasa que pagan longs a shorts · ${frPct}%"><span class="label">FR</span><span class="value green">${frPct}%</span></div>
-        <div class="opp-stat" data-tip="Retorno anual proyectado · ${o.apr?.toFixed(1)}%"><span class="label">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
-        <div class="opp-stat" data-tip="Acumulado ultimos 3 dias · ${o.accumulated_3d_pct?.toFixed(3)}%"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
-        <div class="opp-stat" data-tip="Ingreso diario por cada $1,000 invertidos"><span class="label">$/dia 1K</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
-        <div class="opp-stat" data-tip="Ganancia neta en 3 dias (despues de fees) por $1K"><span class="label">Neto 3d</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
-        <div class="opp-stat" data-tip="Fees totales estimados (entrada + salida)"><span class="label">Fees</span><span class="value">$${o.fees_total?.toFixed(2) || o.total_fees?.toFixed(2)}</span></div>
-        <div class="opp-stat" data-tip="Horas para recuperar los fees con las ganancias"><span class="label">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
-        <div class="opp-stat" data-tip="Dias estimados de hold recomendado"><span class="label">Hold</span><span class="value">${days}d</span></div>
-        ${ind.momentum_signal ? `<div class="opp-stat" data-tip="Momentum: tendencia del funding rate"><span class="label">Mom</span><span class="value ${momClass}">${momArrow}</span></div>` : ''}
-        ${ind.percentile !== undefined ? `<div class="opp-stat" data-tip="Percentil historico de esta tasa"><span class="label">Pctl</span><span class="value">${Math.round(ind.percentile||0)}%</span></div>` : ''}
+        <div class="opp-stat"><span class="label">FR</span><span class="value green">${frPct}%</span></div>
+        <div class="opp-stat"><span class="label">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
+        <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
+        <div class="opp-stat"><span class="label">$/dia 1K</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Neto 3d</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Fees</span><span class="value">$${o.fees_total?.toFixed(2) || o.total_fees?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
+        <div class="opp-stat"><span class="label">Hold</span><span class="value">${days}d</span></div>
+        ${ind.momentum_signal ? `<div class="opp-stat"><span class="label">Mom</span><span class="value ${momClass}">${momArrow}</span></div>` : ''}
+        ${ind.percentile !== undefined ? `<div class="opp-stat"><span class="label">Pctl</span><span class="value">${Math.round(ind.percentile||0)}%</span></div>` : ''}
       </div>
 
       <div class="opp-meta">
@@ -458,13 +458,13 @@ function renderDefiOpps(data) {
       </div>
 
       <div class="opp-stats">
-        <div class="opp-stat" data-tip="Diferencial de funding entre exchanges · ${frPct}%"><span class="label">Diff</span><span class="value green">${frPct}%</span></div>
-        <div class="opp-stat" data-tip="Retorno anual proyectado · ${o.apr?.toFixed(1)}%"><span class="label">APR</span><span class="value green">${o.apr?.toFixed(1)}%</span></div>
-        <div class="opp-stat" data-tip="Acumulado ultimos 3 dias · ${o.accumulated_3d_pct?.toFixed(3)}%"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
-        <div class="opp-stat" data-tip="Ingreso diario por cada $1,000 invertidos"><span class="label">$/dia 1K</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
-        <div class="opp-stat" data-tip="Ganancia neta en 3 dias (despues de fees) por $1K"><span class="label">Neto 3d</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
-        <div class="opp-stat" data-tip="Fees totales estimados (entrada + salida)"><span class="label">Fees</span><span class="value">$${(o.fees_total || o.total_fees)?.toFixed(2)}</span></div>
-        <div class="opp-stat" data-tip="Horas para recuperar los fees con las ganancias"><span class="label">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
+        <div class="opp-stat"><span class="label">Diff</span><span class="value green">${frPct}%</span></div>
+        <div class="opp-stat"><span class="label">APR</span><span class="value green">${o.apr?.toFixed(1)}%</span></div>
+        <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
+        <div class="opp-stat"><span class="label">$/dia 1K</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Neto 3d</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Fees</span><span class="value">$${(o.fees_total || o.total_fees)?.toFixed(2)}</span></div>
+        <div class="opp-stat"><span class="label">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
       </div>
 
       <div class="opp-meta">
@@ -670,11 +670,11 @@ function renderPositions(data) {
 
   // Capital bar
   document.getElementById('capital-bar').innerHTML = `
-    <div class="cap-item" data-tip="Capital total configurado para arbitraje"><div class="cap-val">$${summary.total?.toFixed(0) || 0}</div><div class="cap-label">Total</div></div>
-    <div class="cap-item" data-tip="Capital asignado en posiciones activas"><div class="cap-val" style="color:var(--blue)">$${summary.used?.toFixed(0) || 0}</div><div class="cap-label">En uso</div></div>
-    <div class="cap-item" data-tip="Capital libre para abrir nuevas posiciones"><div class="cap-val" style="color:var(--green)">$${summary.available?.toFixed(0) || 0}</div><div class="cap-label">Disponible</div></div>
-    <div class="cap-item" data-tip="Ganancia total acumulada de posiciones activas"><div class="cap-val" style="color:var(--green)">$${data.total_earned?.toFixed(2) || 0}</div><div class="cap-label">Ganancia</div></div>
-    <div class="cap-item" data-tip="Posiciones activas / maximo permitido"><div class="cap-val">${summary.count || 0}/${summary.max_positions || 5}</div><div class="cap-label">Pos</div></div>`;
+    <div class="cap-item"><div class="cap-val">$${summary.total?.toFixed(0) || 0}</div><div class="cap-label">Total</div></div>
+    <div class="cap-item"><div class="cap-val" style="color:var(--blue)">$${summary.used?.toFixed(0) || 0}</div><div class="cap-label">En uso</div></div>
+    <div class="cap-item"><div class="cap-val" style="color:var(--green)">$${summary.available?.toFixed(0) || 0}</div><div class="cap-label">Disponible</div></div>
+    <div class="cap-item"><div class="cap-val" style="color:var(--green)">$${data.total_earned?.toFixed(2) || 0}</div><div class="cap-label">Ganancia</div></div>
+    <div class="cap-item"><div class="cap-val">${summary.count || 0}/${summary.max_positions || 5}</div><div class="cap-label">Pos</div></div>`;
 
   // Alerts
   document.getElementById('alerts-bar').innerHTML = alerts.map(a => `
@@ -743,17 +743,17 @@ function renderPositions(data) {
       </div>
 
       <div class="pos-grid">
-        <div class="pos-field" data-tip="Capital total asignado a esta posicion"><span class="label">Capital</span><span class="value">$${p.capital_used.toFixed(0)}</span></div>
-        <div class="pos-field" data-tip="Tiempo desde apertura"><span class="label">Tiempo</span><span class="value">${p.elapsed_h?.toFixed(1)}h</span></div>
-        <div class="pos-field" data-tip="Pagos de funding recibidos"><span class="label">Pagos</span><span class="value">${p.payment_count || p.intervals || 0}</span></div>
-        <div class="pos-field" data-tip="Minutos hasta el proximo pago de funding"><span class="label">Prox pago</span><span class="value">${p.mins_next > 0 ? Math.round(p.mins_next) + 'min' : '—'}</span></div>
-        <div class="pos-field" data-tip="Funding rate al momento de abrir"><span class="label">FR entrada</span><span class="value">${(p.entry_fr*100).toFixed(4)}%</span></div>
-        <div class="pos-field" data-tip="Funding rate actual del mercado"><span class="label">FR actual</span><span class="value" style="color:${frColor}">${(p.current_fr*100).toFixed(4)}%</span></div>
-        <div class="pos-field" data-tip="Retorno anual basado en el FR actual"><span class="label">APR</span><span class="value" style="color:${frColor}">${p.current_apr?.toFixed(1)}%</span></div>
-        <div class="pos-field" data-tip="Tasa promedio de todos los pagos recibidos"><span class="label">Prom</span><span class="value">${p.avg_rate ? (p.avg_rate*100).toFixed(4) + '%' : '—'}</span></div>
-        <div class="pos-field" data-tip="Ganancia bruta acumulada por funding"><span class="label">Ganancia</span><span class="value" style="color:var(--green)">$${p.est_earned?.toFixed(2)}</span></div>
-        <div class="pos-field" data-tip="Fees estimados (entrada + salida)"><span class="label">Fees</span><span class="value" style="color:var(--red)">$${p.est_fees_total?.toFixed(2)}</span></div>
-        <div class="pos-field" data-tip="Ganancia neta despues de fees"><span class="label">Neto</span><span class="value" style="color:${earnColor};font-weight:700">$${p.net_earned?.toFixed(2)}</span></div>
+        <div class="pos-field"><span class="label">Capital</span><span class="value">$${p.capital_used.toFixed(0)}</span></div>
+        <div class="pos-field"><span class="label">Tiempo</span><span class="value">${p.elapsed_h?.toFixed(1)}h</span></div>
+        <div class="pos-field"><span class="label">Pagos</span><span class="value">${p.payment_count || p.intervals || 0}</span></div>
+        <div class="pos-field"><span class="label">Prox pago</span><span class="value">${p.mins_next > 0 ? Math.round(p.mins_next) + 'min' : '—'}</span></div>
+        <div class="pos-field"><span class="label">FR entrada</span><span class="value">${(p.entry_fr*100).toFixed(4)}%</span></div>
+        <div class="pos-field"><span class="label">FR actual</span><span class="value" style="color:${frColor}">${(p.current_fr*100).toFixed(4)}%</span></div>
+        <div class="pos-field"><span class="label">APR</span><span class="value" style="color:${frColor}">${p.current_apr?.toFixed(1)}%</span></div>
+        <div class="pos-field"><span class="label">Prom</span><span class="value">${p.avg_rate ? (p.avg_rate*100).toFixed(4) + '%' : '—'}</span></div>
+        <div class="pos-field"><span class="label">Ganancia</span><span class="value" style="color:var(--green)">$${p.est_earned?.toFixed(2)}</span></div>
+        <div class="pos-field"><span class="label">Fees</span><span class="value" style="color:var(--red)">$${p.est_fees_total?.toFixed(2)}</span></div>
+        <div class="pos-field"><span class="label">Neto</span><span class="value" style="color:${earnColor};font-weight:700">$${p.net_earned?.toFixed(2)}</span></div>
       </div>
 
       ${payTable}
