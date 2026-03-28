@@ -362,8 +362,8 @@ function renderOpps(data) {
       </div>
 
       <div class="opp-actions">
-        <input type="number" id="cap-${i}" placeholder="$" class="inp-sm" style="width:70px">
-        <input type="number" id="lev-${i}" placeholder="x" value="1" min="1" max="50" class="inp-sm" style="width:40px">
+        <label class="inp-label">Capital<input type="number" id="cap-${i}" placeholder="USD" class="inp-sm" style="width:70px"></label>
+        <label class="inp-label">Apal.<input type="number" id="lev-${i}" placeholder="1x" value="1" min="1" max="50" class="inp-sm" style="width:40px"></label>
         <button class="btn btn-calc" onclick="calcEst('${o._id}',${i})">Calc</button>
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${i})">Entrar</button>
       </div>
@@ -474,8 +474,8 @@ function renderDefiOpps(data) {
       </div>
 
       <div class="opp-actions">
-        <input type="number" id="cap-${idx}" placeholder="$" class="inp-sm" style="width:70px">
-        <input type="number" id="lev-${idx}" placeholder="x" value="1" min="1" max="50" class="inp-sm" style="width:40px">
+        <label class="inp-label">Capital<input type="number" id="cap-${idx}" placeholder="USD" class="inp-sm" style="width:70px"></label>
+        <label class="inp-label">Apal.<input type="number" id="lev-${idx}" placeholder="1x" value="1" min="1" max="50" class="inp-sm" style="width:40px"></label>
         <button class="btn btn-calc" onclick="calcEst('${o._id}',${idx})">Calc</button>
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${idx})">Entrar</button>
       </div>

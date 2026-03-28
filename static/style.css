@@ -458,6 +458,14 @@ body {
   flex-wrap: wrap;
 }
 .opp-actions input { width: 80px; }
+.opp-actions .inp-label {
+  display: flex;
+  flex-direction: column;
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: .3px;
+  gap: 3px;
+}
 
 .opp-est {
   font-size: 11px;
@@ -582,6 +590,24 @@ body {
 }
 
 .cfg-section h3 { font-size: 13px; color: var(--text-white); margin-bottom: 10px; font-weight: 600; }
+
+/* Help / metrics guide */
+.help-group { margin-bottom: 16px; }
+.help-group h4 {
+  font-size: 11px; font-weight: 600; color: var(--green);
+  text-transform: uppercase; letter-spacing: .5px;
+  margin-bottom: 8px; padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.help-list { margin: 0; padding: 0; }
+.help-list dt {
+  font-size: 11px; font-weight: 600; color: var(--text-white);
+  margin-top: 8px;
+}
+.help-list dd {
+  font-size: 11px; color: var(--text-secondary); line-height: 1.5;
+  margin: 2px 0 0 0; padding: 0;
+}
 
 .cfg-grid {
   display: grid;
