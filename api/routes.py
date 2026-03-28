@@ -65,9 +65,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @app.route("/api/config", methods=["GET", "POST"])
     @auth_required
     def api_config():
+        uid = get_current_user_id()
         if flask_req.method == "GET":
-            # In SaaS mode, load config from DB for logged-in user
-            uid = get_current_user_id()
             if uid and get_db_persist():
                 us = get_db_persist().load_user_state(uid)
                 return jsonify({
@@ -83,73 +82,56 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "wa_phone": us.get("wa_phone", ""),
                     "wa_apikey": us.get("wa_apikey", ""),
                 })
+            # Fallback defaults if no DB
+            return jsonify({
+                "total_capital": 1000, "scan_minutes": 5,
+                "min_volume": 1000000, "min_apr": 10, "min_score": 40,
+                "min_stability_days": 3, "max_positions": 5,
+                "alert_minutes_before": 5, "email_enabled": False,
+                "wa_phone": "", "wa_apikey": "",
+            })
+
+        # POST — save config to DB
+        data = flask_req.json or {}
+        if uid and get_db_persist():
+            db_data = {}
+            if "total_capital" in data:
+                db_data["total_capital"] = float(data["total_capital"])
+            if "scan_minutes" in data:
+                db_data["scan_interval"] = max(1, int(data["scan_minutes"])) * 60
+            if "min_volume" in data:
+                db_data["min_volume"] = float(data["min_volume"])
+            if "min_apr" in data:
+                db_data["min_apr"] = float(data["min_apr"])
+            if "min_score" in data:
+                db_data["min_score"] = int(data["min_score"])
+            if "min_stability_days" in data:
+                db_data["min_stability_days"] = int(data["min_stability_days"])
+            if "max_positions" in data:
+                db_data["max_positions"] = int(data["max_positions"])
+            if "alert_minutes_before" in data:
+                db_data["alert_minutes_before"] = int(data["alert_minutes_before"])
+            if "email_enabled" in data:
+                db_data["email_enabled"] = bool(data["email_enabled"])
+            if "wa_phone" in data:
+                db_data["wa_phone"] = str(data["wa_phone"]).strip()
+            if "wa_apikey" in data:
+                db_data["wa_apikey"] = str(data["wa_apikey"]).strip()
+
+            get_db_persist().save_user_config(uid, db_data)
+
+            # Sync WhatsApp settings to notifier state for current session
             with state_manager.lock:
                 s = state_manager.state
-                return jsonify({
-                    "total_capital": s["total_capital"],
-                    "scan_minutes": s["scan_interval"] // 60,
-                    "min_volume": s["min_volume"],
-                    "min_apr": s.get("min_apr", 10),
-                    "min_score": s.get("min_score", 40),
-                    "min_stability_days": s.get("min_stability_days", 3),
-                    "max_positions": s.get("max_positions", 5),
-                    "alert_minutes_before": s.get("alert_minutes_before", 5),
-                    "email_enabled": s.get("email_enabled", False),
-                    "wa_phone": s.get("wa_phone", ""),
-                    "wa_apikey": s.get("wa_apikey", ""),
-                })
-        # POST — update config
-        data = flask_req.json or {}
-        with state_manager.lock:
-            s = state_manager.state
-            if "total_capital" in data:
-                s["total_capital"] = float(data["total_capital"])
-            if "scan_minutes" in data:
-                s["scan_interval"] = max(1, int(data["scan_minutes"])) * 60
-            if "min_volume" in data:
-                s["min_volume"] = float(data["min_volume"])
-            if "min_apr" in data:
-                s["min_apr"] = float(data["min_apr"])
-            if "min_score" in data:
-                s["min_score"] = int(data["min_score"])
-            if "min_stability_days" in data:
-                s["min_stability_days"] = int(data["min_stability_days"])
-            if "max_positions" in data:
-                s["max_positions"] = int(data["max_positions"])
-            if "alert_minutes_before" in data:
-                s["alert_minutes_before"] = int(data["alert_minutes_before"])
-            # WhatsApp notification settings
-            if "email_enabled" in data:
-                s["email_enabled"] = bool(data["email_enabled"])
-            if "wa_phone" in data:
-                s["wa_phone"] = str(data["wa_phone"]).strip()
-            if "wa_apikey" in data:
-                s["wa_apikey"] = str(data["wa_apikey"]).strip()
-
-            # Sync notifier
+                for k in ("email_enabled", "wa_phone", "wa_apikey"):
+                    if k in db_data:
+                        s[k] = db_data[k]
+                    elif k == "wa_apikey" and "wa_apikey" in data:
+                        s[k] = str(data["wa_apikey"]).strip()
             if scanner_worker.email_notifier:
                 scanner_worker.email_notifier._sync_from_state()
 
-            state_manager.save()
-
-            # Also persist to DB in SaaS mode
-            uid = get_current_user_id()
-            if uid and get_db_persist():
-                db_data = {
-                    "total_capital": s["total_capital"],
-                    "scan_interval": s["scan_interval"],
-                    "min_volume": s["min_volume"],
-                    "min_apr": s.get("min_apr", 10),
-                    "min_score": s.get("min_score", 40),
-                    "min_stability_days": s.get("min_stability_days", 3),
-                    "max_positions": s.get("max_positions", 5),
-                    "alert_minutes_before": s.get("alert_minutes_before", 5),
-                    "email_enabled": s.get("email_enabled", False),
-                    "wa_phone": s.get("wa_phone", ""),
-                }
-                get_db_persist().save_user_config(uid, db_data)
-
-            return jsonify({"ok": True, "msg": "Configuracion guardada"})
+        return jsonify({"ok": True, "msg": "Configuracion guardada"})
 
     # ── Opportunities ──────────────────────────────────────────
     @app.route("/api/opportunities")
@@ -238,6 +220,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         opp_id = data.get("opportunity_id", "")
         capital = float(data.get("capital", 0))
 
+        uid = get_current_user_id()
+
         with state_manager.lock:
             s = state_manager.state
             opps = s.get("opportunities", [])
@@ -248,9 +232,27 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             if not opp:
                 return jsonify({"ok": False, "msg": "Oportunidad no encontrada"})
 
-            ok, result = open_position(s, opp, capital)
+            # Load user state from DB for capital checks
+            if uid and get_db_persist():
+                user_state = get_db_persist().load_user_state(uid)
+                merged = {
+                    "total_capital": user_state.get("total_capital", 1000),
+                    "max_positions": user_state.get("max_positions", 5),
+                    "positions": user_state.get("positions", []),
+                    "history": user_state.get("history", []),
+                    "total_earned": user_state.get("total_earned", 0),
+                }
+            else:
+                merged = s
+
+            ok, result = open_position(merged, opp, capital)
             if ok:
-                state_manager.save()
+                # Save to DB
+                if uid and get_db_persist():
+                    pos_dict = result["position"]
+                    db_id = get_db_persist().save_position(uid, pos_dict)
+                    result["position"]["db_id"] = db_id
+                    log.info(f"Position saved to DB: id={db_id}, user={uid}")
                 return jsonify({"ok": True, **result})
             else:
                 return jsonify({"ok": False, "msg": result})
@@ -260,24 +262,23 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @auth_required
     def api_positions():
         """Active positions with real-time data."""
+        uid = get_current_user_id()
         with state_manager.lock:
             s = state_manager.state
             all_data = s.get("all_data", [])
 
-            # In SaaS mode, load positions from DB for logged-in user
-            uid = get_current_user_id()
             if uid and get_db_persist():
                 user_state = get_db_persist().load_user_state(uid)
                 positions_list = user_state.get("positions", [])
-                # Build a merged state for capital summary
-                merged = dict(s)
-                merged["positions"] = positions_list
-                merged["total_capital"] = user_state.get("total_capital", s.get("total_capital", 1000))
-                merged["max_positions"] = user_state.get("max_positions", s.get("max_positions", 5))
+                merged = {
+                    "positions": positions_list,
+                    "total_capital": user_state.get("total_capital", 1000),
+                    "max_positions": user_state.get("max_positions", 5),
+                }
                 summary = get_capital_summary(merged)
             else:
-                positions_list = s.get("positions", [])
-                summary = get_capital_summary(s)
+                positions_list = []
+                summary = {"total": 1000, "used": 0, "available": 1000, "count": 0, "max_positions": 5}
 
             pdata = []
             now = time.time()
@@ -364,10 +365,13 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "mins_next": mins_next,
                 })
 
+            # Calculate total_earned from active positions
+            total_earned = sum(p.get("earned_real", 0) for p in positions_list)
+
             return jsonify({
                 "positions": pdata,
                 "summary": summary,
-                "total_earned": s.get("total_earned", 0),
+                "total_earned": total_earned,
                 "alerts": s.get("alerts", []),
             })
 
@@ -380,20 +384,51 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         pos_id = data.get("position_id", "")
         reason = data.get("reason", "manual")
 
-        with state_manager.lock:
-            s = state_manager.state
-            ok, result = close_position(s, pos_id, reason)
-            state_manager.save()
+        uid = get_current_user_id()
 
-        if not ok:
-            return jsonify({"ok": False, "msg": result})
+        # Close in DB
+        if uid and get_db_persist():
+            try:
+                db_pos_id = int(pos_id)
+            except (ValueError, TypeError):
+                return jsonify({"ok": False, "msg": "Posicion no encontrada"})
 
-        # Clear any notified alerts for this symbol (so new positions get fresh alerts)
+            from core.db_models import UserPosition
+            pos = UserPosition.query.filter_by(id=db_pos_id, user_id=uid, status="active").first()
+            if not pos:
+                return jsonify({"ok": False, "msg": "Posicion no encontrada"})
+
+            ih = pos.ih or 8
+            el_h = (time.time() - pos.entry_time / 1000) / 3600
+            earned = pos.earned_real or 0
+            fees = (pos.entry_fees or 0) * 2
+            net_earned = earned - fees
+
+            result_data = {
+                "reason": reason,
+                "hours": el_h,
+                "fees": fees,
+                "net_earned": net_earned,
+            }
+            get_db_persist().close_position(db_pos_id, result_data)
+
+            result = {
+                "symbol": pos.symbol,
+                "earned": earned,
+                "fees": fees,
+                "net_earned": net_earned,
+                "hours": el_h,
+                "payments": pos.payment_count or 0,
+            }
+        else:
+            return jsonify({"ok": False, "msg": "DB no disponible"})
+
+        # Clear any notified alerts for this symbol
         closed_sym = result["symbol"]
         stale_keys = {k for k in scanner_worker._notified_alerts if closed_sym in k}
         scanner_worker._notified_alerts -= stale_keys
 
-        # Send WhatsApp notification OUTSIDE lock (HTTP call can take seconds)
+        # Send WhatsApp notification
         if scanner_worker.email_notifier:
             try:
                 scanner_worker.email_notifier.send_alert({
@@ -426,12 +461,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 "history": user_state.get("history", []),
                 "total_earned": user_state.get("total_earned", 0),
             })
-        with state_manager.lock:
-            s = state_manager.state
-            return jsonify({
-                "history": s.get("history", []),
-                "total_earned": s.get("total_earned", 0),
-            })
+        return jsonify({"history": [], "total_earned": 0})
 
     @app.route("/api/clear_history", methods=["POST"])
     @auth_required
@@ -439,18 +469,20 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         """Clear all history and optionally reset positions."""
         data = flask_req.json or {}
         reset_all = data.get("reset_all", False)
+        uid = get_current_user_id()
 
-        with state_manager.lock:
-            s = state_manager.state
-            s["history"] = []
-            s["total_earned"] = 0
+        if uid and get_db_persist():
+            from core.database import db as _db
+            from core.db_models import UserHistory, UserPosition
+
+            UserHistory.query.filter_by(user_id=uid).delete()
             if reset_all:
-                s["positions"] = []
-                s["alerts"] = []
-            state_manager.save()
+                UserPosition.query.filter_by(user_id=uid, status="active").update(
+                    {"status": "closed", "close_reason": "reset"})
+            _db.session.commit()
 
         what = "todo (historial + posiciones)" if reset_all else "historial"
-        log.info(f"Cleared: {what}")
+        log.info(f"Cleared: {what} for user {uid}")
         return jsonify({"ok": True, "msg": f"{what} borrado"})
 
     # ── Force Scan ─────────────────────────────────────────────
@@ -524,13 +556,20 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     def api_alert_diagnostics():
         """Diagnostic endpoint to check the full alert pipeline status."""
         n = scanner_worker.email_notifier
+        uid = get_current_user_id()
+
         with state_manager.lock:
             s = state_manager.state
-            positions = s.get("positions", [])
             all_data = s.get("all_data", [])
             defi_data = s.get("defi_data", [])
             combined = all_data + defi_data
             stored_alerts = s.get("alerts", [])
+
+        # Load positions from DB
+        positions = []
+        if uid and get_db_persist():
+            user_state = get_db_persist().load_user_state(uid)
+            positions = user_state.get("positions", [])
 
         diag = {
             "whatsapp": {
@@ -552,7 +591,6 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             "positions_detail": [],
         }
 
-        # Check each position for alert conditions
         for pos in positions:
             is_cross = pos.get("mode") == "cross_exchange"
             p_diag = {

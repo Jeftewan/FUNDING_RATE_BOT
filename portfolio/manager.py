@@ -90,7 +90,8 @@ def open_position(state: dict, opportunity: dict, capital: float) -> tuple:
     est_3day = daily_income * 3
     break_even_h = fees["total_cost"] / (daily_income / 24) if daily_income > 0 else 999
 
-    state["positions"].append(pos)
+    # Don't append to state — caller saves to DB
+    # state["positions"].append(pos) is handled by the API route via DBPersistence
 
     return True, {
         "position": pos,

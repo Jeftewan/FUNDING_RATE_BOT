@@ -35,19 +35,14 @@ class ScannerWorker:
         self.config = config
         self.email_notifier = email_notifier
         self.defi_manager = defi_manager
-        self._flask_app = None  # Set by app.py when DB is enabled
+        self._flask_app = None  # Set by app.py for DB access
         self._started = False
         self._last_scan_ts = 0
         self._scan_lock = threading.Lock()
-        # Track which payment windows we already scanned for
-        # Key: "{symbol}_{exchange}_{payment_ts}" → avoids duplicate scans
         self._scanned_events = set()
-        # Track alerts already sent — key: "TYPE_SYMBOL_EXCHANGE"
-        # Once sent, alert won't regenerate until condition clears and reappears
         self._notified_alerts = set()
-        # Momento 3: pending refresh scans after payment
-        # Key: "refresh_{sym_key}_{nts}" → value: timestamp when to trigger
         self._pending_refreshes = {}
+        self._db_persist = None  # Lazy-init DBPersistence
 
     def start(self):
         if self._started:
@@ -76,8 +71,79 @@ class ScannerWorker:
                 log.exception(f"Monitor error: {e}")
             time.sleep(30)
 
+    def _get_db_persist(self):
+        """Lazy-init DBPersistence."""
+        if self._db_persist is None and self._flask_app:
+            from core.db_persistence import DBPersistence
+            self._db_persist = DBPersistence()
+        return self._db_persist
+
+    def _load_all_positions_from_db(self) -> list:
+        """Load all active positions from DB (all users). Returns list of dicts."""
+        if not self._flask_app:
+            return []
+        try:
+            with self._flask_app.app_context():
+                db_persist = self._get_db_persist()
+                if not db_persist:
+                    return []
+                db_positions = db_persist.get_all_active_positions()
+                return [self._db_pos_to_dict(p) for p in db_positions]
+        except Exception as e:
+            log.error(f"Failed to load positions from DB: {e}")
+            return []
+
+    @staticmethod
+    def _db_pos_to_dict(pos) -> dict:
+        """Convert a UserPosition ORM object to a dict for scanner use."""
+        return {
+            "db_id": pos.id,
+            "user_id": pos.user_id,
+            "id": str(pos.id),
+            "symbol": pos.symbol,
+            "exchange": pos.exchange,
+            "mode": pos.mode,
+            "entry_fr": pos.entry_fr,
+            "entry_price": pos.entry_price,
+            "entry_time": pos.entry_time,
+            "capital_used": pos.capital_used,
+            "ih": pos.ih,
+            "earned_real": pos.earned_real,
+            "last_earn_update": pos.last_earn_update or 0,
+            "last_fr_used": pos.last_fr_used or 0,
+            "long_exchange": pos.long_exchange or "",
+            "short_exchange": pos.short_exchange or "",
+            "payment_count": pos.payment_count or 0,
+            "avg_rate": pos.avg_rate or 0,
+            "entry_fees": pos.entry_fees or 0,
+            "payments": pos.payments_json or [],
+        }
+
+    def _save_position_earnings_to_db(self, pos: dict):
+        """Write updated earnings for a position back to DB."""
+        if not self._flask_app or "db_id" not in pos:
+            return
+        try:
+            with self._flask_app.app_context():
+                db_persist = self._get_db_persist()
+                if db_persist:
+                    db_persist.update_position_earnings(
+                        pos["db_id"],
+                        earned=pos.get("earned_real", 0),
+                        payment_count=pos.get("payment_count", 0),
+                        avg_rate=pos.get("avg_rate", 0),
+                        last_fr=pos.get("last_fr_used", 0),
+                        payments=pos.get("payments", []),
+                    )
+        except Exception as e:
+            log.error(f"Failed to save earnings for position {pos.get('db_id')}: {e}")
+
     def _monitor_tick(self):
-        """Single monitor tick — check positions, trigger scans if needed."""
+        """Single monitor tick — check positions, trigger scans if needed.
+
+        Loads positions from DB (all users), checks payment triggers,
+        updates earnings, and generates alerts.
+        """
         scan_reason = None
         alerts = []
         now = time.time()
@@ -89,38 +155,46 @@ class ScannerWorker:
                 del self._pending_refreshes[rkey]
                 break
 
+        # Load positions from DB (all users' active positions)
+        positions = self._load_all_positions_from_db()
+
         with self.state_manager.lock:
             s = self.state_manager.state
             all_data = s.get("all_data", [])
             defi_data = s.get("defi_data", [])
-            positions = s.get("positions", [])
 
             if not positions:
-                # No positions → no need for scans, just update mins_next
                 self._refresh_mins_next(all_data, now, defi_data)
                 return
 
-            # Recalculate mins_next from stored timestamps (no API call)
             self._refresh_mins_next(all_data, now, defi_data)
 
-            # Check each position for scan triggers (only if no refresh pending)
-            # Collect ALL triggers first, then group by ±5 min window
+            # Optimize: deduplicate positions by (symbol, exchange) for trigger checks
+            # Multiple users with same symbol/exchange only need ONE trigger check
             if not scan_reason:
-                triggered_positions = []  # [(mins_next, pos_label, event_keys)]
+                triggered_positions = []
                 combined = all_data + defi_data
+                seen_pairs = set()  # (symbol, exchange) already checked
 
                 for pos in positions:
+                    sym = pos["symbol"]
+                    ex = pos["exchange"]
+                    pair_key = f"{sym}_{ex}"
+
+                    # Skip duplicate symbol/exchange pairs for trigger checking
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+
                     cur = self._find_data(pos, all_data, defi_data)
 
-                    # For cross-exchange: use the earliest funding time
-                    # between long and short sides
                     mn = -1
                     nts = 0
                     if pos.get("mode") == "cross_exchange":
                         long_ex = pos.get("long_exchange", "")
                         short_ex = pos.get("short_exchange", pos.get("exchange", ""))
-                        long_d = next((d for d in combined if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex), None)
-                        short_d = next((d for d in combined if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex), None)
+                        long_d = next((d for d in combined if d["symbol"] == sym and d["exchange"] == long_ex), None)
+                        short_d = next((d for d in combined if d["symbol"] == sym and d["exchange"] == short_ex), None)
                         candidates = [d for d in (long_d, short_d) if d and d.get("mins_next", -1) >= 0]
                         if candidates:
                             nearest = min(candidates, key=lambda d: d["mins_next"])
@@ -133,34 +207,27 @@ class ScannerWorker:
                     if mn < 0:
                         continue
 
-                    sym_key = f"{pos['symbol']}_{pos['exchange']}"
-                    event_key = f"{sym_key}_{nts}"
+                    event_key = f"{pair_key}_{nts}"
 
-                    # Momento 1: ~10 min antes del pago → verificar rate
                     pre_key = f"pre_{event_key}"
                     if PRE_PAYMENT_SCAN_MINS >= mn > POST_PAYMENT_SCAN_MINS:
                         if pre_key not in self._scanned_events:
                             triggered_positions.append((
-                                mn, f"Pre-pago {pos['symbol']}@{pos['exchange']} en {mn:.0f}min",
+                                mn, f"Pre-pago {sym}@{ex} en {mn:.0f}min",
                                 [pre_key], []
                             ))
 
-                    # Momento 2: Justo despues del pago → obtener rate real
                     post_key = f"post_{event_key}"
                     if mn <= POST_PAYMENT_SCAN_MINS:
                         if post_key not in self._scanned_events:
                             triggered_positions.append((
-                                mn, f"Pago {pos['symbol']}@{pos['exchange']}",
+                                mn, f"Pago {sym}@{ex}",
                                 [post_key],
-                                [(sym_key, nts)]  # schedule refresh
+                                [(pair_key, nts)]
                             ))
 
-                # Group triggers within ±5 min window → single scan
                 if triggered_positions:
-                    # Sort by mins_next
                     triggered_positions.sort(key=lambda t: t[0])
-
-                    # Build groups: positions within 5 min of each other
                     groups = []
                     current_group = [triggered_positions[0]]
                     for tp in triggered_positions[1:]:
@@ -171,16 +238,13 @@ class ScannerWorker:
                             current_group = [tp]
                     groups.append(current_group)
 
-                    # Take the first (most urgent) group
                     group = groups[0]
                     labels = [tp[1] for tp in group]
                     scan_reason = " + ".join(labels)
 
-                    # Mark all event keys in the group as scanned
                     for tp in group:
                         for ek in tp[2]:
                             self._scanned_events.add(ek)
-                        # Schedule refreshes
                         for (sk, nts_val) in tp[3]:
                             refresh_key = f"{sk}_{nts_val}"
                             self._pending_refreshes[refresh_key] = now + REFRESH_AFTER_PAYMENT_SECS
@@ -194,59 +258,76 @@ class ScannerWorker:
             except Exception as e:
                 log.error(f"Triggered scan failed: {e}")
 
-        # Process earnings and alerts with current data
+        # Process earnings and alerts (re-read market data after possible scan)
         with self.state_manager.lock:
             s = self.state_manager.state
             all_data = s.get("all_data", [])
             defi_data = s.get("defi_data", [])
-            positions = s.get("positions", [])
             combined = all_data + defi_data
 
             if not combined:
                 log.debug(f"Monitor tick: no market data (all_data={len(all_data)}, defi={len(defi_data)})")
-            elif not positions:
-                pass  # No positions to monitor
-            else:
+            elif positions:
                 self._refresh_mins_next(all_data, time.time(), defi_data)
-                self._update_earnings(s, combined)
-                alerts = self._check_alerts(s, combined)
+                updated_positions = self._update_earnings_db(positions, combined)
+                alerts = self._check_alerts_db(positions, combined)
                 s["alerts"] = alerts
-                self.state_manager.save()
-                if not alerts:
-                    # Log position status for debugging (every ~5 min)
-                    if int(now) % 300 < 35:
-                        for pos in positions:
-                            sym = pos["symbol"]
-                            mode = pos.get("mode", "spot_perp")
-                            efr = pos["entry_fr"]
-                            lfr = pos.get("last_fr_used", 0)
-                            log.info(f"  Monitor {sym} ({mode}): entry_fr={efr*100:.4f}%, "
-                                     f"last_fr={lfr*100:.4f}%, no alerts")
 
-        # Send WhatsApp alerts outside lock, then mark as notified
+                if not alerts and int(now) % 300 < 35:
+                    for pos in positions:
+                        log.info(f"  Monitor {pos['symbol']} ({pos.get('mode','spot_perp')}): "
+                                 f"entry_fr={pos['entry_fr']*100:.4f}%, "
+                                 f"last_fr={pos.get('last_fr_used',0)*100:.4f}%")
+
+        # Save updated earnings to DB in background
+        if positions and self._flask_app:
+            updated = [p for p in positions if p.get("_earnings_updated")]
+            if updated:
+                threading.Thread(
+                    target=self._batch_save_earnings,
+                    args=(updated,),
+                    daemon=True
+                ).start()
+
+        # Send WhatsApp alerts
         if alerts:
             log.info(f"Alerts detected: {[a['type'] for a in alerts]}")
             if self.email_notifier:
                 try:
                     sent = self.email_notifier.send_alerts(alerts)
                     log.info(f"WhatsApp: {sent}/{len(alerts)} alert(s) sent")
-                    # Mark successfully-sent alerts so they won't regenerate
                     if sent > 0:
                         for a in alerts:
                             key = f"{a['type']}_{a['symbol']}_{a.get('exchange', '')}"
                             self._notified_alerts.add(key)
-                            log.info(f"Alert marked as notified: {key}")
-                        # Clear alerts from UI state — already delivered
                         with self.state_manager.lock:
                             self.state_manager.state["alerts"] = []
-                            self.state_manager.save()
                 except Exception as e:
                     log.error(f"WhatsApp error: {e}")
-            else:
-                log.warning("Alerts detected but no email_notifier configured")
 
-        # Cleanup old event keys (keep only recent ones)
         self._cleanup_events()
+
+    def _batch_save_earnings(self, positions: list):
+        """Save earnings for multiple positions to DB (background thread)."""
+        if not self._flask_app:
+            return
+        try:
+            with self._flask_app.app_context():
+                db_persist = self._get_db_persist()
+                if not db_persist:
+                    return
+                for pos in positions:
+                    db_persist.update_position_earnings(
+                        pos["db_id"],
+                        earned=pos.get("earned_real", 0),
+                        payment_count=pos.get("payment_count", 0),
+                        avg_rate=pos.get("avg_rate", 0),
+                        last_fr=pos.get("last_fr_used", 0),
+                        payments=pos.get("payments", []),
+                    )
+                log.debug(f"Saved earnings for {len(positions)} positions to DB")
+        except Exception as e:
+            log.error(f"Batch earnings save failed: {e}")
 
     def _refresh_mins_next(self, all_data: list, now: float,
                             defi_data: list = None):
@@ -387,7 +468,7 @@ class ScannerWorker:
             s["all_data"] = all_data
             s["defi_data"] = defi_data
             s["defi_opportunities"] = defi_opportunities
-            self._update_earnings(s, all_data + defi_data)
+            # Earnings are updated in _monitor_tick via _update_earnings_db
             s["opportunities"] = opportunities
             s["coinglass_data"] = cg_opps
             s["last_scan"] = time.time()
@@ -403,7 +484,6 @@ class ScannerWorker:
             )
             s["last_error"] = ""
             s["scanning"] = False
-            self.state_manager.save()
 
         self._last_scan_ts = time.time()
         log.info(
@@ -506,10 +586,31 @@ class ScannerWorker:
 
     # ── Earnings ──────────────────────────────────────────────
 
+    def _update_earnings_db(self, positions: list, all_data: list) -> list:
+        """Accumulate real earnings for DB-loaded positions.
+
+        Returns list of positions that had earnings updated.
+        """
+        now = time.time()
+        updated = []
+        for pos in positions:
+            old_earned = pos.get("earned_real", 0)
+            mode = pos.get("mode", "spot_perp")
+
+            if mode == "spot_perp":
+                self._update_spot_perp_earnings(pos, all_data, now)
+            else:
+                self._update_cross_exchange_earnings(pos, all_data, now)
+
+            if pos.get("earned_real", 0) != old_earned:
+                pos["_earnings_updated"] = True
+                updated.append(pos)
+        return updated
+
     def _update_earnings(self, state: dict, all_data: list) -> None:
         """Accumulate real earnings based on funding payment timestamps."""
         now = time.time()
-        for pos in state["positions"]:
+        for pos in state.get("positions", []):
             mode = pos.get("mode", "spot_perp")
 
             if mode == "spot_perp":
@@ -704,6 +805,84 @@ class ScannerWorker:
 
     # ── Alerts ────────────────────────────────────────────────
 
+    def _check_alerts_db(self, positions: list, all_data: list) -> list:
+        """Check DB-loaded positions for alerts. Same logic as _check_alerts."""
+        alerts = []
+        alert_mins = 5  # default
+        active_keys = set()
+
+        for i, pos in enumerate(positions):
+            is_cross = pos.get("mode") == "cross_exchange"
+
+            if is_cross:
+                long_ex = pos.get("long_exchange", "")
+                short_ex = pos.get("short_exchange", pos.get("exchange", ""))
+                long_d = next(
+                    (d for d in all_data
+                     if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex),
+                    None,
+                )
+                short_d = next(
+                    (d for d in all_data
+                     if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex),
+                    None,
+                )
+                if not long_d or not short_d:
+                    continue
+                cfr = short_d["fr"] - long_d["fr"]
+                mins_candidates = [d for d in (long_d, short_d) if d.get("mins_next", -1) >= 0]
+                mins_next = min((d["mins_next"] for d in mins_candidates), default=-1)
+                display_ex = f"{short_ex}/{long_ex}"
+            else:
+                cur = self._find_data(pos, all_data)
+                if not cur:
+                    continue
+                cfr = cur["fr"]
+                mins_next = cur.get("mins_next", -1)
+                display_ex = pos["exchange"]
+
+            sym = pos["symbol"]
+
+            if (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
+                key = f"RATE_REVERSAL_{sym}_{display_ex}"
+                active_keys.add(key)
+                if key not in self._notified_alerts:
+                    alerts.append({
+                        "type": "RATE_REVERSAL", "severity": "CRITICAL",
+                        "position_idx": i, "symbol": sym, "exchange": display_ex,
+                        "user_id": pos.get("user_id"),
+                        "message": f"Funding rate cambio de signo: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
+                    })
+            elif abs(cfr) < abs(pos["entry_fr"]) * 0.25:
+                key = f"RATE_DROP_{sym}_{display_ex}"
+                active_keys.add(key)
+                if key not in self._notified_alerts:
+                    alerts.append({
+                        "type": "RATE_DROP", "severity": "WARNING",
+                        "position_idx": i, "symbol": sym, "exchange": display_ex,
+                        "user_id": pos.get("user_id"),
+                        "message": f"Rate cayo >75%: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
+                    })
+
+            if 0 < mins_next <= alert_mins:
+                if cfr <= 0 and pos["entry_fr"] > 0:
+                    key = f"PRE_PAYMENT_UNFAVORABLE_{sym}_{display_ex}"
+                    active_keys.add(key)
+                    if key not in self._notified_alerts:
+                        alerts.append({
+                            "type": "PRE_PAYMENT_UNFAVORABLE", "severity": "WARNING",
+                            "position_idx": i, "symbol": sym, "exchange": display_ex,
+                            "user_id": pos.get("user_id"),
+                            "message": f"Proximo pago en {mins_next:.0f}min — tasa desfavorable: {cfr*100:.4f}%",
+                        })
+
+        stale = self._notified_alerts - active_keys
+        if stale:
+            log.info(f"Alert conditions cleared: {stale}")
+            self._notified_alerts -= stale
+
+        return alerts
+
     def _check_alerts(self, state: dict, all_data: list) -> list:
         """Check positions for alerts: rate reversal, rate drop, pre-payment.
 
@@ -716,7 +895,7 @@ class ScannerWorker:
         # Track which alert keys are active THIS tick — used to clear stale ones
         active_keys = set()
 
-        for i, pos in enumerate(state["positions"]):
+        for i, pos in enumerate(state.get("positions", [])):
             is_cross = pos.get("mode") == "cross_exchange"
 
             if is_cross:
