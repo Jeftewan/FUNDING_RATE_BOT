@@ -147,6 +147,73 @@
       <p style="font-size:10px;color:#555;margin-bottom:10px">Tus keys se almacenan encriptadas.</p>
       <div id="exchange-keys-list"></div>
     </div>
+
+    <div class="cfg-section">
+      <h3>Guia de metricas</h3>
+
+      <div class="help-group">
+        <h4>Oportunidades</h4>
+        <dl class="help-list">
+          <dt>Score</dt>
+          <dd>Puntaje compuesto (0-100) que combina tasa, volumen, estabilidad y momentum. Mayor = mejor oportunidad.</dd>
+          <dt>Grade (A/B/C)</dt>
+          <dd>Calificacion basada en el score. A = excelente (&ge;70), B = buena (&ge;40), C = aceptable.</dd>
+          <dt>FR (Funding Rate)</dt>
+          <dd>Tasa que pagan los longs a los shorts cada periodo. Si es positiva, shorts cobran; si es negativa, longs cobran.</dd>
+          <dt>APR</dt>
+          <dd>Retorno anual proyectado basado en el funding rate actual. Util para comparar con otras inversiones.</dd>
+          <dt>3d Acum</dt>
+          <dd>Porcentaje de funding acumulado en los ultimos 3 dias. Indica la consistencia reciente de la tasa.</dd>
+          <dt>$/dia 1K</dt>
+          <dd>Ingreso diario estimado por cada $1,000 invertidos, antes de fees.</dd>
+          <dt>Neto 3d</dt>
+          <dd>Ganancia neta estimada en 3 dias por cada $1,000 invertidos, ya descontados los fees.</dd>
+          <dt>Fees</dt>
+          <dd>Costos totales estimados (entrada + salida): comisiones de trading, spread, y slippage.</dd>
+          <dt>Break-even</dt>
+          <dd>Horas necesarias para que las ganancias de funding cubran los fees. Despues de este punto, todo es ganancia.</dd>
+          <dt>Hold</dt>
+          <dd>Dias recomendados para mantener la posicion segun la estabilidad de la tasa.</dd>
+          <dt>Mom (Momentum)</dt>
+          <dd>Tendencia del funding: &#11014; acelerando, &#8594; estable, &#11015; desacelerando, &#8595; negativo.</dd>
+          <dt>Pctl (Percentil)</dt>
+          <dd>Posicion historica de la tasa actual. 90% significa que la tasa es mayor que el 90% de las observaciones recientes.</dd>
+        </dl>
+      </div>
+
+      <div class="help-group">
+        <h4>Posiciones activas</h4>
+        <dl class="help-list">
+          <dt>Capital</dt>
+          <dd>Monto total asignado a la posicion. Se divide 50/50 entre spot y futures (o entre los dos exchanges).</dd>
+          <dt>Pagos</dt>
+          <dd>Cantidad de pagos de funding recibidos desde la apertura.</dd>
+          <dt>Prox pago</dt>
+          <dd>Minutos restantes hasta el proximo pago de funding.</dd>
+          <dt>FR entrada vs FR actual</dt>
+          <dd>Compara la tasa al abrir con la actual. Si el signo cambia (+ a -), la posicion ya no es rentable.</dd>
+          <dt>Prom</dt>
+          <dd>Tasa promedio de todos los pagos recibidos. Refleja el rendimiento real, no el teorico.</dd>
+          <dt>Ganancia / Fees / Neto</dt>
+          <dd>Ganancia bruta de funding, fees estimados (entrada + salida), y la diferencia. El neto es lo que realmente ganas.</dd>
+        </dl>
+      </div>
+
+      <div class="help-group">
+        <h4>Como abrir una posicion</h4>
+        <dl class="help-list">
+          <dt>Capital ($)</dt>
+          <dd>Monto en USD que deseas invertir en la oportunidad. Se distribuye automaticamente entre spot y futures.</dd>
+          <dt>Apalancamiento (x)</dt>
+          <dd>Multiplicador de la posicion de futures. Usa 1x para arbitraje seguro. Mayor apalancamiento = mayor riesgo de liquidacion.</dd>
+          <dt>Calc</dt>
+          <dd>Muestra una estimacion detallada: ganancia diaria, fees, break-even y pasos de ejecucion.</dd>
+          <dt>Entrar</dt>
+          <dd>Registra la posicion en el sistema para monitoreo automatico. Debes ejecutar las operaciones manualmente en el exchange.</dd>
+        </dl>
+      </div>
+    </div>
+
     <div class="cfg-section">
       <h3 style="color:#ef4444">Zona peligrosa</h3>
       <button class="btn btn-danger" onclick="deleteAccount()">Eliminar cuenta</button>
