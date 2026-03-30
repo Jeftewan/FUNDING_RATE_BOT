@@ -608,6 +608,18 @@ body {
   font-size: 11px; color: var(--text-secondary); line-height: 1.5;
   margin: 2px 0 0 0; padding: 0;
 }
+.help-list dd code {
+  background: #1a1d23; padding: 1px 5px; border-radius: 3px;
+  font-size: 10px; color: var(--text-primary);
+}
+.help-list dt .ind-badge,
+.help-list dt .opp-badge {
+  vertical-align: middle; margin-right: 6px;
+}
+.help-intro {
+  font-size: 11px; color: var(--text-secondary); line-height: 1.6;
+  margin: 0 0 10px 0;
+}
 
 .cfg-grid {
   display: grid;
