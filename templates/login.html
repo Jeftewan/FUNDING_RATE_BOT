@@ -2,57 +2,71 @@
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>YieldPilot — Ingresos Pasivos con Funding Rate</title>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:'JetBrains Mono',monospace;background:#0a0b0d;color:#c8ccd0;min-height:100vh;
+  body{font-family:'Inter',-apple-system,sans-serif;background:#0a0b0d;color:#c8ccd0;min-height:100vh;
        display:flex;align-items:center;justify-content:center;padding:20px}
-  .page{max-width:900px;width:100%;display:flex;gap:40px;align-items:center}
+  .page{max-width:920px;width:100%;display:flex;gap:48px;align-items:center}
 
   /* Left: branding */
   .brand{flex:1;min-width:0}
-  .logo{display:flex;align-items:center;gap:12px;margin-bottom:20px}
+  .logo{display:flex;align-items:center;gap:12px;margin-bottom:24px}
   .logo svg{width:44px;height:44px;flex-shrink:0}
-  .logo-text{font-size:26px;font-weight:700;color:#fff;letter-spacing:-0.5px}
-  .logo-text span{color:#22c55e}
-  .tagline{font-size:14px;color:#22c55e;margin-bottom:16px;font-weight:500}
-  .desc{font-size:12px;color:#888;line-height:1.7;margin-bottom:24px}
-  .features{list-style:none;display:flex;flex-direction:column;gap:10px}
-  .features li{display:flex;align-items:flex-start;gap:10px;font-size:11px;color:#aaa;line-height:1.5}
-  .features li svg{width:18px;height:18px;flex-shrink:0;color:#22c55e;margin-top:1px}
-  .stats-row{display:flex;gap:16px;margin-top:24px}
-  .stat-card{background:#111318;border:1px solid #1a1d23;border-radius:8px;padding:12px 16px;flex:1;text-align:center}
-  .stat-card .num{font-size:18px;font-weight:700;color:#22c55e}
-  .stat-card .lbl{font-size:9px;color:#555;margin-top:2px;text-transform:uppercase;letter-spacing:0.5px}
+  .logo-text{font-size:28px;font-weight:800;letter-spacing:-0.5px;
+             background:linear-gradient(135deg,#22c55e 0%,#06b6d4 100%);
+             -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .tagline{font-size:15px;color:#22c55e;margin-bottom:18px;font-weight:600}
+  .desc{font-size:14px;color:#888;line-height:1.8;margin-bottom:28px}
+  .features{list-style:none;display:flex;flex-direction:column;gap:14px}
+  .features li{display:flex;align-items:flex-start;gap:12px;font-size:13px;color:#aaa;line-height:1.6}
+  .features li svg{width:20px;height:20px;flex-shrink:0;margin-top:2px}
+  .features li .check-circle{fill:none;stroke:#22c55e;stroke-width:2}
+  .features li strong{color:#fff;font-weight:600}
+  .stats-row{display:flex;gap:12px;margin-top:32px}
+  .stat-card{background:#111318;border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:14px 16px;flex:1;text-align:center}
+  .stat-card .num{font-size:20px;font-weight:800;
+                  background:linear-gradient(135deg,#22c55e,#06b6d4);
+                  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  .stat-card .lbl{font-size:10px;color:#555;margin-top:4px;text-transform:uppercase;letter-spacing:0.5px;font-weight:500}
 
   /* Right: auth form */
-  .auth-box{width:360px;flex-shrink:0;background:#111318;border:1px solid #1a1d23;border-radius:12px;padding:32px}
-  .auth-box h2{font-size:16px;color:#fff;font-weight:500;margin-bottom:4px;text-align:center}
-  .auth-box .sub{font-size:11px;color:#555;margin-bottom:20px;text-align:center}
-  .tabs-auth{display:flex;gap:0;margin-bottom:20px;border-radius:8px;overflow:hidden;border:1px solid #1a1d23}
-  .tab-auth{flex:1;padding:8px;text-align:center;font-size:11px;cursor:pointer;background:#0a0b0d;color:#888;
-            border:none;font-family:inherit;font-weight:500;transition:all .2s}
-  .tab-auth.active{background:#22c55e18;color:#22c55e;font-weight:700}
-  .field{margin-bottom:14px}
-  .field label{display:block;font-size:10px;color:#555;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.5px}
-  .field input{width:100%;padding:10px 12px;background:#0a0b0d;border:1px solid #1a1d23;border-radius:6px;
-               color:#fff;font-family:inherit;font-size:13px;outline:none;transition:border-color .2s}
-  .field input:focus{border-color:#22c55e55}
-  .btn-go{width:100%;padding:12px;font-size:13px;font-weight:700;border:none;border-radius:8px;cursor:pointer;
-          font-family:inherit;background:linear-gradient(135deg,#22c55e,#16a34a);color:#000;transition:opacity .2s}
-  .btn-go:hover{opacity:.9}
-  .btn-go:disabled{opacity:.5;cursor:not-allowed}
-  .msg{font-size:11px;margin-top:14px;padding:10px;border-radius:6px;text-align:center;display:none}
-  .msg.success{background:#22c55e15;color:#22c55e;border:1px solid #22c55e33;display:block}
-  .msg.error{background:#ef444415;color:#ef4444;border:1px solid #ef444433;display:block}
-  .auth-footer{font-size:9px;color:#444;text-align:center;margin-top:18px;line-height:1.5}
+  .auth-box{width:380px;flex-shrink:0;background:#111318;border:1px solid rgba(255,255,255,0.06);
+            border-radius:16px;padding:36px;box-shadow:0 4px 32px rgba(0,0,0,0.3)}
+  .auth-box h2{font-size:20px;color:#fff;font-weight:700;margin-bottom:6px;text-align:center}
+  .auth-box .sub{font-size:13px;color:#555;margin-bottom:24px;text-align:center}
+  .tabs-auth{display:flex;gap:0;margin-bottom:24px;border-radius:10px;overflow:hidden;border:1px solid rgba(255,255,255,0.06)}
+  .tab-auth{flex:1;padding:10px;text-align:center;font-size:13px;cursor:pointer;background:#0a0b0d;color:#666;
+            border:none;font-family:inherit;font-weight:600;transition:all .2s}
+  .tab-auth.active{background:rgba(34,197,94,0.08);color:#22c55e}
+  .field{margin-bottom:16px}
+  .field label{display:block;font-size:11px;color:#555;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600}
+  .field input{width:100%;padding:12px 14px;background:#0a0b0d;border:1px solid rgba(255,255,255,0.06);border-radius:10px;
+               color:#fff;font-family:inherit;font-size:14px;outline:none;transition:border-color .2s,box-shadow .2s}
+  .field input:focus{border-color:rgba(34,197,94,0.4);box-shadow:0 0 0 3px rgba(34,197,94,0.08)}
+  .field input::placeholder{color:#444}
+  .btn-go{width:100%;padding:14px;font-size:14px;font-weight:700;border:none;border-radius:12px;cursor:pointer;
+          font-family:inherit;background:#22c55e;color:#000;transition:all .2s;
+          box-shadow:0 0 24px rgba(34,197,94,0.2)}
+  .btn-go:hover{background:#16a34a;box-shadow:0 0 32px rgba(34,197,94,0.3);transform:translateY(-1px)}
+  .btn-go:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+  .msg{font-size:12px;margin-top:16px;padding:12px;border-radius:10px;text-align:center;display:none}
+  .msg.success{background:rgba(34,197,94,0.08);color:#22c55e;border:1px solid rgba(34,197,94,0.2);display:block}
+  .msg.error{background:rgba(239,68,68,0.08);color:#ef4444;border:1px solid rgba(239,68,68,0.2);display:block}
+  .auth-footer{font-size:10px;color:#444;text-align:center;margin-top:20px;line-height:1.6}
 
   /* Responsive */
   @media(max-width:768px){
-    .page{flex-direction:column;gap:24px}
-    .auth-box{width:100%;max-width:400px}
+    .page{flex-direction:column;gap:28px}
+    .brand{text-align:center}
+    .features{align-items:flex-start;max-width:400px;margin:0 auto}
+    .auth-box{width:100%;max-width:420px}
     .stats-row{gap:8px}
-    .stat-card .num{font-size:14px}
+    .stat-card .num{font-size:16px}
+    .stat-card{padding:10px 8px}
+    .logo{justify-content:center}
   }
 </style>
 </head><body>
@@ -70,7 +84,7 @@
         <path d="M19 9V13" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
         <path d="M24 11V13" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
       </svg>
-      <div class="logo-text">Yield<span>Pilot</span></div>
+      <div class="logo-text">YieldPilot</div>
     </div>
 
     <div class="tagline">Genera ingresos pasivos con funding rates de criptomonedas</div>
@@ -83,20 +97,20 @@
 
     <ul class="features">
       <li>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
-        <span><strong style="color:#fff">9 exchanges en tiempo real</strong> — Binance, Bybit, OKX, Bitget + Hyperliquid, GMX y mas DeFi</span>
+        <svg viewBox="0 0 24 24" class="check-circle"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+        <span><strong>9 exchanges en tiempo real</strong> — Binance, Bybit, OKX, Bitget + Hyperliquid, GMX y mas DeFi</span>
       </li>
       <li>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
-        <span><strong style="color:#fff">Scoring inteligente v10</strong> — Momentum, z-score, regimen de volatilidad y deteccion de spikes</span>
+        <svg viewBox="0 0 24 24" class="check-circle"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+        <span><strong>Scoring inteligente v10</strong> — Momentum, z-score, regimen de volatilidad y deteccion de spikes</span>
       </li>
       <li>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
-        <span><strong style="color:#fff">Arbitraje spot-perp y cross-exchange</strong> — Detecta diferenciales rentables entre exchanges</span>
+        <svg viewBox="0 0 24 24" class="check-circle"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+        <span><strong>Arbitraje spot-perp y cross-exchange</strong> — Detecta diferenciales rentables entre exchanges</span>
       </li>
       <li>
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
-        <span><strong style="color:#fff">Portfolio tracker</strong> — Monitorea tus posiciones, ganancias y pagos en tiempo real</span>
+        <svg viewBox="0 0 24 24" class="check-circle"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+        <span><strong>Portfolio tracker</strong> — Monitorea tus posiciones, ganancias y pagos en tiempo real</span>
       </li>
     </ul>
 
@@ -107,7 +121,7 @@
       </div>
       <div class="stat-card">
         <div class="num">500+</div>
-        <div class="lbl">Pares analizados</div>
+        <div class="lbl">Pares</div>
       </div>
       <div class="stat-card">
         <div class="num">24/7</div>
