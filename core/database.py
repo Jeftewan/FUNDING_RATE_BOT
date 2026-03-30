@@ -51,6 +51,10 @@ def _run_migrations(db):
     migrations = [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(256)",
         "ALTER TABLE funding_rate_snapshots ADD COLUMN IF NOT EXISTS open_interest FLOAT",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS leverage INTEGER DEFAULT 1",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS exposure FLOAT DEFAULT 0",
+        # Backfill exposure for existing positions (1x leverage: exposure = capital/2)
+        "UPDATE user_positions SET exposure = capital_used / 2 WHERE exposure = 0 OR exposure IS NULL",
     ]
     for sql in migrations:
         try:

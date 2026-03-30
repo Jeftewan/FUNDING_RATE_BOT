@@ -58,18 +58,35 @@ class DBPersistence:
         """Create a new position in DB. Returns position ID."""
         from core.database import db
         from core.db_models import UserPosition
+        import time as _time
+
+        capital = pos_dict.get("capital_used", 0)
+        leverage = pos_dict.get("leverage", 1)
+        mode = pos_dict.get("mode", "spot_perp")
+
+        # Calculate exposure if not provided
+        exposure = pos_dict.get("exposure", 0)
+        if not exposure and capital > 0:
+            if mode == "spot_perp":
+                exposure = capital * leverage / (leverage + 1)
+            else:
+                exposure = (capital / 2) * leverage
 
         pos = UserPosition(
             user_id=user_id,
             symbol=pos_dict.get("symbol", ""),
             exchange=pos_dict.get("exchange", ""),
-            mode=pos_dict.get("mode", "spot_perp"),
+            mode=mode,
             entry_fr=pos_dict.get("entry_fr", 0),
             entry_price=pos_dict.get("entry_price", 0),
             entry_time=pos_dict.get("entry_time", 0),
-            capital_used=pos_dict.get("capital_used", 0),
+            capital_used=capital,
+            leverage=leverage,
+            exposure=exposure,
             ih=pos_dict.get("ih", 8),
             earned_real=0,
+            last_earn_update=_time.time(),
+            last_fr_used=0,
             long_exchange=pos_dict.get("long_exchange", ""),
             short_exchange=pos_dict.get("short_exchange", ""),
             entry_fees=pos_dict.get("entry_fees", 0),
@@ -174,9 +191,11 @@ class DBPersistence:
             "entry_price": pos.entry_price,
             "entry_time": pos.entry_time,
             "capital_used": pos.capital_used,
+            "leverage": pos.leverage or 1,
+            "exposure": pos.exposure or (pos.capital_used / 2),
             "ih": pos.ih,
             "earned_real": pos.earned_real,
-            "last_earn_update": pos.last_earn_update,
+            "last_earn_update": pos.last_earn_update or (pos.entry_time / 1000 if pos.entry_time else 0),
             "last_fr_used": pos.last_fr_used,
             "long_exchange": pos.long_exchange,
             "short_exchange": pos.short_exchange,

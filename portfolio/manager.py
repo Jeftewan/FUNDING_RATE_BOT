@@ -23,7 +23,8 @@ def get_capital_summary(state: dict) -> dict:
     }
 
 
-def open_position(state: dict, opportunity: dict, capital: float) -> tuple:
+def open_position(state: dict, opportunity: dict, capital: float,
+                   leverage: int = 1) -> tuple:
     """Open a new position from an opportunity.
 
     Returns (ok, result_dict_or_error_msg).
@@ -80,7 +81,7 @@ def open_position(state: dict, opportunity: dict, capital: float) -> tuple:
     pos["entry_fees"] = fees["total_cost"]
 
     # Calculate sizing based on leverage
-    leverage = max(1, int(opportunity.get("leverage", 1)))
+    leverage = max(1, leverage)
     pos["leverage"] = leverage
 
     if mode == "spot_perp":

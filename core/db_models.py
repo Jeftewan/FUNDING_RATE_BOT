@@ -83,6 +83,8 @@ class UserPosition(db.Model):
     entry_price = db.Column(db.Float, default=0)
     entry_time = db.Column(db.Float, default=0)  # unix timestamp
     capital_used = db.Column(db.Float, default=0)
+    leverage = db.Column(db.Integer, default=1)
+    exposure = db.Column(db.Float, default=0)  # notional exposure per side
     ih = db.Column(db.Float, default=8)  # interval hours
     earned_real = db.Column(db.Float, default=0)
     last_earn_update = db.Column(db.Float, default=0)

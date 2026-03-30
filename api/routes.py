@@ -219,6 +219,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         data = flask_req.json or {}
         opp_id = data.get("opportunity_id", "")
         capital = float(data.get("capital", 0))
+        leverage = max(1, int(data.get("leverage", 1)))
 
         uid = get_current_user_id()
 
@@ -245,7 +246,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             else:
                 merged = s
 
-            ok, result = open_position(merged, opp, capital)
+            ok, result = open_position(merged, opp, capital, leverage)
             if ok:
                 # Save to DB
                 if uid and get_db_persist():
