@@ -220,6 +220,11 @@ class ExchangeManager:
                 ih = self._get_funding_interval(exchange_name, info, data, symbol)
                 ipd = 24 / ih if ih > 0 else 3
 
+                # If next funding timestamp is missing (e.g. Bitget bulk endpoint),
+                # calculate from known schedule (fixed intervals at 00:00, 08:00, 16:00 UTC etc.)
+                if not next_ts or next_ts <= 0:
+                    next_ts = self._calc_next_funding_ts(ih)
+
                 # Minutes to next funding
                 mins_next = -1
                 if next_ts and next_ts > 0:
@@ -299,6 +304,27 @@ class ExchangeManager:
                         pass
 
         return 8
+
+    @staticmethod
+    def _calc_next_funding_ts(interval_hours: int = 8) -> int:
+        """Calculate next funding timestamp (ms) from fixed UTC schedule.
+
+        Most exchanges use fixed intervals aligned to 00:00 UTC.
+        E.g. 8h → 00:00, 08:00, 16:00 UTC; 4h → 00:00, 04:00, ...
+        """
+        import math
+        now = time.time()
+        interval_sec = interval_hours * 3600
+        # Seconds since midnight UTC
+        day_start = (now // 86400) * 86400
+        elapsed = now - day_start
+        # Next slot within the day
+        next_slot = math.ceil(elapsed / interval_sec) * interval_sec
+        next_time = day_start + next_slot
+        # If rounding landed exactly on now, advance one interval
+        if next_time <= now:
+            next_time += interval_sec
+        return int(next_time * 1000)
 
     def _enrich_volumes(self, exchange_name: str, rates: list):
         """Fetch 24h volumes via tickers if not available from funding data."""
