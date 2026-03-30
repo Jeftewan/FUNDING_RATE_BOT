@@ -644,8 +644,8 @@ class ScannerWorker:
             return
 
         if cfr > 0:
-            fut_size = pos["capital_used"] / 2
-            earn_per_payment = fut_size * cfr
+            exposure = pos.get("exposure", pos["capital_used"] / 2)
+            earn_per_payment = exposure * cfr
         else:
             earn_per_payment = 0
 
@@ -674,7 +674,7 @@ class ScannerWorker:
         if not long_data or not short_data:
             return
 
-        fut_size = pos["capital_used"] / 2
+        exposure = pos.get("exposure", pos["capital_used"] / 2)
         long_ih = long_data.get("ih", 8)
         short_ih = short_data.get("ih", 8)
         long_interval = long_ih * 3600
@@ -701,7 +701,7 @@ class ScannerWorker:
 
         if short_payments >= 1:
             # Short side: we are SHORT, so we RECEIVE when rate > 0
-            short_earn = fut_size * short_fr * short_payments
+            short_earn = exposure * short_fr * short_payments
             total_earned += short_earn
             pos["_short_last_update"] = now
             any_payment = True
@@ -718,7 +718,7 @@ class ScannerWorker:
 
         if long_payments >= 1:
             # Long side: we are LONG, so we PAY when rate > 0
-            long_earn = -(fut_size * long_fr * long_payments)
+            long_earn = -(exposure * long_fr * long_payments)
             total_earned += long_earn
             pos["_long_last_update"] = now
             any_payment = True
@@ -775,8 +775,8 @@ class ScannerWorker:
             return
 
         if cfr > 0:
-            fut_size = pos["capital_used"] / 2
-            earn_per_iv = fut_size * cfr
+            exposure = pos.get("exposure", pos["capital_used"] / 2)
+            earn_per_iv = exposure * cfr
         else:
             earn_per_iv = 0
 

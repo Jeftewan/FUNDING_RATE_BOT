@@ -79,14 +79,28 @@ def open_position(state: dict, opportunity: dict, capital: float) -> tuple:
 
     pos["entry_fees"] = fees["total_cost"]
 
-    # Generate execution steps
-    steps = _generate_steps(pos, opportunity, capital)
+    # Calculate sizing based on leverage
+    leverage = max(1, int(opportunity.get("leverage", 1)))
+    pos["leverage"] = leverage
 
-    # Calculate estimates
+    if mode == "spot_perp":
+        fut_margin = capital / (leverage + 1)
+        spot_size = capital - fut_margin
+        exposure = spot_size  # both sides equal
+    else:
+        fut_margin = capital / 2
+        spot_size = 0
+        exposure = fut_margin * leverage
+
+    pos["exposure"] = exposure
+
+    # Generate execution steps
+    steps = _generate_steps(pos, opportunity, capital, leverage, spot_size, fut_margin, exposure)
+
+    # Calculate estimates — funding is on EXPOSURE, not margin
     fr = abs(pos["entry_fr"])
     ipd = opportunity.get("payments_per_day", 3)
-    fut_size = capital / 2
-    daily_income = fut_size * fr * ipd
+    daily_income = exposure * fr * ipd
     est_3day = daily_income * 3
     break_even_h = fees["total_cost"] / (daily_income / 24) if daily_income > 0 else 999
 
@@ -103,34 +117,38 @@ def open_position(state: dict, opportunity: dict, capital: float) -> tuple:
     }
 
 
-def _generate_steps(pos: dict, opp: dict, capital: float) -> list:
+def _generate_steps(pos: dict, opp: dict, capital: float,
+                    leverage: int = 1, spot_size: float = 0,
+                    fut_margin: float = 0, exposure: float = 0) -> list:
     """Generate step-by-step execution instructions."""
     mode = pos["mode"]
     symbol = pos["symbol"]
 
     if mode == "spot_perp":
-        spot_size = capital / 2
-        fut_size = capital / 2
         exchange = pos["exchange"]
-        return [
+        steps = [
             f"1. Transferir ${capital:.0f} USDT a {exchange}",
             f"2. Comprar {symbol} en SPOT por ${spot_size:.2f} USDT",
-            f"3. Abrir SHORT {symbol}/USDT perpetuo por ${fut_size:.2f} USDT",
-            f"4. Configurar Cross Margin, Leverage 1x",
+            f"3. Abrir SHORT {symbol}/USDT perpetuo — margen ${fut_margin:.2f}, exposicion ${exposure:.2f}",
+            f"4. Configurar Cross Margin, Leverage {leverage}x",
             f"5. El bot monitoreara los pagos cada {pos['ih']}h",
         ]
+        if leverage > 1:
+            steps.insert(1, f"   Spot: ${spot_size:.2f} + Margen futures: ${fut_margin:.2f} = ${capital:.2f}")
+        return steps
     else:
-        per_side = capital / 2
+        margin_side = capital / 2
         long_ex = pos.get("long_exchange", "")
         short_ex = pos.get("short_exchange", "")
-        return [
-            f"1. Transferir ${per_side:.0f} USDT a {long_ex} (cuenta futures)",
-            f"2. Transferir ${per_side:.0f} USDT a {short_ex} (cuenta futures)",
-            f"3. Abrir LONG {symbol}/USDT perpetuo en {long_ex} por ${per_side:.2f}",
-            f"4. Abrir SHORT {symbol}/USDT perpetuo en {short_ex} por ${per_side:.2f}",
-            f"5. Configurar Cross Margin 1x en ambos exchanges",
+        steps = [
+            f"1. Transferir ${margin_side:.0f} USDT a {long_ex} (cuenta futures)",
+            f"2. Transferir ${margin_side:.0f} USDT a {short_ex} (cuenta futures)",
+            f"3. Abrir LONG {symbol}/USDT en {long_ex} — margen ${margin_side:.2f}, exposicion ${exposure:.2f}",
+            f"4. Abrir SHORT {symbol}/USDT en {short_ex} — margen ${margin_side:.2f}, exposicion ${exposure:.2f}",
+            f"5. Configurar Cross Margin {leverage}x en ambos exchanges",
             f"6. El bot monitoreara el diferencial de funding",
         ]
+        return steps
 
 
 def close_position(state: dict, position_id: str, reason: str = "manual") -> tuple:
