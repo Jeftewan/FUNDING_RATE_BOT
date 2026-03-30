@@ -17,7 +17,10 @@ def calculate_position_estimate(opportunity: dict, capital: float,
                                 leverage: int = 1) -> dict:
     """Calculate estimated returns + SL/TP for a given opportunity.
 
-    Returns detailed breakdown for the frontend calculator.
+    Delta-neutral sizing with leverage:
+      Spot-Perp: spot_size = capital * lev / (lev+1), fut_margin = capital / (lev+1)
+                 exposure = spot_size = fut_margin * lev (both sides equal)
+      Cross-Ex:  margin_per_side = capital / 2, exposure = margin * lev
     """
     mode = opportunity.get("mode", "spot_perp")
     fr = abs(opportunity.get("funding_rate", opportunity.get("rate_differential", 0)))
@@ -25,7 +28,6 @@ def calculate_position_estimate(opportunity: dict, capital: float,
     price = opportunity.get("price", 0)
 
     if mode == "cross_exchange":
-        # Use minimum of both sides' payments per day
         ipd = min(opportunity.get("long_ppd", 3), opportunity.get("short_ppd", 3))
     else:
         ipd = opportunity.get("payments_per_day", 3)
@@ -33,6 +35,13 @@ def calculate_position_estimate(opportunity: dict, capital: float,
     if mode == "spot_perp":
         fees = calculate_spot_perp_fees(opportunity["exchange"], capital, vol)
         exchange = opportunity["exchange"]
+        # Delta-neutral: spot_size = fut_margin * leverage
+        # spot_size + fut_margin = capital
+        # → fut_margin = capital / (lev + 1)
+        # → spot_size = capital * lev / (lev + 1)
+        fut_margin = capital / (leverage + 1)
+        spot_size = capital - fut_margin  # = capital * lev / (lev + 1)
+        exposure = spot_size  # both sides have equal exposure
     else:
         fees = calculate_cross_exchange_fees(
             opportunity.get("long_exchange", ""),
@@ -40,11 +49,14 @@ def calculate_position_estimate(opportunity: dict, capital: float,
             capital, vol,
         )
         exchange = opportunity.get("short_exchange", "")
+        # Cross-exchange: both sides use futures with leverage
+        # margin_per_side = capital / 2, exposure = margin * leverage
+        fut_margin = capital / 2
+        spot_size = 0
+        exposure = fut_margin * leverage
 
-    # With leverage: position size = capital * leverage / 2 each side
-    fut_size = (capital * leverage) / 2
-
-    daily_income = fut_size * fr * ipd
+    # Funding is paid on the EXPOSURE (notional), not the margin
+    daily_income = exposure * fr * ipd
     income_3day = daily_income * 3
     apr = (daily_income * 365 / capital * 100) if capital > 0 else 0
     hourly = daily_income / 24
@@ -58,7 +70,7 @@ def calculate_position_estimate(opportunity: dict, capital: float,
         "leverage": leverage,
         "mode": mode,
         "funding_rate": fr,
-        "position_size": fut_size * 2,
+        "exposure": exposure,
         "daily_income": daily_income,
         "income_3day": income_3day,
         "income_7day": daily_income * 7,
@@ -73,6 +85,16 @@ def calculate_position_estimate(opportunity: dict, capital: float,
         "net_3day": income_3day - fees["total_cost"],
         "net_daily": daily_income - (fees["total_cost"] / 3),
     }
+
+    # Add sizing details for frontend
+    if mode == "spot_perp":
+        result["spot_size"] = spot_size
+        result["fut_margin"] = fut_margin
+        result["fut_exposure"] = exposure
+    else:
+        result["margin_per_side"] = fut_margin
+        result["exposure_per_side"] = exposure
+
     result.update(sl_tp)
     return result
 

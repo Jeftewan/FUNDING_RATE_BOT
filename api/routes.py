@@ -347,8 +347,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                                (pos["entry_fr"] < 0 and cfr > 0))
 
                 ipd = 24 / ih
-                fut_size = pos["capital_used"] / 2
-                daily = fut_size * abs(cfr) * ipd
+                exposure = pos.get("exposure", pos["capital_used"] / 2)
+                daily = exposure * abs(cfr) * ipd
                 current_apr = (daily * 365 / pos["capital_used"] * 100) if pos["capital_used"] > 0 else 0
 
                 pdata.append({

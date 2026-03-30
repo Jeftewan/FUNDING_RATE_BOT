@@ -529,14 +529,29 @@ async function calcEst(oppId, idx) {
     const data = await res.json();
     if (data.ok) {
       const e = data.estimate;
+      let sizingHtml = '';
+      if (e.mode === 'spot_perp' && lev > 1) {
+        sizingHtml = `<div style="margin:4px 0;padding:5px 8px;background:#1a1d23;border-radius:6px;font-size:11px;color:#888">
+          Spot: <b style="color:#3b82f6">$${e.spot_size?.toFixed(2)}</b> · Margen futures: <b style="color:#f59e0b">$${e.fut_margin?.toFixed(2)}</b> · Exposicion: <b style="color:#fff">$${e.exposure?.toFixed(2)}</b> (${lev}x)
+        </div>`;
+      } else if (e.mode === 'spot_perp') {
+        sizingHtml = `<div style="margin:4px 0;padding:5px 8px;background:#1a1d23;border-radius:6px;font-size:11px;color:#888">
+          Spot: <b style="color:#3b82f6">$${e.spot_size?.toFixed(2)}</b> · Short futures: <b style="color:#f59e0b">$${e.fut_margin?.toFixed(2)}</b>
+        </div>`;
+      } else if (e.mode === 'cross_exchange') {
+        sizingHtml = `<div style="margin:4px 0;padding:5px 8px;background:#1a1d23;border-radius:6px;font-size:11px;color:#888">
+          Margen/lado: <b style="color:#f59e0b">$${e.margin_per_side?.toFixed(2)}</b> · Exposicion/lado: <b style="color:#fff">$${e.exposure_per_side?.toFixed(2)}</b>${lev > 1 ? ` (${lev}x)` : ''}
+        </div>`;
+      }
+
       let html = `
+        ${sizingHtml}
         <div style="margin:4px 0">
           <span style="color:#22c55e">$${e.daily_income.toFixed(2)}/dia</span> |
           <span style="color:#22c55e">$${e.income_3day.toFixed(2)}/3d</span> |
           Neto: <span style="color:#fff">$${e.net_3day.toFixed(2)}</span> |
           Fees: $${e.fees_total.toFixed(2)} |
           BE: ${e.break_even_hours.toFixed(1)}h
-          ${lev > 1 ? ` | Pos: $${e.position_size?.toFixed(0)}` : ''}
         </div>`;
 
       if (e.sl_tp) {
