@@ -2,7 +2,7 @@
 
 :root {
   --bg-primary: #0a0b0d;
-  --bg-card: rgba(17,19,24,0.6);
+  --bg-card: #111318;
   --bg-card-solid: #111318;
   --bg-input: #0d0f12;
   --border: rgba(255,255,255,0.06);
@@ -379,14 +379,12 @@ body {
 
 .opp-card {
   background: var(--bg-card);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px;
   margin-bottom: 10px;
   transition: border-color .2s, box-shadow .2s, opacity .15s;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.12);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.15);
 }
 .opp-card:hover { border-color: var(--border-hover); box-shadow: 0 4px 32px rgba(0,0,0,0.2); }
 .opp-card.grade-a { border-left: 3px solid #22c55e44; }
@@ -518,13 +516,11 @@ body {
 
 .pos-card {
   background: var(--bg-card);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px;
   margin-bottom: 10px;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.12);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.15);
   transition: opacity .15s;
 }
 
@@ -630,13 +626,11 @@ body {
 
 .cfg-section {
   background: var(--bg-card);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px;
   margin-bottom: 12px;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.12);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.15);
 }
 
 .cfg-section h3 { font-size: 14px; font-family: var(--font-ui); color: var(--text-white); margin-bottom: 12px; font-weight: 600; }
@@ -812,7 +806,6 @@ body {
 
 .skeleton-card {
   background: var(--bg-card);
-  backdrop-filter: blur(12px);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 16px;
@@ -837,13 +830,11 @@ body {
 
 .earnings-chart-container {
   background: var(--bg-card);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px;
   margin-bottom: 12px;
-  box-shadow: 0 4px 24px rgba(0,0,0,0.12);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.15);
 }
 .earnings-chart-container canvas { width: 100% !important; max-height: 180px; }
 
