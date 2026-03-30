@@ -31,6 +31,7 @@
       <button class="tab" onclick="switchTab('positions')" id="tab-positions">Posiciones</button>
       <button class="tab" onclick="switchTab('config')" id="tab-config">Config</button>
       {% if db_enabled %}<button class="tab" onclick="switchTab('account')" id="tab-account">Cuenta</button>{% endif %}
+      <button class="tab" onclick="switchTab('help')" id="tab-help">Ayuda</button>
     </div>
 
     <div class="status-bar" id="status-bar">
@@ -147,79 +148,130 @@
       <p style="font-size:10px;color:#555;margin-bottom:10px">Tus keys se almacenan encriptadas.</p>
       <div id="exchange-keys-list"></div>
     </div>
-
-    <div class="cfg-section">
-      <h3>Guia de metricas</h3>
-
-      <div class="help-group">
-        <h4>Oportunidades</h4>
-        <dl class="help-list">
-          <dt>Score</dt>
-          <dd>Puntaje compuesto (0-100) que combina tasa, volumen, estabilidad y momentum. Mayor = mejor oportunidad.</dd>
-          <dt>Grade (A/B/C)</dt>
-          <dd>Calificacion basada en el score. A = excelente (&ge;70), B = buena (&ge;40), C = aceptable.</dd>
-          <dt>FR (Funding Rate)</dt>
-          <dd>Tasa que pagan los longs a los shorts cada periodo. Si es positiva, shorts cobran; si es negativa, longs cobran.</dd>
-          <dt>APR</dt>
-          <dd>Retorno anual proyectado basado en el funding rate actual. Util para comparar con otras inversiones.</dd>
-          <dt>3d Acum</dt>
-          <dd>Porcentaje de funding acumulado en los ultimos 3 dias. Indica la consistencia reciente de la tasa.</dd>
-          <dt>$/dia 1K</dt>
-          <dd>Ingreso diario estimado por cada $1,000 invertidos, antes de fees.</dd>
-          <dt>Neto 3d</dt>
-          <dd>Ganancia neta estimada en 3 dias por cada $1,000 invertidos, ya descontados los fees.</dd>
-          <dt>Fees</dt>
-          <dd>Costos totales estimados (entrada + salida): comisiones de trading, spread, y slippage.</dd>
-          <dt>Break-even</dt>
-          <dd>Horas necesarias para que las ganancias de funding cubran los fees. Despues de este punto, todo es ganancia.</dd>
-          <dt>Hold</dt>
-          <dd>Dias recomendados para mantener la posicion segun la estabilidad de la tasa.</dd>
-          <dt>Mom (Momentum)</dt>
-          <dd>Tendencia del funding: &#11014; acelerando, &#8594; estable, &#11015; desacelerando, &#8595; negativo.</dd>
-          <dt>Pctl (Percentil)</dt>
-          <dd>Posicion historica de la tasa actual. 90% significa que la tasa es mayor que el 90% de las observaciones recientes.</dd>
-        </dl>
-      </div>
-
-      <div class="help-group">
-        <h4>Posiciones activas</h4>
-        <dl class="help-list">
-          <dt>Capital</dt>
-          <dd>Monto total asignado a la posicion. Se divide 50/50 entre spot y futures (o entre los dos exchanges).</dd>
-          <dt>Pagos</dt>
-          <dd>Cantidad de pagos de funding recibidos desde la apertura.</dd>
-          <dt>Prox pago</dt>
-          <dd>Minutos restantes hasta el proximo pago de funding.</dd>
-          <dt>FR entrada vs FR actual</dt>
-          <dd>Compara la tasa al abrir con la actual. Si el signo cambia (+ a -), la posicion ya no es rentable.</dd>
-          <dt>Prom</dt>
-          <dd>Tasa promedio de todos los pagos recibidos. Refleja el rendimiento real, no el teorico.</dd>
-          <dt>Ganancia / Fees / Neto</dt>
-          <dd>Ganancia bruta de funding, fees estimados (entrada + salida), y la diferencia. El neto es lo que realmente ganas.</dd>
-        </dl>
-      </div>
-
-      <div class="help-group">
-        <h4>Como abrir una posicion</h4>
-        <dl class="help-list">
-          <dt>Capital ($)</dt>
-          <dd>Monto en USD que deseas invertir en la oportunidad. Se distribuye automaticamente entre spot y futures.</dd>
-          <dt>Apalancamiento (x)</dt>
-          <dd>Multiplicador de la posicion de futures. Usa 1x para arbitraje seguro. Mayor apalancamiento = mayor riesgo de liquidacion.</dd>
-          <dt>Calc</dt>
-          <dd>Muestra una estimacion detallada: ganancia diaria, fees, break-even y pasos de ejecucion.</dd>
-          <dt>Entrar</dt>
-          <dd>Registra la posicion en el sistema para monitoreo automatico. Debes ejecutar las operaciones manualmente en el exchange.</dd>
-        </dl>
-      </div>
-    </div>
-
     <div class="cfg-section">
       <h3 style="color:#ef4444">Zona peligrosa</h3>
       <button class="btn btn-danger" onclick="deleteAccount()">Eliminar cuenta</button>
     </div>
   </div>
   {% endif %}
+
+  <!-- ═══ HELP TAB ═══ -->
+  <div id="page-help" class="page">
+    <div class="cfg-section">
+      <h3>Que es el arbitraje de funding rate?</h3>
+      <p class="help-intro">
+        Los contratos perpetuos tienen un mecanismo de <b>funding rate</b>: cada cierto tiempo (4h, 8h) un lado del mercado le paga al otro para mantener el precio alineado con el spot.
+        Si la tasa es positiva, los <b>longs pagan a los shorts</b>. El arbitraje consiste en abrir una posicion cubierta (hedge) para cobrar esos pagos sin riesgo de precio.
+      </p>
+      <p class="help-intro">
+        <b>Spot-Perp:</b> Compras el token en spot + abres un short en futuros perpetuos. El precio no te afecta porque las ganancias/perdidas se cancelan.<br>
+        <b>Cross-Exchange:</b> Abres long en un exchange y short en otro, aprovechando que pagan tasas diferentes.
+      </p>
+    </div>
+
+    <div class="cfg-section">
+      <h3>Senales e indicadores</h3>
+      <div class="help-group">
+        <h4>Badges de oportunidad</h4>
+        <dl class="help-list">
+          <dt><span class="ind-badge ind-bonanza">BONANZA</span> Regimen de alta volatilidad</dt>
+          <dd>El mercado esta en un periodo de tasas de funding inusualmente altas. Las oportunidades son mas rentables pero tambien menos estables. Buen momento para entrar si el score es alto.</dd>
+          <dt><span class="ind-badge ind-lowvol">BAJA VOL</span> Regimen de baja volatilidad</dt>
+          <dd>El mercado tiene tasas de funding bajas y estables. Las ganancias seran menores pero mas predecibles. Requiere mayor capital para que valga la pena.</dd>
+          <dt><span class="ind-badge ind-spike">SPIKE &#8593;</span> Spike entrante</dt>
+          <dd>Se detecta un aumento rapido del funding rate. Puede ser temporal — si entras, monitorea de cerca porque la tasa puede caer pronto.</dd>
+          <dt><span class="ind-badge ind-warn">REVERSION</span> Reversion en curso</dt>
+          <dd>La tasa esta bajando despues de un spike. Senal de que el pico ya paso. <b>No es buen momento para abrir</b> una nueva posicion; si ya tienes una, considera cerrar.</dd>
+          <dt><span class="ind-badge ind-danger">Z:2.5</span> Z-Score (riesgo)</dt>
+          <dd>Mide que tan lejos esta la tasa actual de su promedio historico en desviaciones estandar. <b>Z &gt; 2</b> = tasa extrema, probablemente insostenible. <b>Z &gt; 3</b> = muy riesgoso, alta probabilidad de reversion.</dd>
+        </dl>
+      </div>
+
+      <div class="help-group">
+        <h4>Grades y Score</h4>
+        <dl class="help-list">
+          <dt><span class="opp-badge A">A</span> Excelente (Score &ge; 70)</dt>
+          <dd>Tasa alta, volumen saludable, tendencia estable. Las mejores oportunidades para abrir posiciones.</dd>
+          <dt><span class="opp-badge B">B</span> Buena (Score &ge; 40)</dt>
+          <dd>Oportunidad viable pero con alguna debilidad (volumen bajo, momentum incierto, o fees altos vs ganancia).</dd>
+          <dt><span class="opp-badge C">C</span> Aceptable (Score &lt; 40)</dt>
+          <dd>Metricas debiles. Solo considerar si conoces bien el par y tienes una razon especifica.</dd>
+        </dl>
+      </div>
+    </div>
+
+    <div class="cfg-section">
+      <h3>Metricas de oportunidades</h3>
+      <dl class="help-list">
+        <dt>FR (Funding Rate)</dt>
+        <dd>Tasa que pagan los longs a los shorts en cada periodo. Si es positiva, shorts cobran; si es negativa, longs cobran. Es la base de la ganancia del arbitraje.</dd>
+        <dt>APR</dt>
+        <dd>Retorno anual proyectado: <code>(FR &times; pagos/dia &times; 365 &times; exposicion) / capital</code>. Util para comparar oportunidades entre si y contra otras inversiones.</dd>
+        <dt>3d Acum</dt>
+        <dd>Porcentaje de funding acumulado en los ultimos 3 dias. Si es consistente, la tasa es confiable. Si varia mucho, el FR es volatil.</dd>
+        <dt>$/dia 1K</dt>
+        <dd>Ingreso diario estimado por cada $1,000 invertidos, antes de fees. Responde "cuanto gano por dia?".</dd>
+        <dt>Neto 3d</dt>
+        <dd>Ganancia neta en 3 dias por cada $1,000, ya descontados los fees. Si es negativo, necesitas mas tiempo para recuperar los costos.</dd>
+        <dt>Fees</dt>
+        <dd>Costos totales estimados (entrada + salida): comisiones de trading + spread + slippage. Fees altos = necesitas mas tiempo de hold.</dd>
+        <dt>Break-even (BE)</dt>
+        <dd>Horas necesarias para que las ganancias cubran los fees. Despues de este punto, todo es ganancia neta. Busca BE bajo.</dd>
+        <dt>Hold</dt>
+        <dd>Dias recomendados de hold segun la estabilidad. Si la tasa es volatile, el hold recomendado es corto.</dd>
+        <dt>Mom (Momentum)</dt>
+        <dd>Tendencia del funding rate: &#11014; acelerando (subiendo), &#8594; estable, &#11015; desacelerando (bajando), &#8595; negativo. Preferir acelerando o estable.</dd>
+        <dt>Pctl (Percentil)</dt>
+        <dd>Donde esta la tasa actual comparada con su historial. 90% = la tasa es mayor que el 90% de las observaciones. Alto percentil + momentum estable = buena senal.</dd>
+      </dl>
+    </div>
+
+    <div class="cfg-section">
+      <h3>Posiciones activas</h3>
+      <dl class="help-list">
+        <dt>Capital</dt>
+        <dd>Monto total asignado. Con 1x leverage se divide 50/50 (spot + futures). Con mayor leverage, mas va a spot y menos a margen de futures.</dd>
+        <dt>Pagos</dt>
+        <dd>Cantidad de pagos de funding recibidos. Cada pago ocurre en el intervalo del par (4h, 8h, etc).</dd>
+        <dt>Prox pago</dt>
+        <dd>Tiempo restante hasta el proximo pago. El bot escanea automaticamente antes de cada pago para verificar la tasa.</dd>
+        <dt>FR entrada vs FR actual</dt>
+        <dd>Compara la tasa al abrir vs la actual. Si el signo cambia (+ a -), recibes alerta de RATE REVERSAL — debes cerrar.</dd>
+        <dt>APR</dt>
+        <dd>Retorno anual basado en el funding rate ACTUAL (no el de entrada). Si bajo mucho, la posicion ya no es tan rentable.</dd>
+        <dt>Prom</dt>
+        <dd>Tasa promedio de todos los pagos reales recibidos. Es el rendimiento real de la posicion, no una proyeccion.</dd>
+        <dt>Ganancia / Fees / Neto</dt>
+        <dd>Ganancia bruta de funding, fees estimados (entrada + salida), y ganancia neta. El neto es lo que realmente ganas al cerrar.</dd>
+      </dl>
+    </div>
+
+    <div class="cfg-section">
+      <h3>Como abrir una posicion</h3>
+      <dl class="help-list">
+        <dt>Capital ($)</dt>
+        <dd>Monto en USD a invertir. Se distribuye automaticamente segun el modo y el apalancamiento elegido.</dd>
+        <dt>Apalancamiento (x)</dt>
+        <dd>Multiplicador del lado futures. Con 1x: 50% spot + 50% futures. Con 3x: 75% spot + 25% margen (misma exposicion). Mayor leverage = menos margen necesario, pero mas cerca de liquidacion.</dd>
+        <dt>Calc</dt>
+        <dd>Calcula y muestra: desglose spot/futures, ganancia diaria, fees, break-even, niveles de SL/TP y pasos de ejecucion.</dd>
+        <dt>Entrar</dt>
+        <dd>Registra la posicion para monitoreo automatico (alertas, seguimiento de pagos). <b>Debes ejecutar las operaciones manualmente en el exchange.</b></dd>
+      </dl>
+    </div>
+
+    <div class="cfg-section">
+      <h3>Alertas automaticas</h3>
+      <dl class="help-list">
+        <dt>RATE REVERSAL</dt>
+        <dd>La tasa cambio de signo. Si entraste con FR positivo y ahora es negativo, estas pagando en vez de cobrar. <b>Cerrar inmediatamente.</b></dd>
+        <dt>RATE DROP</dt>
+        <dd>La tasa cayo mas del 75% respecto a la de entrada. La posicion ya no es tan rentable — considerar cerrar.</dd>
+        <dt>PRE PAYMENT UNFAVORABLE</dt>
+        <dd>Faltan pocos minutos para un pago y la tasa es desfavorable. Vas a recibir poco o nada en este periodo.</dd>
+      </dl>
+    </div>
+  </div>
 </div>
 
 <!-- Modal -->
@@ -253,6 +305,10 @@
     <span>Cuenta</span>
   </button>
   {% endif %}
+  <button class="nav-item" id="bnav-help" onclick="switchTab('help')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><path d="M9 9a3 3 0 015.12 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="currentColor"/></svg>
+    <span>Ayuda</span>
+  </button>
 </nav>
 
 <div id="toast-container" class="toast-container"></div>
