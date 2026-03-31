@@ -13,6 +13,7 @@ import time
 import logging
 import threading
 from datetime import datetime
+from analysis.ai_analyzer import analyze_top_opportunities
 
 log = logging.getLogger("bot")
 
@@ -457,6 +458,12 @@ class ScannerWorker:
 
         # Sort by score DESC
         opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
+
+        # 6b. AI analysis of top opportunities
+        try:
+            opportunities = analyze_top_opportunities(opportunities, self.config)
+        except Exception as e:
+            log.warning(f"AI analysis skipped: {e}")
 
         # 7. Update state (BEFORE snapshot storage — snapshots are slow and non-critical)
         status_parts = [f"{len(r)}{n[:2].upper()}" for n, r in all_rates.items() if r]

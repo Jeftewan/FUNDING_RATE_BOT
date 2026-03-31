@@ -368,6 +368,15 @@ function renderOpps(data) {
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${i})">Entrar</button>
       </div>
       <div class="opp-est" id="est-${i}"></div>
+      ${o.ai_analysis ? `
+      <div class="opp-ai" id="ai-${i}">
+        <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">
+          <span class="ai-badge ${o.ai_analysis.signal === 'COMPRAR' ? 'ai-buy' : o.ai_analysis.signal === 'EVITAR' ? 'ai-avoid' : 'ai-hold'}">${o.ai_analysis.signal}</span>
+          <span class="ai-conf">${o.ai_analysis.confidence}/10</span>
+          <svg class="ai-arrow" width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
+        </button>
+        <div class="ai-body">${o.ai_analysis.analysis}</div>
+      </div>` : ''}
     </div>`;
   }).join('');
 

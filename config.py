@@ -29,6 +29,9 @@ class Config:
     # Coinglass
     COINGLASS_API_KEY = os.environ.get("COINGLASS_API_KEY", "")
 
+    # Groq AI (free tier — Llama 3.3 70B)
+    GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
     # App
     BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "")
     DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
