@@ -505,6 +505,52 @@ body {
   margin-top: 6px;
 }
 
+/* ═══ AI ANALYSIS ════════════════════════════════ */
+
+.opp-ai {
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
+}
+.btn-ai-toggle {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  font-family: var(--font-ui);
+  padding: 4px 0;
+  width: 100%;
+  transition: color .15s;
+}
+.btn-ai-toggle:hover { color: var(--text-primary); }
+.ai-badge {
+  font-size: 10px;
+  font-family: var(--font-ui);
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 10px;
+  letter-spacing: .3px;
+}
+.ai-buy { background: var(--green-bg); color: var(--green); border: 1px solid #22c55e44; }
+.ai-hold { background: var(--orange-bg); color: var(--orange); border: 1px solid #f59e0b44; }
+.ai-avoid { background: var(--red-bg); color: var(--red); border: 1px solid #ef444444; }
+.ai-conf { color: var(--text-muted); font-family: var(--font); font-size: 10px; }
+.ai-arrow { margin-left: auto; transition: transform .2s; color: var(--text-muted); }
+.opp-ai.open .ai-arrow { transform: rotate(180deg); }
+.ai-body {
+  display: none;
+  font-size: 12px;
+  font-family: var(--font-ui);
+  color: var(--text-secondary);
+  line-height: 1.6;
+  padding: 8px 0 2px;
+}
+.opp-ai.open .ai-body { display: block; }
+
 /* ═══ POSITION CARDS ═══════════════════════════════ */
 
 .pos-card {
