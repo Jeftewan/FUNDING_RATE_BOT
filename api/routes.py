@@ -376,6 +376,66 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 "alerts": s.get("alerts", []),
             })
 
+    # ── Position AI Analysis ────────────────────────────────────
+    @app.route("/api/positions/ai", methods=["POST"])
+    @auth_required
+    def api_positions_ai():
+        """On-demand AI analysis for active positions."""
+        from analysis.ai_analyzer import analyze_positions
+
+        # Reuse the positions data from api_positions logic
+        uid = get_current_user_id()
+        with state_manager.lock:
+            s = state_manager.state
+            all_data = s.get("all_data", [])
+
+            if uid and get_db_persist():
+                user_state = get_db_persist().load_user_state(uid)
+                positions_list = user_state.get("positions", [])
+            else:
+                positions_list = []
+
+            if not positions_list:
+                return jsonify({"ok": True, "analyses": {}})
+
+            # Build enriched position data (same as api_positions)
+            pdata = []
+            now = time.time()
+            for pos in positions_list:
+                is_cross = pos.get("mode") == "cross_exchange"
+                if is_cross:
+                    long_ex = pos.get("long_exchange", "")
+                    short_ex = pos.get("short_exchange", pos.get("exchange", ""))
+                    long_d = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex), None)
+                    short_d = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex), None)
+                    cfr = (short_d["fr"] - long_d["fr"]) if long_d and short_d else pos["entry_fr"]
+                else:
+                    cur = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]), None)
+                    cfr = cur["fr"] if cur else pos["entry_fr"]
+
+                ih = pos.get("ih", 8)
+                el_h = (now - pos["entry_time"] / 1000) / 3600
+                earned = pos.get("earned_real", 0)
+                entry_fees = pos.get("entry_fees", 0)
+                net_earned = earned - entry_fees * 2
+                exposure = pos.get("exposure", pos["capital_used"] / 2)
+                ipd = 24 / ih
+                daily = exposure * abs(cfr) * ipd
+                current_apr = (daily * 365 / pos["capital_used"] * 100) if pos["capital_used"] > 0 else 0
+                fr_reversed = ((pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0))
+
+                pdata.append({
+                    **pos,
+                    "current_fr": cfr,
+                    "elapsed_h": el_h,
+                    "net_earned": net_earned,
+                    "current_apr": current_apr,
+                    "fr_reversed": fr_reversed,
+                })
+
+        analyses = analyze_positions(pdata, config)
+        return jsonify({"ok": True, "analyses": analyses})
+
     # ── Close Position ─────────────────────────────────────────
     @app.route("/api/close_position", methods=["POST"])
     @auth_required
