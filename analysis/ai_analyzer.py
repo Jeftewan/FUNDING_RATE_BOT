@@ -161,3 +161,115 @@ def analyze_top_opportunities(opportunities: list, config, top_n: int = MAX_OPPS
         log.warning(f"AI analysis failed: {e}")
 
     return opportunities
+
+
+# ── Position Analysis ─────────────────────────────────────────
+
+POSITION_SYSTEM_PROMPT = (
+    "Eres un analista experto en arbitraje de funding rates. "
+    "Evalua posiciones ACTIVAS y responde SOLO con JSON valido:\n"
+    '{"analyses":[{"id":"id de la posicion","signal":"MANTENER|CERRAR|VIGILAR",'
+    '"confidence":1-10,"analysis":"1-2 oraciones en espanol"}]}\n\n'
+    "Criterios:\n"
+    "- MANTENER: FR actual sigue favorable, APR positivo, sin reversion.\n"
+    "- CERRAR: FR se revirtio o tiende a 0, APR negativo, ya cobro suficiente.\n"
+    "- VIGILAR: FR bajando pero aun positivo, posible reversion pronto.\n\n"
+    "Se ultra breve. Enfocate en: tendencia del FR, riesgo de reversion, "
+    "y si conviene seguir o salir ahora."
+)
+
+
+def _slim_position(pos: dict) -> dict:
+    """Ultra-compact position data for AI — minimal tokens."""
+    payments = pos.get("payments") or []
+    # Only last 2 rates for trend direction
+    recent = [round(p["rate"] * 100, 4) for p in payments[-2:]] if payments else []
+
+    return {
+        "id": str(pos.get("id", "")),
+        "sym": pos.get("symbol", ""),
+        "efr": round((pos.get("entry_fr", 0) or 0) * 100, 4),
+        "cfr": round((pos.get("current_fr", 0) or 0) * 100, 4),
+        "apr": round(pos.get("current_apr", 0) or 0, 1),
+        "net": round(pos.get("net_earned", 0) or 0, 2),
+        "h": round(pos.get("elapsed_h", 0) or 0, 1),
+        "rev": bool(pos.get("fr_reversed")),
+        "lr": recent,
+    }
+
+
+def analyze_positions(positions: list, config) -> dict:
+    """Analyze active positions with Groq AI. Returns {pos_id: {signal, confidence, analysis}}.
+
+    Gracefully degrades: returns empty dict on any failure.
+    """
+    api_key = getattr(config, "GROQ_API_KEY", "")
+    if not api_key or not positions:
+        return {}
+
+    try:
+        from groq import Groq
+
+        slim_data = [_slim_position(p) for p in positions]
+        user_content = (
+            f"Evalua estas {len(slim_data)} posiciones activas:\n"
+            + json.dumps(slim_data, separators=(",", ":"), ensure_ascii=False)
+        )
+        messages = [
+            {"role": "system", "content": POSITION_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ]
+
+        client = Groq(api_key=api_key)
+        resp = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.3,
+            max_tokens=1000,
+            timeout=TIMEOUT,
+        )
+
+        raw = resp.choices[0].message.content or ""
+        result = _parse_position_response(raw)
+        log.info(f"Position AI: {len(result)}/{len(positions)} analyzed")
+        return result
+
+    except Exception as e:
+        log.warning(f"Position AI failed: {e}")
+        return {}
+
+
+def _parse_position_response(text: str) -> dict:
+    """Parse Groq response into {pos_id: analysis_dict} map."""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                return {}
+        else:
+            return {}
+
+    analyses = data.get("analyses", [])
+    if not isinstance(analyses, list):
+        return {}
+
+    result = {}
+    for a in analyses:
+        pos_id = str(a.get("id", ""))
+        if not pos_id:
+            continue
+        signal = a.get("signal", "VIGILAR").upper()
+        if signal not in ("MANTENER", "CERRAR", "VIGILAR"):
+            signal = "VIGILAR"
+        result[pos_id] = {
+            "signal": signal,
+            "confidence": max(1, min(10, int(a.get("confidence", 5)))),
+            "analysis": str(a.get("analysis", ""))[:500],
+        }
+
+    return result

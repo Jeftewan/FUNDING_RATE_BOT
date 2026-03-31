@@ -688,7 +688,36 @@ async function loadPositions() {
   }
 }
 
+let _posAiData = {};
+let _posAiLoading = false;
+let _lastPosData = null;
+
+async function analyzePositionsAI() {
+  if (_posAiLoading) return;
+  _posAiLoading = true;
+  const btn = document.getElementById('pos-ai-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Analizando...'; }
+  try {
+    const res = await fetch('/api/positions/ai', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok && data.analyses) {
+      _posAiData = data.analyses;
+      if (_lastPosData) renderPositions(_lastPosData);
+      showToast('Analisis IA completado', 'success');
+    } else {
+      showToast('Sin resultados de IA', 'warning');
+    }
+  } catch (e) {
+    showToast('Error al analizar posiciones', 'error');
+  } finally {
+    _posAiLoading = false;
+    const btn2 = document.getElementById('pos-ai-btn');
+    if (btn2) { btn2.disabled = false; btn2.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/></svg> Analizar con IA'; }
+  }
+}
+
 function renderPositions(data) {
+  _lastPosData = data;
   const positions = data.positions || [];
   const summary = data.summary || {};
   const alerts = data.alerts || [];
@@ -700,7 +729,8 @@ function renderPositions(data) {
     <div class="cap-item"><div class="cap-val" style="color:var(--blue)">$${summary.used?.toFixed(0) || 0}</div><div class="cap-label">En uso</div></div>
     <div class="cap-item"><div class="cap-val" style="color:var(--green)">$${summary.available?.toFixed(0) || 0}</div><div class="cap-label">Disponible</div></div>
     <div class="cap-item"><div class="cap-val" style="color:var(--green)">$${data.total_earned?.toFixed(2) || 0}</div><div class="cap-label">Ganancia</div></div>
-    <div class="cap-item"><div class="cap-val">${summary.count || 0}/${summary.max_positions || 5}</div><div class="cap-label">Pos</div></div>`;
+    <div class="cap-item"><div class="cap-val">${summary.count || 0}/${summary.max_positions || 5}</div><div class="cap-label">Pos</div></div>
+    <div class="cap-item"><button class="pos-ai-btn" id="pos-ai-btn" onclick="analyzePositionsAI()"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/></svg> Analizar con IA</button></div>`;
 
   // Alerts
   document.getElementById('alerts-bar').innerHTML = alerts.map(a => `
@@ -783,6 +813,17 @@ function renderPositions(data) {
       </div>
 
       ${payTable}
+      ${_posAiData[posId] ? `
+      <div class="pos-ai" id="pos-ai-${idx}">
+        <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">
+          <svg class="ai-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/></svg>
+          <span class="ai-label">\u00bfQu\u00e9 hacer? Sugerencia IA</span>
+          <span class="ai-badge ${_posAiData[posId].signal === 'MANTENER' ? 'ai-buy' : _posAiData[posId].signal === 'CERRAR' ? 'ai-avoid' : 'ai-watch'}">${_posAiData[posId].signal}</span>
+          <span class="ai-conf">${_posAiData[posId].confidence}/10</span>
+          <svg class="ai-arrow" width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
+        </button>
+        <div class="ai-body">${_posAiData[posId].analysis}</div>
+      </div>` : ''}
     </div>`;
   }).join('');
 }
