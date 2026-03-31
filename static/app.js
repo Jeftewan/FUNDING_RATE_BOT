@@ -371,6 +371,8 @@ function renderOpps(data) {
       ${o.ai_analysis ? `
       <div class="opp-ai" id="ai-${i}">
         <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">
+          <svg class="ai-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/><circle cx="9" cy="9" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="9" r="1" fill="currentColor" stroke="none"/></svg>
+          <span class="ai-label">Analisis IA</span>
           <span class="ai-badge ${o.ai_analysis.signal === 'COMPRAR' ? 'ai-buy' : o.ai_analysis.signal === 'EVITAR' ? 'ai-avoid' : 'ai-hold'}">${o.ai_analysis.signal}</span>
           <span class="ai-conf">${o.ai_analysis.confidence}/10</span>
           <svg class="ai-arrow" width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
