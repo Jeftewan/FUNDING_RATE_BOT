@@ -161,3 +161,32 @@ class FundingRateSnapshot(db.Model):
                             name="uq_snapshot_symbol_exchange_ts"),
         db.Index("idx_frs_symbol_exchange", "symbol", "exchange", "captured_at"),
     )
+
+
+class ScoreSnapshot(db.Model):
+    """Rolling score history per opportunity.
+
+    Tracks how each opportunity's score evolves across scans.
+    Rolling window: max 30 entries per symbol+exchange pair (~10 days).
+    Older entries are overwritten to keep DB lean.
+    Estimated size: ~50 symbols × 30 rows × ~200 bytes = ~300KB total.
+    """
+    __tablename__ = "score_snapshots"
+
+    id = db.Column(db.Integer, primary_key=True)
+    symbol = db.Column(db.String(20), nullable=False)
+    exchange = db.Column(db.String(50), nullable=False)
+    mode = db.Column(db.String(20), default="spot_perp")
+    score = db.Column(db.Integer, nullable=False)
+    funding_rate = db.Column(db.Float, default=0)
+    apr = db.Column(db.Float, default=0)
+    volume_24h = db.Column(db.Float, default=0)
+    z_score = db.Column(db.Float, default=0)
+    momentum_signal = db.Column(db.String(20), default="flat")
+    scan_number = db.Column(db.Integer, default=0)
+    captured_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
+                            nullable=False, index=True)
+
+    __table_args__ = (
+        db.Index("idx_ss_symbol_exchange", "symbol", "exchange", "captured_at"),
+    )

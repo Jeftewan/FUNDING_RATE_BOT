@@ -502,11 +502,21 @@ class ScannerWorker:
 
         # 8. Store funding rate snapshots in background (non-blocking)
         snapshot_data = all_data + defi_data
+        scan_count = self.state_manager.get("scan_count", 0)
         threading.Thread(
             target=self._store_rate_snapshots,
             args=(snapshot_data,),
             daemon=True,
         ).start()
+
+        # 9. Store score snapshots (rolling window, non-blocking)
+        all_opps = opportunities + defi_opportunities
+        if all_opps:
+            threading.Thread(
+                target=self._store_score_snapshots,
+                args=(all_opps, scan_count),
+                daemon=True,
+            ).start()
 
     # ── Rate Snapshot Storage (data accumulation for ML) ─────
 
@@ -573,6 +583,96 @@ class ScannerWorker:
 
         except Exception as e:
             log.warning(f"Rate snapshot storage failed (non-critical): {e}")
+
+    # ── Score Snapshot Storage (rolling window) ────────────────
+
+    MAX_SCORE_HISTORY = 30  # Max entries per symbol+exchange pair
+
+    def _store_score_snapshots(self, opportunities: list, scan_count: int):
+        """Store score snapshots with rolling window cleanup.
+
+        Keeps max 30 entries per symbol+exchange pair (~10 days of data).
+        Runs in background thread.
+        """
+        if not self._flask_app:
+            return
+
+        try:
+            with self._flask_app.app_context():
+                from core.database import db
+                from core.db_models import ScoreSnapshot
+                from datetime import datetime, timezone
+
+                now = datetime.now(timezone.utc)
+
+                rows = []
+                for opp in opportunities:
+                    indicators = opp.get("indicators", {})
+                    rows.append(ScoreSnapshot(
+                        symbol=opp.get("symbol", ""),
+                        exchange=opp.get("exchange", opp.get("short_exchange", "")),
+                        mode=opp.get("mode", "spot_perp"),
+                        score=opp.get("score", 0),
+                        funding_rate=opp.get("funding_rate", 0) or opp.get("rate_differential", 0),
+                        apr=opp.get("apr", 0),
+                        volume_24h=opp.get("volume_24h", 0) or 0,
+                        z_score=indicators.get("z_score", 0) if isinstance(indicators, dict) else 0,
+                        momentum_signal=indicators.get("momentum_signal", "flat") if isinstance(indicators, dict) else "flat",
+                        scan_number=scan_count,
+                        captured_at=now,
+                    ))
+
+                if rows:
+                    db.session.add_all(rows)
+                    db.session.commit()
+
+                # Rolling window cleanup: every 10 scans, trim old entries
+                if scan_count % 10 == 0:
+                    self._trim_score_snapshots(db, ScoreSnapshot)
+
+                log.info(f"Stored {len(rows)} score snapshots")
+
+        except Exception as e:
+            log.warning(f"Score snapshot storage failed (non-critical): {e}")
+
+    def _trim_score_snapshots(self, db, ScoreSnapshot):
+        """Keep only the most recent MAX_SCORE_HISTORY entries per pair."""
+        try:
+            from sqlalchemy import func, text
+
+            # Find pairs that exceed the limit
+            pairs = db.session.query(
+                ScoreSnapshot.symbol,
+                ScoreSnapshot.exchange,
+                func.count(ScoreSnapshot.id).label("cnt")
+            ).group_by(
+                ScoreSnapshot.symbol, ScoreSnapshot.exchange
+            ).having(
+                func.count(ScoreSnapshot.id) > self.MAX_SCORE_HISTORY
+            ).all()
+
+            total_deleted = 0
+            for symbol, exchange, cnt in pairs:
+                excess = cnt - self.MAX_SCORE_HISTORY
+                # Delete oldest entries for this pair
+                oldest_ids = db.session.query(ScoreSnapshot.id).filter(
+                    ScoreSnapshot.symbol == symbol,
+                    ScoreSnapshot.exchange == exchange,
+                ).order_by(
+                    ScoreSnapshot.captured_at.asc()
+                ).limit(excess).subquery()
+
+                deleted = ScoreSnapshot.query.filter(
+                    ScoreSnapshot.id.in_(oldest_ids)
+                ).delete(synchronize_session=False)
+                total_deleted += deleted
+
+            if total_deleted:
+                db.session.commit()
+                log.info(f"Trimmed {total_deleted} old score snapshots")
+
+        except Exception as e:
+            log.warning(f"Score snapshot trim failed: {e}")
 
     # ── Data helpers ──────────────────────────────────────────
 

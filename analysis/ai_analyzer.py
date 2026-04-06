@@ -11,18 +11,16 @@ MAX_OPPS = 10
 TIMEOUT = 15
 
 SYSTEM_PROMPT = (
-    "Eres un analista experto en arbitraje de funding rates de criptomonedas. "
-    "Analiza cada oportunidad y responde SOLO con un objeto JSON valido:\n"
-    '{"analyses":[{"id":"_id de la oportunidad","signal":"COMPRAR|MANTENER|EVITAR",'
-    '"confidence":1-10,"analysis":"2-3 oraciones en espanol"}]}\n\n'
-    "Criterios:\n"
-    "- COMPRAR: score alto (>65), momentum positivo/estable, break-even razonable (<8h), "
-    "volumen saludable, sin z-score extremo.\n"
-    "- EVITAR: z_score extremo (>2.5), momentum negativo, fees altos vs ganancia, "
-    "volumen muy bajo, spike terminando (reversion).\n"
-    "- MANTENER: condiciones mixtas, requiere vigilancia.\n\n"
-    "Se breve y directo. Enfocate en: momento de entrada, riesgo principal, "
-    "y tiempo sugerido de hold. No repitas los numeros, interpreta."
+    "Analista de arbitraje de funding rates. Responde SOLO JSON:\n"
+    '{"analyses":[{"id":"_id","signal":"COMPRAR|MANTENER|EVITAR",'
+    '"confidence":1-10,"analysis":"max 15 palabras"}]}\n\n'
+    "Reglas de decision:\n"
+    "COMPRAR: sc>60 + mom!=negative + beh<10h + vol>5M + z<1.5\n"
+    "EVITAR: z>2.0 | mom=negative | rev=true | vol<2M | beh>15h\n"
+    "MANTENER: no cumple COMPRAR ni EVITAR\n"
+    "IMPORTANTE: z>2.5 es MUY peligroso (tasa insostenible, reversion inminente)\n\n"
+    "En analysis: di QUE HACER y POR QUE en max 15 palabras. "
+    "Ej: 'Entrar ahora, momentum fuerte y fees se recuperan en 3h'"
 )
 
 
@@ -36,11 +34,8 @@ def _slim_opp(opp: dict) -> dict:
         "sym": opp.get("symbol", ""),
         "mode": "cross" if is_cross else "sp",
         "sc": opp.get("score", 0),
-        "gr": opp.get("stability_grade", "?"),
-        "apr": round(opp.get("apr", 0), 1),
+        "apr": round(opp.get("apr", 0)),
         "beh": round(opp.get("break_even_hours", 0), 1),
-        "hold": opp.get("estimated_hold_days", "?"),
-        "fees": round(opp.get("fees_total", 0) or opp.get("total_fees", 0) or 0, 2),
         "d1k": round(opp.get("daily_income_per_1000", 0), 2),
         "n3d": round(opp.get("net_3d_revenue_per_1000", 0), 2),
         "vol": round((opp.get("volume_24h", 0) or 0) / 1e6, 1),
@@ -51,15 +46,16 @@ def _slim_opp(opp: dict) -> dict:
     else:
         slim["fr"] = round((opp.get("funding_rate", 0) or 0) * 100, 4)
 
+    # Indicadores aplanados — sin dict anidado para ahorrar tokens
     if ind:
-        slim["ind"] = {
-            "mom": ind.get("momentum_signal", "flat"),
-            "z": round(ind.get("z_score", 0), 1),
-            "pct": round(ind.get("percentile", 0)),
-            "reg": ind.get("regime", "normal"),
-            "spike": ind.get("is_spike_incoming", False),
-            "rev": ind.get("is_spike_ending", False),
-        }
+        slim["mom"] = ind.get("momentum_signal", "flat")
+        slim["z"] = round(ind.get("z_score", 0), 1)
+        slim["pct"] = round(ind.get("percentile", 0))
+        slim["reg"] = ind.get("regime", "normal")
+        if ind.get("is_spike_incoming"):
+            slim["spike"] = True
+        if ind.get("is_spike_ending"):
+            slim["rev"] = True
 
     return slim
 
@@ -77,13 +73,11 @@ def _build_messages(opps: list) -> list:
     ]
 
 
-def _parse_response(text: str) -> dict:
-    """Parse Groq response into {opp_id: analysis_dict} map."""
-    # Try direct JSON parse
+def _parse_ai_response(text: str, valid_signals: tuple, default_signal: str) -> dict:
+    """Parse Groq JSON response into {id: {signal, confidence, analysis}} map."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        # Try extracting JSON from markdown code fence
         m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
         if m:
             try:
@@ -99,16 +93,16 @@ def _parse_response(text: str) -> dict:
 
     result = {}
     for a in analyses:
-        opp_id = a.get("id", "")
-        if not opp_id:
+        aid = str(a.get("id", ""))
+        if not aid:
             continue
-        signal = a.get("signal", "MANTENER").upper()
-        if signal not in ("COMPRAR", "MANTENER", "EVITAR"):
-            signal = "MANTENER"
-        result[opp_id] = {
+        signal = a.get("signal", default_signal).upper()
+        if signal not in valid_signals:
+            signal = default_signal
+        result[aid] = {
             "signal": signal,
             "confidence": max(1, min(10, int(a.get("confidence", 5)))),
-            "analysis": str(a.get("analysis", ""))[:500],
+            "analysis": str(a.get("analysis", ""))[:200],
         }
 
     return result
@@ -139,13 +133,15 @@ def analyze_top_opportunities(opportunities: list, config, top_n: int = MAX_OPPS
             model=GROQ_MODEL,
             messages=messages,
             response_format={"type": "json_object"},
-            temperature=0.3,
-            max_tokens=1500,
+            temperature=0.2,
+            max_tokens=1200,
             timeout=TIMEOUT,
         )
 
         raw = resp.choices[0].message.content or ""
-        analysis_map = _parse_response(raw)
+        analysis_map = _parse_ai_response(
+            raw, ("COMPRAR", "MANTENER", "EVITAR"), "MANTENER"
+        )
 
         if analysis_map:
             for opp in opportunities:
@@ -166,28 +162,29 @@ def analyze_top_opportunities(opportunities: list, config, top_n: int = MAX_OPPS
 # ── Position Analysis ─────────────────────────────────────────
 
 POSITION_SYSTEM_PROMPT = (
-    "Eres un analista experto en arbitraje de funding rates. "
-    "Evalua posiciones ACTIVAS y responde SOLO con JSON valido:\n"
-    '{"analyses":[{"id":"id de la posicion","signal":"MANTENER|CERRAR|VIGILAR",'
-    '"confidence":1-10,"analysis":"1-2 oraciones en espanol"}]}\n\n'
-    "Criterios:\n"
-    "- MANTENER: FR actual sigue favorable, APR positivo, sin reversion.\n"
-    "- CERRAR: FR se revirtio o tiende a 0, APR negativo, ya cobro suficiente.\n"
-    "- VIGILAR: FR bajando pero aun positivo, posible reversion pronto.\n\n"
-    "Se ultra breve. Enfocate en: tendencia del FR, riesgo de reversion, "
-    "y si conviene seguir o salir ahora."
+    "Evalua posiciones de arbitraje de funding rates. Responde SOLO JSON:\n"
+    '{"analyses":[{"id":"id","signal":"MANTENER|CERRAR|VIGILAR",'
+    '"confidence":1-10,"analysis":"max 15 palabras"}]}\n\n'
+    "Reglas:\n"
+    "CERRAR: rev=true | cfr~0 | apr<0 | (cfr<efr/3 y h>48)\n"
+    "VIGILAR: cfr<efr/2 | apr cayendo | lr muestra tendencia a baja\n"
+    "MANTENER: cfr estable o subiendo, apr>0, sin reversion\n\n"
+    "En analysis: ACCION CONCRETA y razon. "
+    "Ej: 'Cerrar ya, FR revertido hace 2 pagos' o 'Mantener, FR estable y APR 45%'"
 )
 
 
 def _slim_position(pos: dict) -> dict:
     """Ultra-compact position data for AI — minimal tokens."""
     payments = pos.get("payments") or []
-    # Only last 2 rates for trend direction
-    recent = [round(p["rate"] * 100, 4) for p in payments[-2:]] if payments else []
+    # Last 3 rates for better trend detection
+    recent = [round(p["rate"] * 100, 4) for p in payments[-3:]] if payments else []
 
     return {
         "id": str(pos.get("id", "")),
         "sym": pos.get("symbol", ""),
+        "mode": "cross" if pos.get("mode") == "cross_exchange" else "sp",
+        "cap": round(pos.get("capital_used", 0) or 0),
         "efr": round((pos.get("entry_fr", 0) or 0) * 100, 4),
         "cfr": round((pos.get("current_fr", 0) or 0) * 100, 4),
         "apr": round(pos.get("current_apr", 0) or 0, 1),
@@ -225,13 +222,15 @@ def analyze_positions(positions: list, config) -> dict:
             model=GROQ_MODEL,
             messages=messages,
             response_format={"type": "json_object"},
-            temperature=0.3,
-            max_tokens=1000,
+            temperature=0.2,
+            max_tokens=800,
             timeout=TIMEOUT,
         )
 
         raw = resp.choices[0].message.content or ""
-        result = _parse_position_response(raw)
+        result = _parse_ai_response(
+            raw, ("MANTENER", "CERRAR", "VIGILAR"), "VIGILAR"
+        )
         log.info(f"Position AI: {len(result)}/{len(positions)} analyzed")
         return result
 
@@ -240,36 +239,3 @@ def analyze_positions(positions: list, config) -> dict:
         return {}
 
 
-def _parse_position_response(text: str) -> dict:
-    """Parse Groq response into {pos_id: analysis_dict} map."""
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if m:
-            try:
-                data = json.loads(m.group(1))
-            except json.JSONDecodeError:
-                return {}
-        else:
-            return {}
-
-    analyses = data.get("analyses", [])
-    if not isinstance(analyses, list):
-        return {}
-
-    result = {}
-    for a in analyses:
-        pos_id = str(a.get("id", ""))
-        if not pos_id:
-            continue
-        signal = a.get("signal", "VIGILAR").upper()
-        if signal not in ("MANTENER", "CERRAR", "VIGILAR"):
-            signal = "VIGILAR"
-        result[pos_id] = {
-            "signal": signal,
-            "confidence": max(1, min(10, int(a.get("confidence", 5)))),
-            "analysis": str(a.get("analysis", ""))[:500],
-        }
-
-    return result

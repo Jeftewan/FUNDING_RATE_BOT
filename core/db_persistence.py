@@ -221,3 +221,120 @@ class DBPersistence:
             "reason": h.reason,
             "closed_at": h.closed_at.isoformat() if h.closed_at else "",
         }
+
+    def get_score_trend(self, symbol: str, exchange: str, limit: int = 10) -> dict:
+        """Get score trend for a symbol+exchange pair.
+
+        Returns:
+          - scores: list of recent scores (oldest first)
+          - trend: 'rising', 'falling', 'stable', 'new'
+          - avg_score: average score over history
+          - delta: score change (latest - oldest)
+          - count: number of data points
+        """
+        from core.db_models import ScoreSnapshot
+
+        snapshots = ScoreSnapshot.query.filter_by(
+            symbol=symbol, exchange=exchange
+        ).order_by(
+            ScoreSnapshot.captured_at.desc()
+        ).limit(limit).all()
+
+        if not snapshots:
+            return {"scores": [], "trend": "new", "avg_score": 0, "delta": 0, "count": 0}
+
+        # Reverse to chronological order (oldest first)
+        snapshots.reverse()
+        scores = [s.score for s in snapshots]
+        avg_score = sum(scores) / len(scores)
+
+        if len(scores) < 3:
+            trend = "new"
+            delta = 0
+        else:
+            delta = scores[-1] - scores[0]
+            # Compare recent half vs older half
+            mid = len(scores) // 2
+            older_avg = sum(scores[:mid]) / mid
+            recent_avg = sum(scores[mid:]) / (len(scores) - mid)
+            diff = recent_avg - older_avg
+
+            if diff > 3:
+                trend = "rising"
+            elif diff < -3:
+                trend = "falling"
+            else:
+                trend = "stable"
+
+        return {
+            "scores": scores,
+            "trend": trend,
+            "avg_score": round(avg_score, 1),
+            "delta": delta,
+            "count": len(scores),
+        }
+
+    def get_score_trends_batch(self, pairs: list, limit: int = 10) -> dict:
+        """Get score trends for multiple symbol+exchange pairs at once.
+
+        Args:
+            pairs: list of (symbol, exchange) tuples
+        Returns:
+            dict keyed by "symbol_exchange" with trend info
+        """
+        from core.db_models import ScoreSnapshot
+        from sqlalchemy import or_, and_
+
+        if not pairs:
+            return {}
+
+        # Fetch all relevant snapshots in one query
+        conditions = [
+            and_(ScoreSnapshot.symbol == sym, ScoreSnapshot.exchange == ex)
+            for sym, ex in pairs
+        ]
+        all_snapshots = ScoreSnapshot.query.filter(
+            or_(*conditions)
+        ).order_by(
+            ScoreSnapshot.captured_at.desc()
+        ).all()
+
+        # Group by symbol+exchange
+        grouped = {}
+        for s in all_snapshots:
+            key = f"{s.symbol}_{s.exchange}"
+            grouped.setdefault(key, []).append(s)
+
+        results = {}
+        for key, snapshots in grouped.items():
+            # Keep only most recent `limit` and reverse to chronological
+            snapshots = snapshots[:limit]
+            snapshots.reverse()
+            scores = [s.score for s in snapshots]
+            avg_score = sum(scores) / len(scores)
+
+            if len(scores) < 3:
+                trend = "new"
+                delta = 0
+            else:
+                delta = scores[-1] - scores[0]
+                mid = len(scores) // 2
+                older_avg = sum(scores[:mid]) / mid
+                recent_avg = sum(scores[mid:]) / (len(scores) - mid)
+                diff = recent_avg - older_avg
+                if diff > 3:
+                    trend = "rising"
+                elif diff < -3:
+                    trend = "falling"
+                else:
+                    trend = "stable"
+
+            results[key] = {
+                "scores": scores,
+                "trend": trend,
+                "avg_score": round(avg_score, 1),
+                "delta": delta,
+                "count": len(scores),
+            }
+
+        return results
