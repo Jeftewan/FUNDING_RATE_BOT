@@ -15,9 +15,10 @@ SYSTEM_PROMPT = (
     '{"analyses":[{"id":"_id","signal":"COMPRAR|MANTENER|EVITAR",'
     '"confidence":1-10,"analysis":"max 15 palabras"}]}\n\n'
     "Reglas de decision:\n"
-    "COMPRAR: sc>60 + mom!=negative + beh<10h + vol>5M + z<2.0\n"
-    "EVITAR: z>2.5 | mom=negative | rev=true | vol<2M | beh>15h\n"
-    "MANTENER: no cumple COMPRAR ni EVITAR\n\n"
+    "COMPRAR: sc>60 + mom!=negative + beh<10h + vol>5M + z<1.5\n"
+    "EVITAR: z>2.0 | mom=negative | rev=true | vol<2M | beh>15h\n"
+    "MANTENER: no cumple COMPRAR ni EVITAR\n"
+    "IMPORTANTE: z>2.5 es MUY peligroso (tasa insostenible, reversion inminente)\n\n"
     "En analysis: di QUE HACER y POR QUE en max 15 palabras. "
     "Ej: 'Entrar ahora, momentum fuerte y fees se recuperan en 3h'"
 )

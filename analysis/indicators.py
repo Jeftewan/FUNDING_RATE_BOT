@@ -109,14 +109,20 @@ def z_score(current_rate: float, rates: list) -> dict:
 
     z = (abs_current - mean) / std
 
-    if z > 2.5:
+    if z > 3.0:
         risk = "extreme"
-        penalty = -5
+        penalty = -10
+    elif z > 2.5:
+        risk = "very_high"
+        penalty = -7
     elif z > 2.0:
         risk = "high"
-        penalty = -3
+        penalty = -4
     elif z > 1.5:
         risk = "elevated"
+        penalty = -2
+    elif z > 1.0:
+        risk = "slightly_elevated"
         penalty = -1
     else:
         risk = "normal"
@@ -283,6 +289,6 @@ def compute_all_indicators(current_rate: float, rates: list) -> dict:
         "total_new_points": total_new_points,
         # Summary flags for frontend
         "is_spike_incoming": mom["signal"] == "accelerating" and zscore["risk"] == "normal",
-        "is_spike_ending": mom["signal"] == "decelerating" or zscore["risk"] in ("extreme", "high"),
+        "is_spike_ending": mom["signal"] == "decelerating" or zscore["risk"] in ("extreme", "very_high", "high"),
         "is_bonanza": regime["regime"] == "high_vol" and mom["points"] >= 4,
     }

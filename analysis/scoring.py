@@ -1,20 +1,20 @@
-"""Opportunity scoring v10.0 — enhanced with predictive indicators.
+"""Opportunity scoring v10.1 — stronger mean-reversion protection.
 
 Unified formula for spot-perp and cross-exchange opportunities.
-v10 adds: momentum, z-score mean-reversion, rate percentile,
-volatility regime detection, and acceleration bonus.
+v10.1: increased mean-reversion penalty (-10 max), rebalanced
+stability/consistency weights for better sustainability prediction.
 
 Dimensions (max 100 pts):
-  1. Stability      (25 pts) — CV + min_ratio
-  2. Consistency     (20 pts) — streak + favorable %
+  1. Stability      (22 pts) — CV + min_ratio (reduced from 25)
+  2. Consistency     (23 pts) — streak + favorable % (increased from 20)
   3. Liquidity       (15 pts) — 24h volume
-  4. Yield           (15 pts) — settlement-based (reduced from 20)
+  4. Yield           (15 pts) — settlement-based
   5. Fee Efficiency  (10 pts) — fee_drag ratio
   6. Momentum         (8 pts) — ROC + EMA ratio + acceleration
   7. Rate Percentile  (5 pts) — current vs historical range
   8. Volatility Regime(5 pts) — recent vs overall stddev
   9. Acceleration     (2 pts) — linear slope bonus
- 10. Mean Reversion  (-5 pts) — z-score penalty for unsustainable rates
+ 10. Mean Reversion (-10 pts) — z-score penalty (strengthened from -5)
 """
 import math
 from analysis.indicators import compute_all_indicators
@@ -53,33 +53,33 @@ def opportunity_score(params: dict) -> int:
     current_rate = abs(params.get("current_rate", 0))
     rates = params.get("rates", [])
 
-    # ── 1. ESTABILIDAD (25 pts) ──────────────────────────────────
+    # ── 1. ESTABILIDAD (22 pts) ──────────────────────────────────
     if cv < 0.2 and min_ratio > 0.5:
-        sc += 25
+        sc += 22
     elif cv < 0.3 and min_ratio > 0.3:
-        sc += 21
+        sc += 18
     elif cv < 0.3:
-        sc += 17
+        sc += 15
     elif cv < 0.5:
-        sc += 12
+        sc += 10
     elif cv < 0.8:
-        sc += 7
+        sc += 6
     elif cv < 1.2:
         sc += 3
     else:
         sc += 1
 
-    # ── 2. CONSISTENCIA (20 pts) ─────────────────────────────────
+    # ── 2. CONSISTENCIA (23 pts) ─────────────────────────────────
     if streak >= 12 and pct >= 90:
-        sc += 20
+        sc += 23
     elif streak >= 8 and pct >= 85:
-        sc += 17
+        sc += 19
     elif streak >= 5 and pct >= 80:
-        sc += 14
+        sc += 15
     elif streak >= 3 and pct >= 70:
-        sc += 11
+        sc += 12
     elif pct >= 60:
-        sc += 7
+        sc += 8
     else:
         sc += 2
 
