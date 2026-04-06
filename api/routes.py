@@ -154,6 +154,25 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                         o["mins_to_next"] = max(0, (nts / 1000 - now) / 60)
                     filtered.append(o)
 
+            # Enrich with score trends if DB is available
+            if db_enabled and filtered:
+                try:
+                    pairs = [
+                        (o.get("symbol", ""),
+                         o.get("exchange", o.get("short_exchange", "")))
+                        for o in filtered
+                    ]
+                    trends = db_persistence.get_score_trends_batch(pairs)
+                    for o in filtered:
+                        key = f"{o.get('symbol', '')}_{o.get('exchange', o.get('short_exchange', ''))}"
+                        trend_data = trends.get(key)
+                        if trend_data:
+                            o["score_trend"] = trend_data["trend"]
+                            o["score_avg"] = trend_data["avg_score"]
+                            o["score_delta"] = trend_data["delta"]
+                except Exception:
+                    pass  # Non-critical: don't break opportunity listing
+
             return jsonify({
                 "opportunities": filtered,
                 "total_unfiltered": len(opps),
@@ -716,6 +735,18 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             })
         except Exception as e:
             return jsonify({"rates": [], "timestamps": [], "avg": 0, "error": str(e)})
+
+    # ── Score History ──────────────────────────────────────────
+    @app.route("/api/score_history/<symbol>/<exchange>")
+    def api_score_history(symbol, exchange):
+        """Get score evolution for a symbol+exchange pair."""
+        if not db_enabled:
+            return jsonify({"error": "DB not enabled"}), 400
+        try:
+            trend = db_persistence.get_score_trend(symbol, exchange)
+            return jsonify(trend)
+        except Exception as e:
+            return jsonify({"scores": [], "trend": "new", "error": str(e)})
 
     # ── Account & Exchange Keys (SaaS mode) ─────────────────
     if db_enabled:
