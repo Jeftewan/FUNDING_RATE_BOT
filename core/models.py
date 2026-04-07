@@ -104,6 +104,12 @@ class SpotPerpOpportunity:
             "stability_grade": self.stability_grade,
             "estimated_hold_days": self.estimated_hold_days,
         }
+        if self.history:
+            d["history"] = {
+                "pct": self.history.get("pct", 0),
+                "streak": self.history.get("streak", 0),
+                "fee_drag": self.history.get("fee_drag", 0),
+            }
         if self.indicators:
             d["indicators"] = {
                 "momentum_signal": self.indicators.get("momentum", {}).get("signal", ""),
@@ -148,6 +154,7 @@ class CrossExchangeOpportunity:
     stability_grade: str = "D"
     estimated_hold_days: int = 0
     volume_24h: float = 0
+    history: dict = field(default_factory=dict)
     indicators: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -180,6 +187,12 @@ class CrossExchangeOpportunity:
             "estimated_hold_days": self.estimated_hold_days,
             "volume_24h": self.volume_24h,
         }
+        if self.history:
+            d["history"] = {
+                "pct": self.history.get("consistency_pct", self.history.get("pct", 0)),
+                "streak": self.history.get("streak", 0),
+                "fee_drag": self.history.get("fee_drag", 0),
+            }
         if self.indicators:
             d["indicators"] = {
                 "momentum_signal": self.indicators.get("momentum", {}).get("signal", ""),
