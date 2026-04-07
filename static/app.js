@@ -853,10 +853,11 @@ let _lastHistoryData = [];
 
 function exportCSV() {
   if (!_lastHistoryData.length) { showToast('Sin historial para exportar', 'warning'); return; }
-  const headers = ['Simbolo','Exchange','Modo','Capital','Horas','Pagos','Ganancia','Fees','Neto','Tasa Promedio','Razon','Fecha Cierre'];
+  const headers = ['Simbolo','Exchange','Modo','Capital','Exposicion','Apalancamiento','Horas','Pagos','Ganancia','Fees','Neto','Tasa Promedio','Razon','Fecha Cierre'];
   const rows = _lastHistoryData.map(h => [
     h.symbol, h.exchange, h.mode || 'spot_perp',
-    h.capital_used?.toFixed(2) || '', h.hours?.toFixed(1) || '',
+    h.capital_used?.toFixed(2) || '', h.exposure?.toFixed(2) || '', h.leverage || '1',
+    h.hours?.toFixed(1) || '',
     h.payment_count || h.intervals || '', h.earned?.toFixed(4) || '',
     h.fees?.toFixed(4) || '', (h.net_earned || h.earned)?.toFixed(4) || '',
     h.avg_rate ? (h.avg_rate * 100).toFixed(4) + '%' : '',
@@ -888,7 +889,7 @@ function renderHistory(data) {
     return `
     <div class="hist-item">
       <span>${h.symbol} (${h.exchange}) — ${h.mode || 'spot_perp'}</span>
-      <span>${h.hours?.toFixed(1)}h | ${h.payment_count || h.intervals} pagos</span>
+      <span>${h.hours?.toFixed(1)}h | ${h.payment_count || h.intervals} pagos | $${h.exposure?.toFixed(0) || '?'} exp${h.leverage > 1 ? ' ('+h.leverage+'x)' : ''}</span>
       <span style="color:${netColor}">$${(h.net_earned || h.earned)?.toFixed(2)}</span>
       <span style="color:#555">${h.closed_at ? h.closed_at.split('T')[0] : h.time?.split('T')[0] || ''}</span>
     </div>`;

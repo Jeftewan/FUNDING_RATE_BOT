@@ -165,10 +165,20 @@ POSITION_SYSTEM_PROMPT = (
     "Evalua posiciones de arbitraje de funding rates. Responde SOLO JSON:\n"
     '{"analyses":[{"id":"id","signal":"MANTENER|CERRAR|VIGILAR",'
     '"confidence":1-10,"analysis":"max 15 palabras"}]}\n\n'
+    "Campos: efr=entry FR, cfr=current FR, ar=avg rate historico, apr=APR actual, "
+    "h=horas abierta, pc=pagos recibidos, rev=FR revertido, lr=ultimas 3 tasas, net=ganancia neta\n\n"
     "Reglas:\n"
-    "CERRAR: rev=true | cfr~0 | apr<0 | (cfr<efr/3 y h>48)\n"
-    "VIGILAR: cfr<efr/2 | apr cayendo | lr muestra tendencia a baja\n"
-    "MANTENER: cfr estable o subiendo, apr>0, sin reversion\n\n"
+    "CERRAR: rev=true | cfr~0 | apr<0 | (cfr<efr/3 y h>48) | (h>144 y cfr<ar/2)\n"
+    "VIGILAR: cfr<efr/2 | apr cayendo | lr tendencia baja | (cfr<ar y h>72) | (h>144 y cfr<ar)\n"
+    "MANTENER: cfr estable o subiendo, apr>0, sin reversion, cfr>=ar\n\n"
+    "Contexto tiempo:\n"
+    "- pc<3: datos insuficientes, NO usar ar para decidir\n"
+    "- h>144 (6d): escrutinio alto, exigir cfr>=ar para MANTENER\n"
+    "- h>288 (12d): considerar CERRAR salvo apr excelente y cfr>=ar\n\n"
+    "Contexto ar vs cfr:\n"
+    "- cfr < ar*0.5: deterioro claro, VIGILAR o CERRAR\n"
+    "- cfr >= ar: posicion sana\n"
+    "- ar < efr/2: posicion historicamente debil aunque cfr suba\n\n"
     "En analysis: ACCION CONCRETA y razon. "
     "Ej: 'Cerrar ya, FR revertido hace 2 pagos' o 'Mantener, FR estable y APR 45%'"
 )
@@ -187,6 +197,8 @@ def _slim_position(pos: dict) -> dict:
         "cap": round(pos.get("capital_used", 0) or 0),
         "efr": round((pos.get("entry_fr", 0) or 0) * 100, 4),
         "cfr": round((pos.get("current_fr", 0) or 0) * 100, 4),
+        "ar": round((pos.get("avg_rate", 0) or 0) * 100, 4),
+        "pc": pos.get("payment_count", 0) or 0,
         "apr": round(pos.get("current_apr", 0) or 0, 1),
         "net": round(pos.get("net_earned", 0) or 0, 2),
         "h": round(pos.get("elapsed_h", 0) or 0, 1),
