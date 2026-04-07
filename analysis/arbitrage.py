@@ -94,6 +94,7 @@ class ArbitrageScanner:
         # Fee drag
         gross_3d_usd = NOTIONAL * abs(accumulated_3d) if abs(accumulated_3d) > 0 else 1
         fee_drag = fees["total_cost"] / gross_3d_usd
+        hist_dict["fee_drag"] = fee_drag
 
         score_params = {
             "cv": cv,
@@ -253,6 +254,7 @@ class ArbitrageScanner:
             )
 
         fee_ratio = fees["total_cost"] / revenue_3d_usd if revenue_3d_usd > 0 else 1
+        diff_hist["fee_drag"] = fee_ratio
         diff_series = diff_hist.get("diff_series", [])
 
         # Settlement-based yield: avg of historical daily differentials
@@ -320,6 +322,7 @@ class ArbitrageScanner:
             stability_grade=grade,
             estimated_hold_days=est_days,
             volume_24h=max(long_fr.volume_24h, short_fr.volume_24h),
+            history=diff_hist,
             indicators=cross_score_params.get("_indicators", {}),
         )
 
