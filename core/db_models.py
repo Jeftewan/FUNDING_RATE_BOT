@@ -113,6 +113,8 @@ class UserHistory(db.Model):
     exchange = db.Column(db.String(50), default="")
     mode = db.Column(db.String(20), default="spot_perp")
     capital_used = db.Column(db.Float, default=0)
+    exposure = db.Column(db.Float, default=0)
+    leverage = db.Column(db.Integer, default=1)
     hours = db.Column(db.Float, default=0)
     payment_count = db.Column(db.Integer, default=0)
     earned = db.Column(db.Float, default=0)

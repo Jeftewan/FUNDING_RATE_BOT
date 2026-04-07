@@ -106,6 +106,8 @@ class EmailNotifier:
             lines.append("\n🟡 Considerar cerrar posicion")
         elif alert_type == "PRE_PAYMENT_UNFAVORABLE":
             lines.append("\n🟡 Tasa desfavorable antes del pago")
+        elif alert_type == "SL_TP_REVIEW":
+            lines.append("\n🔵 *REVISAR STOP LOSS / TAKE PROFIT*")
         elif alert_type == "POSITION_CLOSED":
             lines.append("\n🟢 Posicion cerrada")
 

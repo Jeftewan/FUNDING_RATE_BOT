@@ -55,6 +55,9 @@ def _run_migrations(db):
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS exposure FLOAT DEFAULT 0",
         # Backfill exposure for existing positions (1x leverage: exposure = capital/2)
         "UPDATE user_positions SET exposure = capital_used / 2 WHERE exposure = 0 OR exposure IS NULL",
+        # History: add exposure and leverage columns
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS exposure FLOAT DEFAULT 0",
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS leverage INTEGER DEFAULT 1",
     ]
     for sql in migrations:
         try:

@@ -43,6 +43,7 @@ class ScannerWorker:
         self._scanned_events = set()
         self._notified_alerts = set()
         self._pending_refreshes = {}
+        self._sl_tp_review_sent = {}  # {position_id: last_sent_timestamp}
         self._db_persist = None  # Lazy-init DBPersistence
 
     def start(self):
@@ -274,6 +275,7 @@ class ScannerWorker:
                 self._refresh_mins_next(all_data, time.time(), defi_data)
                 updated_positions = self._update_earnings_db(positions, combined)
                 alerts = self._check_alerts_db(positions, combined)
+                alerts.extend(self._check_sl_tp_reviews(positions))
                 s["alerts"] = alerts
 
                 if not alerts and int(now) % 300 < 35:
@@ -989,6 +991,54 @@ class ScannerWorker:
         if stale:
             log.info(f"Alert conditions cleared: {stale}")
             self._notified_alerts -= stale
+
+        return alerts
+
+    def _check_sl_tp_reviews(self, positions: list) -> list:
+        """Generate SL_TP_REVIEW alerts for positions open > 144h, every 144h."""
+        SL_TP_REVIEW_INTERVAL = 144 * 3600  # 144 hours in seconds
+        alerts = []
+        now = time.time()
+
+        for pos in positions:
+            pos_id = str(pos.get("id", ""))
+            entry_time_s = (pos.get("entry_time", 0) or 0) / 1000
+            if entry_time_s <= 0:
+                continue
+
+            elapsed_s = now - entry_time_s
+            if elapsed_s < SL_TP_REVIEW_INTERVAL:
+                continue
+
+            last_sent = self._sl_tp_review_sent.get(pos_id, 0)
+            if now - last_sent < SL_TP_REVIEW_INTERVAL:
+                continue
+
+            elapsed_h = elapsed_s / 3600
+            sym = pos.get("symbol", "???")
+            ex = pos.get("exchange", "")
+            if pos.get("mode") == "cross_exchange":
+                ex = f"{pos.get('short_exchange', '')}/{pos.get('long_exchange', '')}"
+            earned = pos.get("earned_real", 0) or 0
+
+            alerts.append({
+                "type": "SL_TP_REVIEW",
+                "severity": "WARNING",
+                "symbol": sym,
+                "exchange": ex,
+                "user_id": pos.get("user_id"),
+                "message": (
+                    f"Posicion abierta {elapsed_h:.0f}h ({elapsed_h/24:.0f} dias) "
+                    f"— revisar SL/TP. Ganancia acum: ${earned:.2f}"
+                ),
+            })
+            self._sl_tp_review_sent[pos_id] = now
+
+        # Cleanup: remove entries for positions no longer active
+        active_ids = {str(p.get("id", "")) for p in positions}
+        stale = [k for k in self._sl_tp_review_sent if k not in active_ids]
+        for k in stale:
+            del self._sl_tp_review_sent[k]
 
         return alerts
 
