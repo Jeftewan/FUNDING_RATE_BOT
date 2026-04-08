@@ -919,7 +919,7 @@ class ScannerWorker:
     def _check_alerts_db(self, positions: list, all_data: list) -> list:
         """Check DB-loaded positions for alerts. Same logic as _check_alerts."""
         alerts = []
-        alert_mins = 5  # default
+        alert_mins = self.state_manager.get("alert_minutes_before", 5)
         active_keys = set()
 
         for i, pos in enumerate(positions):

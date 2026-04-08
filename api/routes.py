@@ -144,10 +144,15 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             min_score = s.get("min_score", 40)
             now = time.time()
 
+            min_stability_days = s.get("min_stability_days", 3)
+
             opps = s.get("opportunities", [])
             filtered = []
             for o in opps:
-                if o.get("apr", 0) >= min_apr and o.get("score", 0) >= min_score:
+                hold_days = o.get("estimated_hold_days", 0)
+                if (o.get("apr", 0) >= min_apr
+                        and o.get("score", 0) >= min_score
+                        and hold_days >= min_stability_days):
                     # Recalculate mins_to_next live
                     nts = o.get("next_funding_ts", 0)
                     if nts and nts > 0:

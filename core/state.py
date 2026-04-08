@@ -34,12 +34,15 @@ class StateManager:
             "wa_phone": "",
             "wa_apikey": "",
 
-            # --- Legacy fields kept for scanner min_volume reads ---
+            # --- Configuración editable (defaults, overridden by DB) ---
             "total_capital": 1000,
             "scan_interval": 300,
             "min_volume": 1_000_000,
             "min_apr": 10,
             "min_score": 40,
+            "min_stability_days": 3,
+            "max_positions": 5,
+            "alert_minutes_before": 5,
         }
 
     def load(self) -> None:
