@@ -297,13 +297,7 @@ class ScannerWorker:
                     daemon=True
                 ).start()
 
-        # Switch analysis (every 5 minutes, not every tick)
-        if positions and now - self._last_switch_analysis >= 300:
-            self._last_switch_analysis = now
-            try:
-                self._run_switch_analysis(positions, alerts)
-            except Exception as e:
-                log.warning(f"Switch analysis error: {e}")
+        # Switch analysis removed from auto-loop — now on-demand via /api/positions/ai
 
         # Send WhatsApp alerts
         if alerts:
@@ -358,8 +352,10 @@ class ScannerWorker:
                 if nts and nts > 0:
                     d["mins_next"] = max(0, (nts / 1000 - now) / 60)
 
-    def _run_switch_analysis(self, positions: list, alerts: list):
-        """Run switch analysis for active positions against current opportunities."""
+    def run_switch_analysis(self, positions: list, alerts: list = None):
+        """Run switch analysis for active positions against current opportunities.
+        Called on-demand from /api/positions/ai endpoint.
+        """
         from analysis.switch_analyzer import analyze_switch
 
         with self.state_manager.lock:
@@ -385,8 +381,8 @@ class ScannerWorker:
                     )
                     self._switch_results[pos_id] = result
 
-                    # Generate alert if SWITCH recommended
-                    if result["recommendation"] == "SWITCH":
+                    # Generate alert if SWITCH recommended (only if alerts list provided)
+                    if alerts is not None and result["recommendation"] == "SWITCH":
                         best = result.get("best_switch")
                         if best:
                             alert_key = f"SWITCH_{pos.get('symbol')}_{pos_id}"

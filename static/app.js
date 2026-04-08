@@ -700,12 +700,21 @@ async function analyzePositionsAI() {
   if (_posAiLoading) return;
   _posAiLoading = true;
   const btn = document.getElementById('pos-ai-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Analizando...'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Analizando posiciones...'; }
   try {
     const res = await fetch('/api/positions/ai', { method: 'POST' });
     const data = await res.json();
     if (data.ok && data.analyses) {
       _posAiData = data.analyses;
+      // Update switch analysis in cached position data (on-demand results)
+      if (data.switch_results && _lastPosData && _lastPosData.positions) {
+        for (const p of _lastPosData.positions) {
+          const pid = String(p.id || '');
+          if (data.switch_results[pid]) {
+            p.switch_analysis = data.switch_results[pid];
+          }
+        }
+      }
       if (_lastPosData) renderPositions(_lastPosData);
       showToast('Analisis IA completado', 'success');
     } else {
