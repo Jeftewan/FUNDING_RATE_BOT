@@ -243,7 +243,16 @@ POSITION_SYSTEM_PROMPT = (
     "Ejemplo CERRAR: 'FR cayo de 0.02% a 0.003% en ultimos 3 pagos, muy por debajo del promedio (0.015%). "
     "Con 168h abierta el deterioro es claro. Cerrar y reubicar capital en mejor oportunidad.'\n"
     "Ejemplo VIGILAR: 'FR actual (0.01%) esta por debajo del promedio (0.018%) tras 96h. "
-    "Tendencia descendente en lr. Vigilar proximo pago, cerrar si cae bajo 0.005%.'"
+    "Tendencia descendente en lr. Vigilar proximo pago, cerrar si cae bajo 0.005%.'\n\n"
+    "CONTEXTO SWITCHING (si campo sw presente):\n"
+    "- sw.val: valor neto del switch (positivo=beneficio despues de fees)\n"
+    "- sw.beh: horas para recuperar fees del cambio\n"
+    "- sw.rec: recomendacion cuantitativa (SWITCH/CONSIDER/HOLD)\n"
+    "- sw.alt: simbolo de la alternativa recomendada\n"
+    "- sw.apr: APR de la alternativa\n"
+    "Si sw.rec=SWITCH y val>0 y beh<24: recomendar CERRAR con mencion de la alternativa\n"
+    "Si sw.rec=CONSIDER: VIGILAR con mencion de la alternativa como opcion\n"
+    "Si sw.rec=HOLD: ignorar switching, evaluar posicion por sus propios meritos"
 )
 
 
@@ -275,6 +284,21 @@ def _slim_position(pos: dict) -> dict:
         "rev": bool(pos.get("fr_reversed")),
         "lr": recent,
     }
+
+    # Include switch analysis context if available
+    sa = pos.get("switch_analysis")
+    if sa and sa.get("recommendation") != "HOLD":
+        best = sa.get("best_switch")
+        if best:
+            slim["sw"] = {
+                "val": round(best.get("adjusted_switch_value", 0), 2),
+                "beh": round(best.get("break_even_h", 999), 1),
+                "rec": sa["recommendation"],
+                "alt": best.get("symbol", ""),
+                "apr": round(best.get("apr", 0), 1),
+            }
+
+    return slim
 
 
 def analyze_positions(positions: list, config) -> dict:

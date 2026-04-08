@@ -82,6 +82,8 @@ class SpotPerpOpportunity:
     stability_grade: str = "D"
     estimated_hold_days: int = 0
     indicators: dict = field(default_factory=dict)
+    is_exceptional: bool = False
+    exceptional_reasons: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {
@@ -103,6 +105,8 @@ class SpotPerpOpportunity:
             "rsi": self.rsi,
             "stability_grade": self.stability_grade,
             "estimated_hold_days": self.estimated_hold_days,
+            "is_exceptional": self.is_exceptional,
+            "exceptional_reasons": self.exceptional_reasons,
         }
         if self.history:
             d["history"] = {
@@ -156,6 +160,8 @@ class CrossExchangeOpportunity:
     volume_24h: float = 0
     history: dict = field(default_factory=dict)
     indicators: dict = field(default_factory=dict)
+    is_exceptional: bool = False
+    exceptional_reasons: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {
@@ -186,6 +192,8 @@ class CrossExchangeOpportunity:
             "stability_grade": self.stability_grade,
             "estimated_hold_days": self.estimated_hold_days,
             "volume_24h": self.volume_24h,
+            "is_exceptional": self.is_exceptional,
+            "exceptional_reasons": self.exceptional_reasons,
         }
         if self.history:
             d["history"] = {

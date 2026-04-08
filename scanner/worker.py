@@ -14,6 +14,7 @@ import logging
 import threading
 from datetime import datetime
 from analysis.ai_analyzer import analyze_top_opportunities
+from analysis.indicators import detect_exceptional
 
 log = logging.getLogger("bot")
 
@@ -45,6 +46,8 @@ class ScannerWorker:
         self._pending_refreshes = {}
         self._sl_tp_review_sent = {}  # {position_id: last_sent_timestamp}
         self._db_persist = None  # Lazy-init DBPersistence
+        self._last_switch_analysis = 0  # Timestamp of last switch analysis
+        self._switch_results = {}  # {position_id: switch_analysis_result}
 
     def start(self):
         if self._started:
@@ -294,6 +297,14 @@ class ScannerWorker:
                     daemon=True
                 ).start()
 
+        # Switch analysis (every 5 minutes, not every tick)
+        if positions and now - self._last_switch_analysis >= 300:
+            self._last_switch_analysis = now
+            try:
+                self._run_switch_analysis(positions, alerts)
+            except Exception as e:
+                log.warning(f"Switch analysis error: {e}")
+
         # Send WhatsApp alerts
         if alerts:
             log.info(f"Alerts detected: {[a['type'] for a in alerts]}")
@@ -346,6 +357,56 @@ class ScannerWorker:
                 nts = d.get("next_funding_ts", 0)
                 if nts and nts > 0:
                     d["mins_next"] = max(0, (nts / 1000 - now) / 60)
+
+    def _run_switch_analysis(self, positions: list, alerts: list):
+        """Run switch analysis for active positions against current opportunities."""
+        from analysis.switch_analyzer import analyze_switch
+
+        with self.state_manager.lock:
+            s = self.state_manager.state
+            opportunities = s.get("opportunities", []) + s.get("defi_opportunities", [])
+            all_data = s.get("all_data", []) + s.get("defi_data", [])
+
+        if not opportunities:
+            return
+
+        db_persist = None
+        if self._flask_app:
+            with self._flask_app.app_context():
+                db_persist = self._get_db_persist()
+
+                for pos in positions:
+                    pos_id = str(pos.get("id", ""))
+                    if not pos.get("earned_real"):
+                        continue  # Skip positions with no earnings yet
+
+                    result = analyze_switch(
+                        pos, opportunities, all_data, db_persist
+                    )
+                    self._switch_results[pos_id] = result
+
+                    # Generate alert if SWITCH recommended
+                    if result["recommendation"] == "SWITCH":
+                        best = result.get("best_switch")
+                        if best:
+                            alert_key = f"SWITCH_{pos.get('symbol')}_{pos_id}"
+                            if alert_key not in self._notified_alerts:
+                                alerts.append({
+                                    "type": "SWITCH_OPPORTUNITY",
+                                    "severity": "INFO",
+                                    "symbol": pos.get("symbol", ""),
+                                    "exchange": pos.get("exchange", ""),
+                                    "user_id": pos.get("user_id"),
+                                    "message": (
+                                        f"Alternativa superior: {best['symbol']} en {best['exchange']} "
+                                        f"APR {best['apr']:.1f}%. "
+                                        f"Beneficio neto: ${best['adjusted_switch_value']:.2f}. "
+                                        f"Break-even: {best['break_even_h']:.0f}h"
+                                    ),
+                                })
+                                self._notified_alerts.add(alert_key)
+
+                log.info(f"Switch analysis: {len(self._switch_results)} positions analyzed")
 
     def _cleanup_events(self):
         """Remove old scanned events to avoid memory growth."""
@@ -467,6 +528,48 @@ class ScannerWorker:
         except Exception as e:
             log.warning(f"AI analysis skipped: {e}")
 
+        # 6c. Detect exceptional opportunities (top 20 by score, DB required)
+        exceptional_alerts = []
+        if self._flask_app:
+            try:
+                with self._flask_app.app_context():
+                    db_persist = self._get_db_persist()
+                    if db_persist:
+                        for opp in opportunities[:20]:
+                            sym = opp.get("symbol", "")
+                            ex = opp.get("exchange", opp.get("short_exchange", ""))
+                            hist_stats = db_persist.get_historical_stats(sym, ex)
+                            if hist_stats["data_points"] < 10:
+                                continue  # Not enough history
+                            fr = opp.get("funding_rate", opp.get("rate_differential", 0))
+                            exc = detect_exceptional(
+                                current_rate=fr,
+                                rates=hist_stats["rates"],
+                                current_score=opp.get("score", 0),
+                                score_history=hist_stats["score_history"],
+                                current_apr=opp.get("apr", 0),
+                                apr_history=hist_stats["apr_history"],
+                            )
+                            opp["is_exceptional"] = exc["is_exceptional"]
+                            opp["exceptional_reasons"] = exc["reasons"]
+                            if exc["is_exceptional"]:
+                                alert_key = f"EXCEPTIONAL_{sym}_{ex}"
+                                if alert_key not in self._notified_alerts:
+                                    exceptional_alerts.append({
+                                        "type": "EXCEPTIONAL_OPPORTUNITY",
+                                        "severity": "INFO",
+                                        "symbol": sym,
+                                        "exchange": ex,
+                                        "message": (
+                                            f"Oportunidad excepcional: {sym} en {ex}. "
+                                            f"Score {opp.get('score', 0)}, APR {opp.get('apr', 0):.1f}%. "
+                                            + " | ".join(exc["reasons"][:2])
+                                        ),
+                                    })
+                                    self._notified_alerts.add(alert_key)
+            except Exception as e:
+                log.warning(f"Exceptional detection skipped: {e}")
+
         # 7. Update state (BEFORE snapshot storage — snapshots are slow and non-critical)
         status_parts = [f"{len(r)}{n[:2].upper()}" for n, r in all_rates.items() if r]
         status_str = "+".join(status_parts)
@@ -501,6 +604,15 @@ class ScannerWorker:
             f"Scan #{self.state_manager.get('scan_count')}: "
             f"{len(all_data)} pairs, {n_sp} spot-perp, {n_cx} cross-exchange"
         )
+
+        # Send exceptional opportunity alerts via WhatsApp
+        if exceptional_alerts and self.email_notifier:
+            try:
+                sent = self.email_notifier.send_alerts(exceptional_alerts)
+                if sent > 0:
+                    log.info(f"Exceptional alerts: {sent} sent via WhatsApp")
+            except Exception as e:
+                log.warning(f"Exceptional alert send failed: {e}")
 
         # 8. Store funding rate snapshots in background (non-blocking)
         snapshot_data = all_data + defi_data

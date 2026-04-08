@@ -1,8 +1,13 @@
 """DB-backed persistence for multi-user SaaS mode."""
 import logging
+import time as _time_mod
 from datetime import datetime, timezone
 
 log = logging.getLogger("bot.db_persist")
+
+# Cache for get_historical_stats (changes slowly, avoid hammering DB)
+_hist_stats_cache = {}  # key -> (timestamp, result)
+_HIST_STATS_TTL = 300  # 5 minutes
 
 
 class DBPersistence:
@@ -342,3 +347,99 @@ class DBPersistence:
             }
 
         return results
+
+    def get_historical_stats(self, symbol: str, exchange: str,
+                              days: int = 90) -> dict:
+        """Get historical stats for a symbol+exchange from DB snapshots.
+
+        Queries FundingRateSnapshot (90 days) and ScoreSnapshot (30 entries).
+        Cached for 5 minutes to avoid excessive DB queries.
+
+        Returns:
+          - avg_rate: average funding rate over period
+          - stddev_rate: std deviation
+          - p90_rate: 90th percentile rate
+          - rates: list of historical rates (for percentile calc)
+          - avg_score: average score from score snapshots
+          - score_history: list of historical scores
+          - avg_apr: estimated average APR
+          - apr_history: list of estimated APRs
+        """
+        cache_key = f"{symbol}_{exchange}_{days}"
+        now = _time_mod.time()
+
+        if cache_key in _hist_stats_cache:
+            cached_ts, cached_result = _hist_stats_cache[cache_key]
+            if now - cached_ts < _HIST_STATS_TTL:
+                return cached_result
+
+        import math
+
+        try:
+            from core.db_models import FundingRateSnapshot, ScoreSnapshot
+            from datetime import timedelta
+
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+            # Funding rate snapshots (90 days)
+            rate_snaps = FundingRateSnapshot.query.filter(
+                FundingRateSnapshot.symbol == symbol,
+                FundingRateSnapshot.exchange == exchange,
+                FundingRateSnapshot.captured_at >= cutoff,
+            ).order_by(FundingRateSnapshot.captured_at.asc()).all()
+
+            rates = [s.rate for s in rate_snaps if s.rate is not None]
+
+            if rates:
+                avg_rate = sum(rates) / len(rates)
+                variance = sum((r - avg_rate) ** 2 for r in rates) / len(rates)
+                stddev_rate = math.sqrt(variance)
+                sorted_rates = sorted(abs(r) for r in rates)
+                p90_idx = int(len(sorted_rates) * 0.9)
+                p90_rate = sorted_rates[min(p90_idx, len(sorted_rates) - 1)]
+            else:
+                avg_rate = 0
+                stddev_rate = 0
+                p90_rate = 0
+
+            # Estimate APR from rate snapshots
+            apr_history = []
+            for s in rate_snaps:
+                if s.rate and s.interval_hours:
+                    ppd = 24 / s.interval_hours
+                    apr = abs(s.rate) * ppd * 365 * 100
+                    apr_history.append(apr)
+            avg_apr = sum(apr_history) / len(apr_history) if apr_history else 0
+
+            # Score snapshots (last 30)
+            score_snaps = ScoreSnapshot.query.filter_by(
+                symbol=symbol, exchange=exchange,
+            ).order_by(
+                ScoreSnapshot.captured_at.desc()
+            ).limit(30).all()
+
+            score_history = [s.score for s in reversed(score_snaps)]
+            avg_score = sum(score_history) / len(score_history) if score_history else 0
+
+            result = {
+                "avg_rate": avg_rate,
+                "stddev_rate": stddev_rate,
+                "p90_rate": p90_rate,
+                "rates": rates,
+                "avg_score": avg_score,
+                "score_history": score_history,
+                "avg_apr": avg_apr,
+                "apr_history": apr_history,
+                "data_points": len(rates),
+            }
+
+            _hist_stats_cache[cache_key] = (now, result)
+            return result
+
+        except Exception as e:
+            log.warning(f"get_historical_stats failed for {symbol}@{exchange}: {e}")
+            return {
+                "avg_rate": 0, "stddev_rate": 0, "p90_rate": 0, "rates": [],
+                "avg_score": 0, "score_history": [], "avg_apr": 0,
+                "apr_history": [], "data_points": 0,
+            }

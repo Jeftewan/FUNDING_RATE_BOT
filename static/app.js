@@ -325,14 +325,18 @@ function renderOpps(data) {
     const zBadge = ind.z_risk === 'extreme' ? '<span class="ind-badge ind-danger">Z:'+ind.z_score+'</span>' :
                    ind.z_risk === 'high' ? '<span class="ind-badge ind-warn">Z:'+ind.z_score+'</span>' : '';
 
+    const isExc = o.is_exceptional;
+    const excReasons = (o.exceptional_reasons || []).join(' · ');
+    const excBadge = isExc ? `<span class="ind-badge ind-exceptional" title="${excReasons}">⭐ EXCEPCIONAL</span>` : '';
+
     return `
-    <div class="opp-card${grade === 'A' ? ' grade-a' : ''}">
+    <div class="opp-card${grade === 'A' ? ' grade-a' : ''}${isExc ? ' exceptional' : ''}">
       <div class="opp-header">
         <div class="opp-header-left">
           <span class="opp-symbol">${o.symbol}</span>
           <span class="opp-mode">${mode}</span>
           <span class="opp-exchange">${exchange}</span>
-          ${spikeBadge}${regimeBadge}${zBadge}
+          ${excBadge}${spikeBadge}${regimeBadge}${zBadge}
         </div>
         <div class="opp-header-right">
           <span class="opp-badge ${grade}">${grade}</span>
@@ -813,6 +817,25 @@ function renderPositions(data) {
       </div>
 
       ${payTable}
+      ${p.switch_analysis && p.switch_analysis.recommendation !== 'HOLD' ? (() => {
+        const sa = p.switch_analysis;
+        const best = sa.best_switch;
+        const isSwitch = sa.recommendation === 'SWITCH';
+        const cls = isSwitch ? 'switch-banner switch-recommended' : 'switch-banner switch-consider';
+        const icon = isSwitch ? '🔄' : '💡';
+        const label = isSwitch ? 'Alternativa superior detectada' : 'Alternativa disponible';
+        return `
+        <div class="${cls}">
+          <div class="switch-header">${icon} ${label}</div>
+          <div class="switch-detail">
+            <span><b>${best.symbol}</b> en ${best.exchange}</span>
+            <span>APR ${best.apr?.toFixed(1)}%</span>
+            <span>Score ${best.score}</span>
+            <span>Beneficio: $${best.adjusted_switch_value?.toFixed(2)}</span>
+            <span>BE: ${best.break_even_h?.toFixed(0)}h</span>
+          </div>
+        </div>`;
+      })() : ''}
       ${_posAiData[posId] ? `
       <div class="pos-ai" id="pos-ai-${idx}">
         <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">

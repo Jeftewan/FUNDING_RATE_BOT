@@ -376,6 +376,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 daily = exposure * abs(cfr) * ipd
                 current_apr = (daily * 365 / pos["capital_used"] * 100) if pos["capital_used"] > 0 else 0
 
+                # Include switch analysis if available
+                pos_id = str(pos.get("id", ""))
+                switch_data = scanner_worker._switch_results.get(pos_id)
+
                 pdata.append({
                     **pos,
                     "current_fr": cfr,
@@ -388,6 +392,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "current_apr": current_apr,
                     "fr_reversed": fr_reversed,
                     "mins_next": mins_next,
+                    "switch_analysis": switch_data,
                 })
 
             # Calculate total_earned from active positions
@@ -448,6 +453,9 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 current_apr = (daily * 365 / pos["capital_used"] * 100) if pos["capital_used"] > 0 else 0
                 fr_reversed = ((pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0))
 
+                pos_id_ai = str(pos.get("id", ""))
+                switch_data_ai = scanner_worker._switch_results.get(pos_id_ai)
+
                 pdata.append({
                     **pos,
                     "current_fr": cfr,
@@ -455,6 +463,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "net_earned": net_earned,
                     "current_apr": current_apr,
                     "fr_reversed": fr_reversed,
+                    "switch_analysis": switch_data_ai,
                 })
 
         analyses = analyze_positions(pdata, config)
