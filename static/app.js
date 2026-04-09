@@ -826,22 +826,117 @@ function renderPositions(data) {
       </div>
 
       ${payTable}
-      ${p.switch_analysis && p.switch_analysis.recommendation !== 'HOLD' ? (() => {
+      ${p.switch_analysis ? (() => {
         const sa = p.switch_analysis;
         const best = sa.best_switch;
-        const isSwitch = sa.recommendation === 'SWITCH';
-        const cls = isSwitch ? 'switch-banner switch-recommended' : 'switch-banner switch-consider';
-        const icon = isSwitch ? '🔄' : '💡';
-        const label = isSwitch ? 'Alternativa superior detectada' : 'Alternativa disponible';
+        const health = sa.position_health || {};
+        const rec = sa.recommendation;
+        const hScore = health.health_score || 0;
+        const feePct = health.fee_recovery_pct || 0;
+        const trend = health.trend || 'unknown';
+        const trendIcon = trend === 'up' ? '\u2191' : trend === 'down' ? '\u2193' : trend === 'stable' ? '\u2192' : '?';
+        const trendColor = trend === 'up' ? 'var(--green)' : trend === 'down' ? 'var(--red)' : 'var(--text-secondary)';
+        const healthColor = hScore >= 70 ? 'var(--green)' : hScore >= 40 ? 'var(--orange)' : 'var(--red)';
+        const feeColor = feePct >= 100 ? 'var(--green)' : feePct >= 50 ? 'var(--orange)' : 'var(--red)';
+        const recClass = rec === 'SWITCH' ? 'dp-switch' : rec === 'CONSIDER' ? 'dp-consider' : 'dp-hold';
+        const recLabel = rec === 'SWITCH' ? 'CAMBIAR' : rec === 'CONSIDER' ? 'EVALUAR' : 'MANTENER';
+        const recIcon = rec === 'SWITCH' ? '\uD83D\uDD04' : rec === 'CONSIDER' ? '\uD83D\uDCA1' : '\u2705';
+
+        let healthReasons = '';
+        if (health.reasons_positive && health.reasons_positive.length) {
+          healthReasons += health.reasons_positive.map(r => `<span class="dp-reason dp-reason-pos">+ ${r}</span>`).join('');
+        }
+        if (health.reasons_negative && health.reasons_negative.length) {
+          healthReasons += health.reasons_negative.map(r => `<span class="dp-reason dp-reason-neg">- ${r}</span>`).join('');
+        }
+
+        let comparisonHtml = '';
+        if (best && rec !== 'HOLD') {
+          const curProj = sa.current_projected || 0;
+          const newProj = best.projected_gain_new || 0;
+          const switchCost = best.switch_cost || 0;
+          const netNew = newProj - switchCost;
+          const improvement = best.improvement_pct || 0;
+          comparisonHtml = `
+          <div class="dp-comparison">
+            <div class="dp-comp-title">Comparacion: Quedarse vs Cambiar</div>
+            <div class="dp-comp-table">
+              <div class="dp-comp-row dp-comp-header">
+                <span></span><span>Actual</span><span>${best.symbol}</span>
+              </div>
+              <div class="dp-comp-row">
+                <span class="dp-comp-label">APR</span>
+                <span>${sa.current_apr?.toFixed(1) || '?'}%</span>
+                <span style="color:${best.apr > (sa.current_apr || 0) ? 'var(--green)' : 'var(--text-secondary)'}">${best.apr?.toFixed(1)}%</span>
+              </div>
+              <div class="dp-comp-row">
+                <span class="dp-comp-label">Score</span>
+                <span>${sa.current_score || '?'}</span>
+                <span style="color:${best.score > (sa.current_score || 0) ? 'var(--green)' : 'var(--text-secondary)'}">${best.score}</span>
+              </div>
+              <div class="dp-comp-row">
+                <span class="dp-comp-label">Proy 72h</span>
+                <span>$${curProj.toFixed(2)}</span>
+                <span style="color:${newProj > curProj ? 'var(--green)' : 'var(--text-secondary)'}">$${newProj.toFixed(2)}</span>
+              </div>
+              <div class="dp-comp-row">
+                <span class="dp-comp-label">Estabilidad</span>
+                <span>-</span>
+                <span>${best.stability_grade || '?'} (${best.consistency ? best.consistency.toFixed(0) + '%' : '?'})</span>
+              </div>
+              <div class="dp-comp-row dp-comp-cost">
+                <span class="dp-comp-label">Costo switch</span>
+                <span colspan="2" style="color:var(--red)">-$${switchCost.toFixed(2)}</span>
+                <span>BE: ${best.break_even_h?.toFixed(0)}h</span>
+              </div>
+              <div class="dp-comp-row dp-comp-result">
+                <span class="dp-comp-label">Beneficio neto</span>
+                <span></span>
+                <span style="color:${best.adjusted_switch_value > 0 ? 'var(--green)' : 'var(--red)'}; font-weight:700">
+                  ${best.adjusted_switch_value > 0 ? '+' : ''}$${best.adjusted_switch_value?.toFixed(2)}
+                  ${improvement > 0 ? ` (+${improvement.toFixed(0)}%)` : ''}
+                </span>
+              </div>
+            </div>
+          </div>`;
+        }
+
+        const summary = sa.decision_summary || '';
+
         return `
-        <div class="${cls}">
-          <div class="switch-header">${icon} ${label}</div>
-          <div class="switch-detail">
-            <span><b>${best.symbol}</b> en ${best.exchange}</span>
-            <span>APR ${best.apr?.toFixed(1)}%</span>
-            <span>Score ${best.score}</span>
-            <span>Beneficio: $${best.adjusted_switch_value?.toFixed(2)}</span>
-            <span>BE: ${best.break_even_h?.toFixed(0)}h</span>
+        <div class="decision-panel ${recClass}">
+          <div class="dp-header" onclick="this.closest('.decision-panel').classList.toggle('dp-open')">
+            <div class="dp-header-left">
+              <span class="dp-badge ${recClass}">${recIcon} ${recLabel}</span>
+              <span class="dp-health-label">Salud</span>
+              <span class="dp-health-score" style="color:${healthColor}">${hScore}/100</span>
+            </div>
+            <div class="dp-expand-btn">
+              <svg class="dp-arrow" width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
+            </div>
+          </div>
+
+          <div class="dp-indicators">
+            <div class="dp-indicator">
+              <span class="dp-ind-label">Fees</span>
+              <div class="dp-progress-bar"><div class="dp-progress-fill" style="width:${Math.min(100, feePct)}%;background:${feeColor}"></div></div>
+              <span class="dp-ind-val" style="color:${feeColor}">${feePct.toFixed(0)}%</span>
+            </div>
+            <div class="dp-indicator">
+              <span class="dp-ind-label">Tendencia</span>
+              <span class="dp-trend" style="color:${trendColor}">${trendIcon} ${trend === 'up' ? 'Subiendo' : trend === 'down' ? 'Bajando' : trend === 'stable' ? 'Estable' : 'Sin datos'}</span>
+            </div>
+            <div class="dp-indicator">
+              <span class="dp-ind-label">FR retenido</span>
+              <span class="dp-ind-val" style="color:${(health.rate_retention || 0) >= 80 ? 'var(--green)' : (health.rate_retention || 0) >= 50 ? 'var(--orange)' : 'var(--red)'}">${(health.rate_retention || 0).toFixed(0)}%</span>
+            </div>
+          </div>
+
+          ${summary ? `<div class="dp-summary">${summary}</div>` : ''}
+
+          <div class="dp-details">
+            ${healthReasons ? `<div class="dp-reasons">${healthReasons}</div>` : ''}
+            ${comparisonHtml}
           </div>
         </div>`;
       })() : ''}
@@ -849,12 +944,15 @@ function renderPositions(data) {
       <div class="pos-ai" id="pos-ai-${idx}">
         <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">
           <svg class="ai-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/></svg>
-          <span class="ai-label">\u00bfQu\u00e9 hacer? Sugerencia IA</span>
+          <span class="ai-label">Analisis IA</span>
           <span class="ai-badge ${_posAiData[posId].signal === 'MANTENER' ? 'ai-buy' : _posAiData[posId].signal === 'CERRAR' ? 'ai-avoid' : 'ai-watch'}">${_posAiData[posId].signal}</span>
           <span class="ai-conf">${_posAiData[posId].confidence}/10</span>
           <svg class="ai-arrow" width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
         </button>
-        <div class="ai-body">${_posAiData[posId].analysis}</div>
+        <div class="ai-body">
+          <div class="ai-analysis">${_posAiData[posId].analysis}</div>
+          ${_posAiData[posId].action_plan ? `<div class="ai-action-plan"><span class="ai-action-label">Plan de accion:</span> ${_posAiData[posId].action_plan}</div>` : ''}
+        </div>
       </div>` : ''}
     </div>`;
   }).join('');

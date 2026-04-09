@@ -118,6 +118,110 @@ def mean_reversion_factor(current_rate: float, avg_rate: float,
         return 0.9
 
 
+def _compute_position_health(position: dict, current_market_rate: float,
+                              current_rate: float) -> dict:
+    """Compute position health metrics for decision-making.
+
+    Returns a dict with health_score (0-100), fee_recovery_pct, trend, and reasons.
+    """
+    entry_fr = position.get("entry_fr", 0)
+    earned = position.get("earned_real", 0)
+    entry_fees = position.get("entry_fees", 0)
+    est_fees = entry_fees * 2
+    elapsed_h = position.get("elapsed_h", 0) or 0
+    payments = position.get("payments") or []
+    fr_reversed = ((entry_fr > 0 and current_market_rate < 0)
+                   or (entry_fr < 0 and current_market_rate > 0))
+
+    # Fee recovery percentage
+    fee_recovery_pct = min(100, (earned / est_fees * 100) if est_fees > 0 else 100)
+
+    # Trend from last 5 payments
+    recent_rates = [p["rate"] for p in payments[-5:]] if payments else []
+    trend = "unknown"
+    trend_strength = 0
+    if len(recent_rates) >= 2:
+        diffs = [recent_rates[i] - recent_rates[i - 1]
+                 for i in range(1, len(recent_rates))]
+        avg_diff = sum(diffs) / len(diffs)
+        if avg_diff > 0.000005:
+            trend = "up"
+            trend_strength = min(100, abs(avg_diff) / abs(entry_fr) * 100) if entry_fr else 50
+        elif avg_diff < -0.000005:
+            trend = "down"
+            trend_strength = min(100, abs(avg_diff) / abs(entry_fr) * 100) if entry_fr else 50
+        else:
+            trend = "stable"
+            trend_strength = 0
+
+    # Rate retention: cfr vs entry_fr
+    if entry_fr and entry_fr != 0:
+        rate_retention = abs(current_market_rate) / abs(entry_fr) * 100
+    else:
+        rate_retention = 100
+
+    # Health score components (0-100)
+    reasons_positive = []
+    reasons_negative = []
+    score = 50  # Base
+
+    # Fee recovery component (+/- 20)
+    if fee_recovery_pct >= 100:
+        score += 20
+        reasons_positive.append("Fees recuperados")
+    elif fee_recovery_pct >= 50:
+        score += 10
+    elif elapsed_h > 48 and fee_recovery_pct < 30:
+        score -= 15
+        reasons_negative.append(f"Solo {fee_recovery_pct:.0f}% fees tras {elapsed_h:.0f}h")
+
+    # FR reversal (-30)
+    if fr_reversed:
+        score -= 30
+        reasons_negative.append("FR cambio de signo")
+
+    # Rate retention (+/- 20)
+    if rate_retention >= 80:
+        score += 15
+        if rate_retention >= 100:
+            reasons_positive.append("FR igual o mejor que entrada")
+    elif rate_retention < 50:
+        score -= 20
+        reasons_negative.append(f"FR cayo a {rate_retention:.0f}% del original")
+    elif rate_retention < 70:
+        score -= 10
+
+    # Trend component (+/- 15)
+    if trend == "up":
+        score += 10
+        reasons_positive.append("Tendencia ascendente")
+    elif trend == "down":
+        score -= 15
+        reasons_negative.append("Tendencia descendente")
+    elif trend == "stable":
+        score += 5
+
+    # Time factor (very old positions get penalty)
+    if elapsed_h > 288:
+        score -= 10
+        reasons_negative.append(f"Posicion antigua ({elapsed_h:.0f}h)")
+    elif elapsed_h > 144:
+        score -= 5
+
+    score = max(0, min(100, score))
+
+    return {
+        "health_score": round(score),
+        "fee_recovery_pct": round(fee_recovery_pct, 1),
+        "trend": trend,
+        "trend_strength": round(trend_strength, 1),
+        "rate_retention": round(rate_retention, 1),
+        "fr_reversed": fr_reversed,
+        "reasons_positive": reasons_positive,
+        "reasons_negative": reasons_negative,
+    }
+
+
 def analyze_switch(position: dict, opportunities: list,
                    all_data: list, db_persistence=None) -> dict:
     """Analyze if switching from current position to a better one is worthwhile.
@@ -128,6 +232,8 @@ def analyze_switch(position: dict, opportunities: list,
         "alternatives": [...top 3 alternatives with metrics],
         "current_projected": float,
         "recommendation": "SWITCH" | "CONSIDER" | "HOLD",
+        "position_health": {health_score, fee_recovery_pct, trend, reasons...},
+        "decision_summary": str,
       }
     """
     capital = position.get("capital_used", 0)
@@ -155,6 +261,15 @@ def analyze_switch(position: dict, opportunities: list,
     current_projected = calculate_projected_earnings(
         abs(current_market_rate), ppd, exposure, hours_remaining
     )
+
+    # Compute position health
+    position_health = _compute_position_health(
+        position, current_market_rate, current_rate
+    )
+
+    # Current APR
+    daily_current = exposure * abs(current_market_rate) * ppd
+    current_apr = (daily_current * 365 / capital * 100) if capital > 0 else 0
 
     # Get historical stats for mean reversion analysis
     hist_rates = []
@@ -226,12 +341,21 @@ def analyze_switch(position: dict, opportunities: list,
         else:
             be_switch_h = 999
 
+        # APR of alternative
+        daily_new = exposure * opp_settlement * opp_ppd
+        alt_apr = (daily_new * 365 / capital * 100) if capital > 0 else 0
+
+        # Improvement ratio (how much better is the new vs current)
+        improvement_pct = 0
+        if projected_current > 0:
+            improvement_pct = ((projected_new - projected_current) / projected_current) * 100
+
         alternatives.append({
             "symbol": opp_sym,
             "exchange": opp_ex,
             "mode": opp.get("mode", "spot_perp"),
             "score": opp_score,
-            "apr": opp.get("apr", 0),
+            "apr": opp.get("apr", 0) or round(alt_apr, 1),
             "switch_cost": switch_cost["total_cost"],
             "projected_gain_new": projected_new,
             "projected_gain_current": projected_current,
@@ -239,6 +363,10 @@ def analyze_switch(position: dict, opportunities: list,
             "adjusted_switch_value": adjusted_value,
             "break_even_h": be_switch_h,
             "mr_factor": mr_factor,
+            "improvement_pct": round(improvement_pct, 1),
+            "stability_grade": opp.get("stability_grade", "?"),
+            "consistency": opp.get("history", {}).get("pct",
+                           opp.get("history", {}).get("favorable_pct", 0)),
             "_id": opp.get("_id", ""),
         })
 
@@ -256,10 +384,61 @@ def analyze_switch(position: dict, opportunities: list,
         elif best["break_even_h"] < 48:
             recommendation = "CONSIDER"
 
+    # Factor in position health: if health is very low, lower threshold for switching
+    if position_health["health_score"] < 30 and best:
+        if best["adjusted_switch_value"] > 0 and best["break_even_h"] < 48:
+            recommendation = "SWITCH"
+        elif best["adjusted_switch_value"] > 0:
+            recommendation = "CONSIDER"
+
+    # Decision summary for the user
+    decision_summary = _build_decision_summary(
+        recommendation, position_health, best, current_apr, current_score
+    )
+
     return {
         "best_switch": best,
         "alternatives": alternatives[:3],
         "current_projected": current_projected,
         "current_market_rate": current_market_rate,
+        "current_apr": round(current_apr, 1),
+        "current_score": current_score,
         "recommendation": recommendation,
+        "position_health": position_health,
+        "decision_summary": decision_summary,
     }
+
+
+def _build_decision_summary(recommendation: str, health: dict,
+                             best: dict, current_apr: float,
+                             current_score: int) -> str:
+    """Build a concise decision summary string for the UI."""
+    h_score = health["health_score"]
+    trend = health["trend"]
+    fee_pct = health["fee_recovery_pct"]
+
+    if recommendation == "SWITCH":
+        alt = best["symbol"] if best else "?"
+        be = best["break_even_h"] if best else 0
+        imp = best.get("improvement_pct", 0)
+        return (f"Cambiar a {alt} — mejora de {imp:.0f}%, "
+                f"recuperas fees de switch en {be:.0f}h. "
+                f"Posicion actual debilitada (salud {h_score}/100).")
+
+    if recommendation == "CONSIDER":
+        alt = best["symbol"] if best else "?"
+        return (f"Alternativa disponible: {alt}. "
+                f"Evaluar cambio — posicion actual con salud {h_score}/100, "
+                f"tendencia {trend}, fees {fee_pct:.0f}% recuperados.")
+
+    # HOLD
+    reasons = health["reasons_positive"]
+    summary = f"Mantener posicion — salud {h_score}/100"
+    if trend != "unknown":
+        summary += f", tendencia {trend}"
+    if fee_pct < 100:
+        summary += f", {fee_pct:.0f}% fees recuperados"
+    elif reasons:
+        summary += f". {reasons[0]}"
+    summary += "."
+    return summary
