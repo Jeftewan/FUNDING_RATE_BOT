@@ -2,6 +2,7 @@
 
 import json
 import logging
+import random
 import re
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,21 @@ SYSTEM_PROMPT = (
     "Ejemplo EVITAR: 'Tasa en z-score 2.3, muy por encima de su media historica. "
     "Momentum desacelerando y consistencia solo 55%. Alto riesgo de reversion, esperar correccion.'"
 )
+
+
+def _get_groq_key(config) -> str:
+    """Pick a random Groq API key from the configured keys."""
+    keys = [
+        k for k in (
+            getattr(config, "GROQ_API_KEY_1", ""),
+            getattr(config, "GROQ_API_KEY_2", ""),
+            getattr(config, "GROQ_API_KEY_3", ""),
+        )
+        if k
+    ]
+    if not keys:
+        return ""
+    return random.choice(keys)
 
 
 def _slim_opp(opp: dict) -> dict:
@@ -159,7 +175,7 @@ def analyze_top_opportunities(opportunities: list, config, top_n: int = MAX_OPPS
     Gracefully degrades: if no API key, Groq fails, or parsing fails,
     returns opportunities unchanged without ai_analysis field.
     """
-    api_key = getattr(config, "GROQ_API_KEY", "")
+    api_key = _get_groq_key(config)
     if not api_key:
         return opportunities
 
@@ -347,7 +363,7 @@ def analyze_positions(positions: list, config) -> dict:
 
     Gracefully degrades: returns empty dict on any failure.
     """
-    api_key = getattr(config, "GROQ_API_KEY", "")
+    api_key = _get_groq_key(config)
     if not api_key or not positions:
         return {}
 
