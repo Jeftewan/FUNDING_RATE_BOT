@@ -260,52 +260,46 @@ def detect_exceptional(current_rate: float, rates: list,
                        current_apr: float, apr_history: list) -> dict:
     """Detect if an opportunity is statistically exceptional.
 
-    Criteria (ALL three required):
-      1. Rate in percentile >= 90 of its history (top 10%)
-      2. Score >= 80 (high quality)
-      3. Score > 1.5x historical average score (significantly above normal)
-
-    Bonus context (informational only, does NOT affect is_exceptional):
-      - APR > 2x historical average APR
+    Criteria (both required):
+      1. Score in percentile >= 95 of its history (top 5%)
+      2. Score >= 70 (minimum quality floor)
 
     Returns:
-      {"is_exceptional": bool, "reasons": [...], "exceptional_score": 0-3}
+      {"is_exceptional": bool, "reasons": [...], "exceptional_score": int,
+       "rate_percentile": float, "score_percentile": float}
     """
     reasons = []
-    core_met = 0
 
-    # 1. Rate percentile check (reuse existing function)
+    # Rate percentile (informational, included in reasons)
     pctl = rate_percentile(current_rate, rates)
     rate_pct = pctl["percentile"]
+
+    # Score percentile vs historical
+    score_pct = 50.0
+    if len(score_history) >= 5:
+        below = sum(1 for s in score_history if s < current_score)
+        score_pct = (below / len(score_history)) * 100
+
+    score_in_top5 = score_pct >= 95
+    score_above_floor = current_score >= 70
+
+    if score_in_top5:
+        reasons.append(f"Score {current_score} en percentil {score_pct:.0f} (top 5% historico)")
     if rate_pct >= 90:
         reasons.append(f"Tasa en percentil {rate_pct:.0f} (top 10% historico)")
-        core_met += 1
-
-    # 2. Score minimum threshold (raised from 75 to 80)
-    if current_score >= 80:
-        core_met += 1
-
-    # 3. Score significantly above historical average (primary criterion)
-    if score_history:
-        avg_score = sum(score_history) / len(score_history)
-        if avg_score > 0 and current_score > avg_score * 1.5:
-            reasons.append(f"Score {current_score} >> promedio historico ({avg_score:.0f})")
-            core_met += 1
-
-    # Bonus context: APR vs historical average (does NOT affect is_exceptional)
     if apr_history:
         avg_apr = sum(apr_history) / len(apr_history)
         if avg_apr > 0 and current_apr > avg_apr * 2:
             reasons.append(f"APR {current_apr:.1f}% > 2x promedio ({avg_apr:.1f}%)")
 
-    # Must meet ALL 3 core criteria to be exceptional
-    is_exceptional = core_met >= 3
+    is_exceptional = score_in_top5 and score_above_floor
 
     return {
         "is_exceptional": is_exceptional,
         "reasons": reasons,
-        "exceptional_score": core_met,
+        "exceptional_score": int(score_in_top5) + int(score_above_floor),
         "rate_percentile": rate_pct,
+        "score_percentile": score_pct,
     }
 
 
