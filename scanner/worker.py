@@ -48,6 +48,7 @@ class ScannerWorker:
         self._db_persist = None  # Lazy-init DBPersistence
         self._last_switch_analysis = 0  # Timestamp of last switch analysis
         self._switch_results = {}  # {position_id: switch_analysis_result}
+        self._prev_exceptional_keys = set()  # Exceptional keys from previous scan
 
     def start(self):
         if self._started:
@@ -524,14 +525,18 @@ class ScannerWorker:
         except Exception as e:
             log.warning(f"AI analysis skipped: {e}")
 
-        # 6c. Detect exceptional opportunities (top 20 by score, DB required)
+        # 6c. Detect exceptional opportunities (top 10 by score, DB required)
+        # Uses separate tracking (_prev_exceptional_keys) — NOT _notified_alerts
+        # to avoid being cleared by position alert cleanup.
+        # Only alerts for NEW exceptional opportunities (not in previous scan).
         exceptional_alerts = []
+        current_exceptional_keys = set()
         if self._flask_app:
             try:
                 with self._flask_app.app_context():
                     db_persist = self._get_db_persist()
                     if db_persist:
-                        for opp in opportunities[:20]:
+                        for opp in opportunities[:10]:
                             sym = opp.get("symbol", "")
                             ex = opp.get("exchange", opp.get("short_exchange", ""))
                             hist_stats = db_persist.get_historical_stats(sym, ex)
@@ -549,8 +554,10 @@ class ScannerWorker:
                             opp["is_exceptional"] = exc["is_exceptional"]
                             opp["exceptional_reasons"] = exc["reasons"]
                             if exc["is_exceptional"]:
-                                alert_key = f"EXCEPTIONAL_{sym}_{ex}"
-                                if alert_key not in self._notified_alerts:
+                                ekey = f"{sym}_{ex}"
+                                current_exceptional_keys.add(ekey)
+                                # Only alert if this is NEW (wasn't exceptional last scan)
+                                if ekey not in self._prev_exceptional_keys:
                                     exceptional_alerts.append({
                                         "type": "EXCEPTIONAL_OPPORTUNITY",
                                         "severity": "INFO",
@@ -563,9 +570,10 @@ class ScannerWorker:
                                             + " | ".join(exc["reasons"][:2])
                                         ),
                                     })
-                                    self._notified_alerts.add(alert_key)
             except Exception as e:
                 log.warning(f"Exceptional detection skipped: {e}")
+        # Update previous keys for next scan comparison
+        self._prev_exceptional_keys = current_exceptional_keys
 
         # 7. Update state (BEFORE snapshot storage — snapshots are slow and non-critical)
         status_parts = [f"{len(r)}{n[:2].upper()}" for n, r in all_rates.items() if r]
@@ -602,17 +610,17 @@ class ScannerWorker:
             f"{len(all_data)} pairs, {n_sp} spot-perp, {n_cx} cross-exchange"
         )
 
-        # Send exceptional opportunity alerts via WhatsApp (max 2 per scan)
+        # Send exceptional opportunity alerts via WhatsApp (max 1 per scan)
         if exceptional_alerts and self.email_notifier:
             try:
                 exceptional_alerts.sort(
                     key=lambda a: a.get("_score", 0), reverse=True
                 )
-                capped = exceptional_alerts[:2]
-                sent = self.email_notifier.send_alerts(capped)
+                best = exceptional_alerts[:1]  # Only the single best new exceptional
+                sent = self.email_notifier.send_alerts(best)
                 if sent > 0:
-                    log.info(f"Exceptional alerts: {sent} sent via WhatsApp "
-                             f"({len(exceptional_alerts)} detected, capped to 2)")
+                    log.info(f"Exceptional alert sent: {best[0].get('symbol')} "
+                             f"(score {best[0].get('_score')})")
             except Exception as e:
                 log.warning(f"Exceptional alert send failed: {e}")
 
