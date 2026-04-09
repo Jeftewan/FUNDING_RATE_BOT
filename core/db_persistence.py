@@ -9,6 +9,9 @@ log = logging.getLogger("bot.db_persist")
 _hist_stats_cache = {}  # key -> (timestamp, result)
 _HIST_STATS_TTL = 300  # 5 minutes
 
+# Cache for global score threshold
+_global_score_cache = {"ts": 0, "p95": None, "count": 0}
+
 
 class DBPersistence:
     """Reads/writes user state from PostgreSQL via SQLAlchemy models."""
@@ -443,3 +446,31 @@ class DBPersistence:
                 "avg_score": 0, "score_history": [], "avg_apr": 0,
                 "apr_history": [], "data_points": 0,
             }
+
+    def get_global_score_p95(self) -> float | None:
+        """Return the 95th percentile score across ALL tokens.
+
+        Cached for 5 minutes. Returns None if insufficient data (<50 scores).
+        """
+        now = _time_mod.time()
+        if _global_score_cache["p95"] is not None and now - _global_score_cache["ts"] < _HIST_STATS_TTL:
+            return _global_score_cache["p95"]
+
+        try:
+            from core.db_models import ScoreSnapshot
+
+            all_scores = [s.score for s in
+                          ScoreSnapshot.query.with_entities(ScoreSnapshot.score).all()]
+            if len(all_scores) < 50:
+                log.debug(f"Global score p95: only {len(all_scores)} scores, need 50+")
+                return None
+
+            all_scores.sort()
+            idx = int(len(all_scores) * 0.95)
+            p95 = all_scores[min(idx, len(all_scores) - 1)]
+            _global_score_cache.update({"ts": now, "p95": p95, "count": len(all_scores)})
+            log.info(f"Global score p95={p95} (from {len(all_scores)} scores)")
+            return p95
+        except Exception as e:
+            log.warning(f"get_global_score_p95 failed: {e}")
+            return None

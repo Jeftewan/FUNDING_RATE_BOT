@@ -525,54 +525,46 @@ class ScannerWorker:
         except Exception as e:
             log.warning(f"AI analysis skipped: {e}")
 
-        # 6c. Detect exceptional opportunities (top 10 by score, DB required)
-        # Uses separate tracking (_prev_exceptional_keys) — NOT _notified_alerts
-        # to avoid being cleared by position alert cleanup.
-        # Only alerts for NEW exceptional opportunities (not in previous scan).
+        # 6c. Detect exceptional opportunities (global score percentile)
+        # One global query for the p95 threshold, then check each top opp.
+        # Only alerts NEW exceptional opportunities (not in previous scan).
         exceptional_alerts = []
         current_exceptional_keys = set()
         if self._flask_app:
             try:
                 with self._flask_app.app_context():
                     db_persist = self._get_db_persist()
-                    if db_persist:
+                    global_p95 = db_persist.get_global_score_p95() if db_persist else None
+                    if global_p95 is not None:
                         for opp in opportunities[:10]:
-                            sym = opp.get("symbol", "")
-                            ex = opp.get("exchange", opp.get("short_exchange", ""))
-                            hist_stats = db_persist.get_historical_stats(sym, ex)
-                            if hist_stats["data_points"] < 10:
-                                continue  # Not enough history
-                            fr = opp.get("funding_rate", opp.get("rate_differential", 0))
+                            score = opp.get("score", 0)
                             exc = detect_exceptional(
-                                current_rate=fr,
-                                rates=hist_stats["rates"],
-                                current_score=opp.get("score", 0),
-                                score_history=hist_stats["score_history"],
+                                current_score=score,
+                                global_p95=global_p95,
                                 current_apr=opp.get("apr", 0),
-                                apr_history=hist_stats["apr_history"],
                             )
                             opp["is_exceptional"] = exc["is_exceptional"]
                             opp["exceptional_reasons"] = exc["reasons"]
                             if exc["is_exceptional"]:
+                                sym = opp.get("symbol", "")
+                                ex = opp.get("exchange", opp.get("short_exchange", ""))
                                 ekey = f"{sym}_{ex}"
                                 current_exceptional_keys.add(ekey)
-                                # Only alert if this is NEW (wasn't exceptional last scan)
                                 if ekey not in self._prev_exceptional_keys:
                                     exceptional_alerts.append({
                                         "type": "EXCEPTIONAL_OPPORTUNITY",
                                         "severity": "INFO",
                                         "symbol": sym,
                                         "exchange": ex,
-                                        "_score": opp.get("score", 0),
+                                        "_score": score,
                                         "message": (
                                             f"Oportunidad excepcional: {sym} en {ex}. "
-                                            f"Score {opp.get('score', 0)}, APR {opp.get('apr', 0):.1f}%. "
+                                            f"Score {score}, APR {opp.get('apr', 0):.1f}%. "
                                             + " | ".join(exc["reasons"][:2])
                                         ),
                                     })
             except Exception as e:
                 log.warning(f"Exceptional detection skipped: {e}")
-        # Update previous keys for next scan comparison
         self._prev_exceptional_keys = current_exceptional_keys
 
         # 7. Update state (BEFORE snapshot storage — snapshots are slow and non-critical)

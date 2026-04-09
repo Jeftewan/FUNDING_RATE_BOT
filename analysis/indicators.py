@@ -255,51 +255,36 @@ def acceleration_bonus(rates: list, window: int = 8) -> dict:
     }
 
 
-def detect_exceptional(current_rate: float, rates: list,
-                       current_score: int, score_history: list,
-                       current_apr: float, apr_history: list) -> dict:
+def detect_exceptional(current_score: int, global_p95: float,
+                       current_apr: float = 0) -> dict:
     """Detect if an opportunity is statistically exceptional.
 
     Criteria (both required):
-      1. Score in percentile >= 95 of its history (top 5%)
+      1. Score >= global p95 threshold (top 5% of ALL tokens historically)
       2. Score >= 70 (minimum quality floor)
 
+    Args:
+      current_score: this opportunity's score
+      global_p95: the 95th percentile score across all tokens (from DB)
+      current_apr: current APR (informational context only)
+
     Returns:
-      {"is_exceptional": bool, "reasons": [...], "exceptional_score": int,
-       "rate_percentile": float, "score_percentile": float}
+      {"is_exceptional": bool, "reasons": [...]}
     """
     reasons = []
 
-    # Rate percentile (informational, included in reasons)
-    pctl = rate_percentile(current_rate, rates)
-    rate_pct = pctl["percentile"]
+    is_exceptional = current_score >= global_p95 and current_score >= 70
 
-    # Score percentile vs historical
-    score_pct = 50.0
-    if len(score_history) >= 5:
-        below = sum(1 for s in score_history if s < current_score)
-        score_pct = (below / len(score_history)) * 100
-
-    score_in_top5 = score_pct >= 95
-    score_above_floor = current_score >= 70
-
-    if score_in_top5:
-        reasons.append(f"Score {current_score} en percentil {score_pct:.0f} (top 5% historico)")
-    if rate_pct >= 90:
-        reasons.append(f"Tasa en percentil {rate_pct:.0f} (top 10% historico)")
-    if apr_history:
-        avg_apr = sum(apr_history) / len(apr_history)
-        if avg_apr > 0 and current_apr > avg_apr * 2:
-            reasons.append(f"APR {current_apr:.1f}% > 2x promedio ({avg_apr:.1f}%)")
-
-    is_exceptional = score_in_top5 and score_above_floor
+    if is_exceptional:
+        reasons.append(
+            f"Score {current_score} >= {global_p95} (percentil 95 global)"
+        )
+    if current_apr > 0:
+        reasons.append(f"APR {current_apr:.1f}%")
 
     return {
         "is_exceptional": is_exceptional,
         "reasons": reasons,
-        "exceptional_score": int(score_in_top5) + int(score_above_floor),
-        "rate_percentile": rate_pct,
-        "score_percentile": score_pct,
     }
 
 
