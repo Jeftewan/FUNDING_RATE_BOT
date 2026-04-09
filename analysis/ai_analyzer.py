@@ -7,7 +7,7 @@ import re
 log = logging.getLogger(__name__)
 
 GROQ_MODEL = "llama-3.3-70b-versatile"
-MAX_OPPS = 10
+MAX_OPPS = 5
 TIMEOUT = 25
 
 SYSTEM_PROMPT = (

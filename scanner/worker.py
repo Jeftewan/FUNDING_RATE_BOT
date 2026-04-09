@@ -556,6 +556,7 @@ class ScannerWorker:
                                         "severity": "INFO",
                                         "symbol": sym,
                                         "exchange": ex,
+                                        "_score": opp.get("score", 0),
                                         "message": (
                                             f"Oportunidad excepcional: {sym} en {ex}. "
                                             f"Score {opp.get('score', 0)}, APR {opp.get('apr', 0):.1f}%. "
@@ -601,12 +602,17 @@ class ScannerWorker:
             f"{len(all_data)} pairs, {n_sp} spot-perp, {n_cx} cross-exchange"
         )
 
-        # Send exceptional opportunity alerts via WhatsApp
+        # Send exceptional opportunity alerts via WhatsApp (max 2 per scan)
         if exceptional_alerts and self.email_notifier:
             try:
-                sent = self.email_notifier.send_alerts(exceptional_alerts)
+                exceptional_alerts.sort(
+                    key=lambda a: a.get("_score", 0), reverse=True
+                )
+                capped = exceptional_alerts[:2]
+                sent = self.email_notifier.send_alerts(capped)
                 if sent > 0:
-                    log.info(f"Exceptional alerts: {sent} sent via WhatsApp")
+                    log.info(f"Exceptional alerts: {sent} sent via WhatsApp "
+                             f"({len(exceptional_alerts)} detected, capped to 2)")
             except Exception as e:
                 log.warning(f"Exceptional alert send failed: {e}")
 
