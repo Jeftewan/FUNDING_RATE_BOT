@@ -108,6 +108,10 @@ class EmailNotifier:
             lines.append("\n🟡 Tasa desfavorable antes del pago")
         elif alert_type == "SL_TP_REVIEW":
             lines.append("\n🔵 *REVISAR STOP LOSS / TAKE PROFIT*")
+        elif alert_type == "EXCEPTIONAL_OPPORTUNITY":
+            lines.append("\n⭐ *OPORTUNIDAD EXCEPCIONAL — Revisar ahora*")
+        elif alert_type == "SWITCH_OPPORTUNITY":
+            lines.append("\n🔄 *Alternativa superior disponible*")
         elif alert_type == "POSITION_CLOSED":
             lines.append("\n🟢 Posicion cerrada")
 

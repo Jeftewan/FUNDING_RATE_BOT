@@ -144,10 +144,15 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             min_score = s.get("min_score", 40)
             now = time.time()
 
+            min_stability_days = s.get("min_stability_days", 3)
+
             opps = s.get("opportunities", [])
             filtered = []
             for o in opps:
-                if o.get("apr", 0) >= min_apr and o.get("score", 0) >= min_score:
+                hold_days = o.get("estimated_hold_days", 0)
+                if (o.get("apr", 0) >= min_apr
+                        and o.get("score", 0) >= min_score
+                        and hold_days >= min_stability_days):
                     # Recalculate mins_to_next live
                     nts = o.get("next_funding_ts", 0)
                     if nts and nts > 0:
@@ -371,6 +376,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 daily = exposure * abs(cfr) * ipd
                 current_apr = (daily * 365 / pos["capital_used"] * 100) if pos["capital_used"] > 0 else 0
 
+                # Include switch analysis if available
+                pos_id = str(pos.get("id", ""))
+                switch_data = scanner_worker._switch_results.get(pos_id)
+
                 pdata.append({
                     **pos,
                     "current_fr": cfr,
@@ -383,6 +392,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "current_apr": current_apr,
                     "fr_reversed": fr_reversed,
                     "mins_next": mins_next,
+                    "switch_analysis": switch_data,
                 })
 
             # Calculate total_earned from active positions
@@ -399,10 +409,12 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @app.route("/api/positions/ai", methods=["POST"])
     @auth_required
     def api_positions_ai():
-        """On-demand AI analysis for active positions."""
+        """On-demand AI + switching analysis for active positions.
+        Runs switch analysis first, then AI analysis — both triggered
+        only when the user clicks the 'Analizar con IA' button.
+        """
         from analysis.ai_analyzer import analyze_positions
 
-        # Reuse the positions data from api_positions logic
         uid = get_current_user_id()
         with state_manager.lock:
             s = state_manager.state
@@ -415,45 +427,63 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 positions_list = []
 
             if not positions_list:
-                return jsonify({"ok": True, "analyses": {}})
+                return jsonify({"ok": True, "analyses": {}, "switch_results": {}})
 
-            # Build enriched position data (same as api_positions)
-            pdata = []
-            now = time.time()
-            for pos in positions_list:
-                is_cross = pos.get("mode") == "cross_exchange"
-                if is_cross:
-                    long_ex = pos.get("long_exchange", "")
-                    short_ex = pos.get("short_exchange", pos.get("exchange", ""))
-                    long_d = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex), None)
-                    short_d = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex), None)
-                    cfr = (short_d["fr"] - long_d["fr"]) if long_d and short_d else pos["entry_fr"]
-                else:
-                    cur = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]), None)
-                    cfr = cur["fr"] if cur else pos["entry_fr"]
+        # ── Run switch analysis on-demand ──────────────────────
+        scanner_worker.run_switch_analysis(positions_list)
 
-                ih = pos.get("ih", 8)
-                el_h = (now - pos["entry_time"] / 1000) / 3600
-                earned = pos.get("earned_real", 0)
-                entry_fees = pos.get("entry_fees", 0)
-                net_earned = earned - entry_fees * 2
-                exposure = pos.get("exposure", pos["capital_used"] / 2)
-                ipd = 24 / ih
-                daily = exposure * abs(cfr) * ipd
-                current_apr = (daily * 365 / pos["capital_used"] * 100) if pos["capital_used"] > 0 else 0
-                fr_reversed = ((pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0))
+        # ── Build enriched position data ───────────────────────
+        with state_manager.lock:
+            s = state_manager.state
+            all_data = s.get("all_data", [])
 
-                pdata.append({
-                    **pos,
-                    "current_fr": cfr,
-                    "elapsed_h": el_h,
-                    "net_earned": net_earned,
-                    "current_apr": current_apr,
-                    "fr_reversed": fr_reversed,
-                })
+        pdata = []
+        switch_results_out = {}
+        now = time.time()
+        for pos in positions_list:
+            is_cross = pos.get("mode") == "cross_exchange"
+            if is_cross:
+                long_ex = pos.get("long_exchange", "")
+                short_ex = pos.get("short_exchange", pos.get("exchange", ""))
+                long_d = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex), None)
+                short_d = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex), None)
+                cfr = (short_d["fr"] - long_d["fr"]) if long_d and short_d else pos["entry_fr"]
+            else:
+                cur = next((d for d in all_data if d["symbol"] == pos["symbol"] and d["exchange"] == pos["exchange"]), None)
+                cfr = cur["fr"] if cur else pos["entry_fr"]
+
+            ih = pos.get("ih", 8)
+            el_h = (now - pos["entry_time"] / 1000) / 3600
+            earned = pos.get("earned_real", 0)
+            entry_fees = pos.get("entry_fees", 0)
+            net_earned = earned - entry_fees * 2
+            exposure = pos.get("exposure", pos["capital_used"] / 2)
+            ipd = 24 / ih
+            daily = exposure * abs(cfr) * ipd
+            current_apr = (daily * 365 / pos["capital_used"] * 100) if pos["capital_used"] > 0 else 0
+            fr_reversed = ((pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0))
+
+            pos_id_ai = str(pos.get("id", ""))
+            switch_data_ai = scanner_worker._switch_results.get(pos_id_ai)
+            if switch_data_ai:
+                switch_results_out[pos_id_ai] = switch_data_ai
+
+            pdata.append({
+                **pos,
+                "current_fr": cfr,
+                "elapsed_h": el_h,
+                "net_earned": net_earned,
+                "current_apr": current_apr,
+                "fr_reversed": fr_reversed,
+                "switch_analysis": switch_data_ai,
+            })
 
         analyses = analyze_positions(pdata, config)
-        return jsonify({"ok": True, "analyses": analyses})
+        return jsonify({
+            "ok": True,
+            "analyses": analyses,
+            "switch_results": switch_results_out,
+        })
 
     # ── Close Position ─────────────────────────────────────────
     @app.route("/api/close_position", methods=["POST"])

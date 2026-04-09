@@ -1,20 +1,20 @@
-"""Opportunity scoring v10.1 — stronger mean-reversion protection.
+"""Opportunity scoring v10.2 — aligned with plan v8.0 priorities.
 
 Unified formula for spot-perp and cross-exchange opportunities.
-v10.1: increased mean-reversion penalty (-10 max), rebalanced
-stability/consistency weights for better sustainability prediction.
+v10.2: rebalanced to plan priorities — higher weight on stability
+and yield sustainability, advanced indicators as bonus/penalty overlay.
 
-Dimensions (max 100 pts):
-  1. Stability      (22 pts) — CV + min_ratio (reduced from 25)
-  2. Consistency     (23 pts) — streak + favorable % (increased from 20)
+Base dimensions (100 pts max):
+  1. Stability      (25 pts) — CV + min_ratio
+  2. Consistency     (20 pts) — streak + favorable %
   3. Liquidity       (15 pts) — 24h volume
-  4. Yield           (15 pts) — settlement-based
+  4. Yield           (20 pts) — settlement-based daily yield
   5. Fee Efficiency  (10 pts) — fee_drag ratio
-  6. Momentum         (8 pts) — ROC + EMA ratio + acceleration
-  7. Rate Percentile  (5 pts) — current vs historical range
-  8. Volatility Regime(5 pts) — recent vs overall stddev
-  9. Acceleration     (2 pts) — linear slope bonus
- 10. Mean Reversion (-10 pts) — z-score penalty (strengthened from -5)
+  6. Trend           (10 pts) — momentum + regime + percentile
+
+Overlay (bonus/penalty, capped within 0-100):
+  - Acceleration bonus  (+2 pts)
+  - Mean Reversion penalty (-10 pts max via z-score)
 """
 import math
 from analysis.indicators import compute_all_indicators
@@ -53,33 +53,33 @@ def opportunity_score(params: dict) -> int:
     current_rate = abs(params.get("current_rate", 0))
     rates = params.get("rates", [])
 
-    # ── 1. ESTABILIDAD (22 pts) ──────────────────────────────────
+    # ── 1. ESTABILIDAD (25 pts) ──────────────────────────────────
     if cv < 0.2 and min_ratio > 0.5:
-        sc += 22
+        sc += 25
     elif cv < 0.3 and min_ratio > 0.3:
-        sc += 18
+        sc += 20
     elif cv < 0.3:
-        sc += 15
+        sc += 16
     elif cv < 0.5:
-        sc += 10
+        sc += 11
     elif cv < 0.8:
-        sc += 6
+        sc += 7
     elif cv < 1.2:
         sc += 3
     else:
         sc += 1
 
-    # ── 2. CONSISTENCIA (23 pts) ─────────────────────────────────
+    # ── 2. CONSISTENCIA (20 pts) ─────────────────────────────────
     if streak >= 12 and pct >= 90:
-        sc += 23
+        sc += 20
     elif streak >= 8 and pct >= 85:
-        sc += 19
+        sc += 16
     elif streak >= 5 and pct >= 80:
-        sc += 15
+        sc += 13
     elif streak >= 3 and pct >= 70:
-        sc += 12
+        sc += 10
     elif pct >= 60:
-        sc += 8
+        sc += 6
     else:
         sc += 2
 
@@ -97,7 +97,7 @@ def opportunity_score(params: dict) -> int:
     else:
         sc += 1
 
-    # ── 4. YIELD DIARIO — settlement-based (15 pts, reduced from 20) ──
+    # ── 4. YIELD DIARIO — settlement-based (20 pts) ─────────────
     yield_day_pct = settlement_avg * ppd * 100
 
     reality_penalty = False
@@ -106,24 +106,24 @@ def opportunity_score(params: dict) -> int:
 
     if reality_penalty:
         if yield_day_pct >= 0.15:
-            sc += 10
+            sc += 13
         elif yield_day_pct >= 0.10:
-            sc += 7
+            sc += 9
         elif yield_day_pct >= 0.06:
-            sc += 5
+            sc += 6
         else:
             sc += 2
     else:
         if yield_day_pct >= 0.15:
-            sc += 15
+            sc += 20
         elif yield_day_pct >= 0.10:
-            sc += 13
+            sc += 17
         elif yield_day_pct >= 0.06:
-            sc += 10
+            sc += 13
         elif yield_day_pct >= 0.03:
-            sc += 7
+            sc += 9
         elif yield_day_pct >= 0.01:
-            sc += 4
+            sc += 5
         else:
             sc += 1
 
@@ -139,15 +139,26 @@ def opportunity_score(params: dict) -> int:
     else:
         sc += 1
 
-    # ── 6-10. ADVANCED INDICATORS (20 pts max, -5 penalty) ──────
-    # Replaces the old simple trend dimension (was 10 pts)
+    # ── 6. TREND (10 pts) — momentum + regime + percentile ──────
     indicators = compute_all_indicators(current_rate, rates)
 
-    sc += indicators["momentum"]["points"]        # 0-8 pts
-    sc += indicators["percentile"]["points"]       # 1-5 pts
-    sc += indicators["regime"]["points"]           # 1-5 pts
+    # Momentum: 0-5 pts (capped from the full indicator)
+    mom_pts = min(5, indicators["momentum"]["points"])
+    # Percentile: 0-3 pts
+    pctl_pts = min(3, indicators["percentile"]["points"])
+    # Regime: 0-2 pts
+    reg_pts = min(2, indicators["regime"]["points"])
+    sc += mom_pts + pctl_pts + reg_pts
+
+    # ── Overlay: Acceleration bonus (+2 pts) ─────────────────────
     sc += indicators["acceleration"]["bonus"]      # 0-2 pts
+
+    # ── Overlay: Mean Reversion penalty (up to -10 pts) ──────────
     sc += indicators["z_score"]["penalty"]         # 0 to -5 pts
+    # Strengthen penalty for extreme z-scores
+    z_val = indicators["z_score"].get("value", 0)
+    if z_val > 3.0:
+        sc -= 5  # extra -5 for extreme spikes (total -10 max)
 
     # Store indicators in params for caller to access
     params["_indicators"] = indicators

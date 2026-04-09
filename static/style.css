@@ -381,6 +381,8 @@ body {
 }
 .opp-card:hover { border-color: var(--border-hover); box-shadow: 0 4px 32px rgba(0,0,0,0.2); }
 .opp-card.grade-a { border-left: 3px solid #22c55e44; }
+.opp-card.exceptional { border: 1px solid #f59e0b66; box-shadow: 0 0 16px rgba(245,158,11,0.15); }
+.opp-card.exceptional .opp-symbol { color: #f59e0b; }
 
 /* Card header */
 .opp-header {
@@ -443,6 +445,7 @@ body {
 .ind-warn { background: var(--orange-bg); color: var(--orange); border: 1px solid #f59e0b44; }
 .ind-danger { background: var(--red-bg); color: var(--red); border: 1px solid #ef444444; }
 .ind-lowvol { background: #64748b18; color: #64748b; border: 1px solid #64748b33; }
+.ind-exceptional { background: #f59e0b22; color: #f59e0b; border: 1px solid #f59e0b55; font-size: 9px; }
 .ind-up { color: var(--green); font-weight: 700; }
 .ind-down { color: var(--red); font-weight: 700; }
 .ind-flat { color: var(--text-secondary); font-weight: 700; }
@@ -625,6 +628,26 @@ body {
   font-weight: 700;
   margin-bottom: 8px;
 }
+.switch-banner {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-family: var(--font-ui);
+  margin-bottom: 8px;
+}
+.switch-recommended {
+  background: #f59e0b18;
+  border: 1px solid #f59e0b44;
+  color: #f59e0b;
+}
+.switch-consider {
+  background: #3b82f618;
+  border: 1px solid #3b82f644;
+  color: #93c5fd;
+}
+.switch-header { font-weight: 700; margin-bottom: 4px; }
+.switch-detail { display: flex; flex-wrap: wrap; gap: 8px; font-size: 10px; color: var(--text-secondary); }
+.switch-detail b { color: var(--text-white); }
 
 .pos-grid {
   display: grid;
