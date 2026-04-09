@@ -140,11 +140,15 @@ def _parse_ai_response(text: str, valid_signals: tuple, default_signal: str) -> 
         signal = a.get("signal", default_signal).upper()
         if signal not in valid_signals:
             signal = default_signal
-        result[aid] = {
+        entry = {
             "signal": signal,
             "confidence": max(1, min(10, int(a.get("confidence", 5)))),
             "analysis": str(a.get("analysis", ""))[:500],
         }
+        action_plan = a.get("action_plan", "")
+        if action_plan:
+            entry["action_plan"] = str(action_plan)[:300]
+        result[aid] = entry
 
     return result
 
@@ -203,56 +207,74 @@ def analyze_top_opportunities(opportunities: list, config, top_n: int = MAX_OPPS
 # ── Position Analysis ─────────────────────────────────────────
 
 POSITION_SYSTEM_PROMPT = (
-    "Eres analista experto en arbitraje de funding rates. Evaluas posiciones abiertas "
-    "y das recomendaciones claras con explicacion detallada.\n\n"
+    "Eres analista experto en arbitraje de funding rates. Tu rol es dar al usuario "
+    "una RUTA DE DECISION CLARA sobre cada posicion: mantener, vigilar o cerrar, "
+    "y si hay una alternativa mejor, explicar el trade-off concreto.\n\n"
     "Responde SOLO JSON valido:\n"
     '{"analyses":[{"id":"id","signal":"MANTENER|CERRAR|VIGILAR",'
-    '"confidence":1-10,"analysis":"texto explicativo 40-60 palabras"}]}\n\n'
+    '"confidence":1-10,"analysis":"texto 50-80 palabras",'
+    '"action_plan":"1-2 pasos concretos que el usuario debe seguir"}]}\n\n'
     "CAMPOS que recibiras:\n"
-    "efr=FR de entrada%, cfr=FR actual%, ar=FR promedio historico de la posicion%, "
-    "apr=APR actual%, h=horas abierta, pc=pagos recibidos, "
-    "rev=FR revertido(cambio de signo), lr=ultimas 3 tasas%, "
-    "net=ganancia neta(despues de fees), cap=capital, exp=exposicion, lev=apalancamiento, "
-    "fees=fees estimados(entry+exit), ih=intervalo de pago en horas\n\n"
-    "REGLAS de decision:\n"
-    "CERRAR: rev=true | cfr~0 | apr<0 | (cfr<efr/3 y h>48) | (h>144 y cfr<ar/2) | net muy negativo\n"
-    "VIGILAR: cfr<efr/2 | apr cayendo | lr tendencia baja | (cfr<ar y h>72) | (h>144 y cfr<ar)\n"
-    "MANTENER: cfr estable o subiendo, apr>0, sin reversion, cfr>=ar\n\n"
-    "CONTEXTO TEMPORAL — muy importante:\n"
-    "- pc<3: pocos datos, ar no confiable, basarse en cfr vs efr y tendencia lr\n"
-    "- h<24 (1d): posicion nueva, dar tiempo salvo reversion clara\n"
-    "- h 24-72: evaluar si cfr se mantiene vs efr\n"
-    "- h 72-144: posicion madura, cfr debe estar cerca de ar para MANTENER\n"
-    "- h>144 (6d): escrutinio alto, exigir cfr>=ar para MANTENER\n"
-    "- h>288 (12d): posicion muy vieja, considerar CERRAR salvo apr excelente\n\n"
-    "CONTEXTO FR PROMEDIO (ar) — dato clave:\n"
-    "- cfr >= ar: posicion sana, FR actual igual o mejor que su promedio\n"
-    "- cfr < ar*0.5: deterioro claro, la tasa esta cayendo significativamente\n"
-    "- ar < efr/2: la posicion nunca rindio lo esperado, debilidad estructural\n"
-    "- ar >= efr: la posicion ha rendido igual o mejor que al entrar\n\n"
-    "CONTEXTO FEES Y RENTABILIDAD:\n"
-    "- net > 0: fees ya recuperados, posicion en ganancia\n"
-    "- net < 0 y h>48: no ha recuperado fees en 2 dias, mal signo\n"
-    "- Con apalancamiento alto (lev>3): mas sensible a movimientos de precio\n\n"
-    "En 'analysis' DEBES incluir estos 3 elementos en 40-60 palabras:\n"
-    "1. ESTADO: como va la posicion (rendimiento, tendencia del FR, tiempo)\n"
-    "2. RAZON: por que recomiendas esa signal (datos concretos del analisis)\n"
-    "3. ACCION: que debe hacer el usuario ahora (mantener/cerrar/ajustar SL-TP)\n\n"
-    "Ejemplo MANTENER: 'Posicion sana con 72h abierta. FR actual (0.015%) por encima del promedio "
-    "(0.012%) y APR de 38%. Fees recuperados con $2.30 neto. Mantener, ajustar SL si FR baja de 0.008%.'\n"
-    "Ejemplo CERRAR: 'FR cayo de 0.02% a 0.003% en ultimos 3 pagos, muy por debajo del promedio (0.015%). "
-    "Con 168h abierta el deterioro es claro. Cerrar y reubicar capital en mejor oportunidad.'\n"
-    "Ejemplo VIGILAR: 'FR actual (0.01%) esta por debajo del promedio (0.018%) tras 96h. "
-    "Tendencia descendente en lr. Vigilar proximo pago, cerrar si cae bajo 0.005%.'\n\n"
-    "CONTEXTO SWITCHING (si campo sw presente):\n"
-    "- sw.val: valor neto del switch (positivo=beneficio despues de fees)\n"
-    "- sw.beh: horas para recuperar fees del cambio\n"
+    "efr=FR entrada%, cfr=FR actual%, ar=FR promedio%, apr=APR actual%, "
+    "h=horas abierta, pc=pagos recibidos, rev=FR revertido, "
+    "lr=ultimas 5 tasas%, net=ganancia neta, fees=fees estimados, "
+    "cap=capital, exp=exposicion, lev=apalancamiento, ih=intervalo horas, "
+    "fee_recovery_pct=% de fees recuperados, trend=tendencia(up/down/stable/unknown)\n\n"
+    "CAMPOS SWITCHING (sw) — CRITICO para decision de cambio:\n"
+    "- sw.val: beneficio neto del switch (descontando TODOS los fees de salir+entrar)\n"
+    "- sw.beh: horas para recuperar los fees del cambio\n"
     "- sw.rec: recomendacion cuantitativa (SWITCH/CONSIDER/HOLD)\n"
-    "- sw.alt: simbolo de la alternativa recomendada\n"
+    "- sw.alt: simbolo alternativa, sw.alt_ex: exchange alternativa\n"
     "- sw.apr: APR de la alternativa\n"
-    "Si sw.rec=SWITCH y val>0 y beh<24: recomendar CERRAR con mencion de la alternativa\n"
-    "Si sw.rec=CONSIDER: VIGILAR con mencion de la alternativa como opcion\n"
-    "Si sw.rec=HOLD: ignorar switching, evaluar posicion por sus propios meritos"
+    "- sw.alt_sc: score de la alternativa\n"
+    "- sw.sw_cost: costo total del switch en $\n"
+    "- sw.cur_proj: proyeccion ganancia actual 72h, sw.new_proj: proyeccion alternativa\n\n"
+    "REGLAS de decision:\n"
+    "CERRAR:\n"
+    "- rev=true (FR cambio de signo) — SIEMPRE cerrar\n"
+    "- cfr~0 o apr<0 — posicion no genera\n"
+    "- cfr<efr/3 y h>48 — deterioro severo confirmado\n"
+    "- sw.rec=SWITCH y sw.val>0 y sw.beh<24 — HAY alternativa claramente mejor\n"
+    "- fee_recovery_pct<30 y h>72 — no recupera fees, capital atrapado\n\n"
+    "VIGILAR:\n"
+    "- cfr<efr/2 — FR ha caido significativamente\n"
+    "- trend=down — tendencia descendente en pagos recientes\n"
+    "- sw.rec=CONSIDER — hay alternativa potencialmente mejor\n"
+    "- fee_recovery_pct<60 y h>48 — recuperacion lenta de fees\n"
+    "- h>144 y cfr<ar — posicion vieja con rendimiento bajo promedio\n\n"
+    "MANTENER:\n"
+    "- cfr estable/subiendo, apr>0, sin reversion\n"
+    "- fee_recovery_pct>=100 (fees ya recuperados)\n"
+    "- trend=up o stable con cfr>=ar\n"
+    "- sw.rec=HOLD o no hay sw — sin alternativa mejor\n\n"
+    "ANALISIS COMPARATIVO (cuando sw presente):\n"
+    "El usuario necesita saber CON NUMEROS si vale la pena cambiar:\n"
+    "1. Cuanto gana quedandose (cur_proj en 72h)\n"
+    "2. Cuanto ganaria cambiando (new_proj menos sw_cost)\n"
+    "3. En cuantas horas recupera el costo del cambio (beh)\n"
+    "4. Riesgo: la alternativa es estable? (alt_sc alto = mas confiable)\n"
+    "Si la diferencia es marginal (<$0.50 o <10% mejora): recomendar MANTENER\n"
+    "Si la alternativa es claramente superior (>30% mejora y beh<24h): recomendar CERRAR\n\n"
+    "CONTEXTO TEMPORAL:\n"
+    "- h<24: posicion nueva, dar tiempo salvo reversion clara\n"
+    "- h 24-72: evaluar cfr vs efr\n"
+    "- h 72-144: madura, cfr debe estar cerca de ar\n"
+    "- h>144: escrutinio alto, exigir cfr>=ar\n"
+    "- h>288: muy vieja, considerar CERRAR salvo apr excelente\n\n"
+    "En 'analysis' incluir estos 3 elementos en 50-80 palabras:\n"
+    "1. DIAGNOSTICO: salud de la posicion (FR, tendencia, fees recuperados)\n"
+    "2. COMPARACION: si hay alternativa, comparar numeros concretos\n"
+    "3. VEREDICTO: conclusion clara con razon principal\n\n"
+    "En 'action_plan' dar 1-2 pasos CONCRETOS y accionables:\n"
+    "Ejemplo: '1. Mantener hasta proximo pago. 2. Si FR baja de 0.005%, cerrar y entrar en ETHUSDT (Binance).'\n"
+    "Ejemplo: '1. Cerrar posicion ahora. 2. Abrir SOLUSDT en Bybit (APR 45%, score 78).'\n"
+    "Ejemplo: '1. Vigilar proximas 8h. 2. Si FR no recupera 0.01%, cerrar.'\n\n"
+    "Ejemplo CERRAR con switch: 'Posicion debilitada: FR cayo a 0.003% (entrada 0.02%), "
+    "tendencia bajista, solo 25% fees recuperados en 96h. Alternativa SOLUSDT ofrece APR 52% vs 8% actual, "
+    "con costo de switch de $1.20 que se recupera en 6h. Cambiar es claramente mejor.'\n"
+    "Ejemplo MANTENER: 'Posicion sana: FR estable en 0.015% (promedio 0.012%), APR 38%, "
+    "fees 100% recuperados con $2.30 neto. Tendencia estable. No hay alternativa que justifique "
+    "el costo de cambio ($2.40). Mantener.'"
 )
 
 
@@ -265,7 +287,7 @@ def _slim_position(pos: dict) -> dict:
     entry_fees = pos.get("entry_fees", 0) or 0
     est_fees = entry_fees * 2  # entry + exit estimate
 
-    return {
+    slim = {
         "id": str(pos.get("id", "")),
         "sym": pos.get("symbol", ""),
         "mode": "cross" if pos.get("mode") == "cross_exchange" else "sp",
@@ -283,7 +305,21 @@ def _slim_position(pos: dict) -> dict:
         "ih": pos.get("ih", 8) or 8,
         "rev": bool(pos.get("fr_reversed")),
         "lr": recent,
+        "fee_recovery_pct": round(min(100, (pos.get("earned_real", 0) / est_fees * 100) if est_fees > 0 else 100), 1),
     }
+
+    # Trend analysis from recent payments
+    if len(recent) >= 2:
+        diffs = [recent[i] - recent[i - 1] for i in range(1, len(recent))]
+        avg_diff = sum(diffs) / len(diffs)
+        if avg_diff > 0.0005:
+            slim["trend"] = "up"
+        elif avg_diff < -0.0005:
+            slim["trend"] = "down"
+        else:
+            slim["trend"] = "stable"
+    else:
+        slim["trend"] = "unknown"
 
     # Include switch analysis context if available
     sa = pos.get("switch_analysis")
@@ -295,7 +331,12 @@ def _slim_position(pos: dict) -> dict:
                 "beh": round(best.get("break_even_h", 999), 1),
                 "rec": sa["recommendation"],
                 "alt": best.get("symbol", ""),
+                "alt_ex": best.get("exchange", ""),
                 "apr": round(best.get("apr", 0), 1),
+                "alt_sc": best.get("score", 0),
+                "sw_cost": round(best.get("switch_cost", 0), 2),
+                "cur_proj": round(sa.get("current_projected", 0), 2),
+                "new_proj": round(best.get("projected_gain_new", 0), 2),
             }
 
     return slim
@@ -332,7 +373,7 @@ def analyze_positions(positions: list, config) -> dict:
             messages=messages,
             response_format={"type": "json_object"},
             temperature=0.3,
-            max_tokens=2000,
+            max_tokens=3000,
             timeout=TIMEOUT,
         )
 
