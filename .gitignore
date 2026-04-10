@@ -7,3 +7,10 @@ build/
 .env
 *.json.tmp
 portfolio_state.json
+
+# Backtest cache (auto-generated)
+cache/fr_snapshots.csv
+cache/score_snapshots.csv
+
+# Backtest report CSVs (large generated artifacts)
+reports/backtest_*.csv
