@@ -90,10 +90,15 @@ def z_score(current_rate: float, rates: list) -> dict:
 
     High |z-score| means the rate is far from normal — likely to revert.
 
+    v10.3: Thresholds and penalties strengthened based on 90-day backtest.
+    Control group (score 55–75) showed z≥1.5 predicts −264% APR vs −49% for
+    z<1.5 — prior penalty scale (−1 to −10) was insufficiently disuasive.
+
     Returns dict with:
       - z: the z-score value
-      - risk: 'extreme', 'high', 'elevated', 'normal'
-      - penalty: 0 to -5 points to subtract from score
+      - risk: 'extreme', 'very_high', 'high', 'elevated', 'slightly_elevated',
+              'mild', 'normal'
+      - penalty: 0 to -30 points to subtract from score
     """
     if len(rates) < 5:
         return {"z": 0, "risk": "insufficient_data", "penalty": 0}
@@ -111,19 +116,22 @@ def z_score(current_rate: float, rates: list) -> dict:
 
     if z > 3.0:
         risk = "extreme"
-        penalty = -10
+        penalty = -30
     elif z > 2.5:
         risk = "very_high"
-        penalty = -7
+        penalty = -22
     elif z > 2.0:
         risk = "high"
-        penalty = -4
+        penalty = -15
     elif z > 1.5:
         risk = "elevated"
-        penalty = -2
+        penalty = -9
     elif z > 1.0:
         risk = "slightly_elevated"
-        penalty = -1
+        penalty = -5
+    elif z > 0.8:
+        risk = "mild"
+        penalty = -2
     else:
         risk = "normal"
         penalty = 0
@@ -217,9 +225,19 @@ def volatility_regime(rates: list, recent_window: int = 8) -> dict:
 def acceleration_bonus(rates: list, window: int = 8) -> dict:
     """Detect if rates are accelerating upward (linear regression slope).
 
+    v10.3: The +2 bonus was DISABLED after the 90-day backtest revealed it
+    was contra-productive. At every score tier, acceleration ON showed
+    dramatically worse forward APR than OFF (e.g. score 55–70: ON −247% vs
+    OFF −25%). A positive normalized slope >0.05 effectively captures the
+    peak of a spike about to mean-revert.
+
+    The normalized slope is still computed and returned for telemetry (it is
+    persisted to `score_snapshots` and surfaced in the API), but the bonus
+    is permanently 0.
+
     Returns dict with:
-      - slope: normalized slope
-      - bonus: 0 or 2 points
+      - slope: normalized slope (informational only)
+      - bonus: always 0 (disabled)
     """
     if len(rates) < window:
         return {"slope": 0.0, "bonus": 0}
@@ -243,15 +261,10 @@ def acceleration_bonus(rates: list, window: int = 8) -> dict:
     # Normalize slope relative to mean
     norm_slope = slope / mean_val
 
-    # Bonus if slope is positive and significant (>50% of mean per window)
-    if norm_slope > 0.05:
-        bonus = 2
-    else:
-        bonus = 0
-
+    # Bonus permanently disabled (see docstring). Slope still reported.
     return {
         "slope": round(norm_slope, 4),
-        "bonus": bonus,
+        "bonus": 0,
     }
 
 
