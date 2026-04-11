@@ -4,8 +4,17 @@ Inspired by Leung & Li (2015) optimal mean reversion trading and
 No-Trade Region theory (transaction costs create zones where rebalancing
 is NOT optimal). Funding rates are mean-reverting with positive bias (~0.01%).
 
+v10.3 recalibration (aligned with scoring v10.3 backtest findings):
+  * Dynamic new_opp_risk by z-score of candidate: penalizes alternatives
+    that are overextended vs their own history (high z = likely reversion).
+  * Yield-zone penalty: candidates with daily yield in the suspicious band
+    (0.15-0.25%) or spike band (>=0.25%) get additional risk discount.
+  * SWITCH score improvement threshold lowered from +15 to +10: scores
+    compress in v10.3 due to hard caps and stronger z-penalty, so large
+    absolute gaps are rarer even when the alternative is genuinely better.
+
 Decision thresholds:
-  SWITCH:  adjusted_switch_value > 0 AND break_even < 24h AND score_new > score + 15
+  SWITCH:  adjusted_switch_value > 0 AND break_even < 24h AND score_new > score + 10
   CONSIDER: adjusted_switch_value > 0 AND break_even < 48h
   HOLD:    anything else
 """
@@ -66,6 +75,67 @@ def calculate_projected_earnings(rate: float, ppd: float,
         return 0
     daily_income = exposure * abs(rate) * ppd
     return daily_income * (hours / 24)
+
+
+def candidate_risk_factor(opp: dict) -> float:
+    """Risk discount for a switch candidate, aligned with scoring v10.3.
+
+    Replaces the old static 0.8 factor. Combines two validated signals from
+    the 90-day backtest:
+
+      1. Z-score of the candidate's own rate vs its history. z>=1.5 predicted
+         -264% APR in the control group. The hard cap in scoring.py only
+         triggers at z>2, so z in [1.0, 2.0] still lets high scores through
+         and needs an extra discount here.
+
+      2. Daily yield zone. The backtest showed yield >=0.25% strongly
+         correlates with imminent spikes. The scoring rewards the sweet spot
+         (0.03-0.10%) and penalizes extremes, but we reinforce it here to
+         avoid switching INTO a candidate that is itself about to revert.
+
+    Returns a factor in [0.4, 0.95].
+    """
+    indicators = opp.get("indicators", {}) or {}
+    # indicators comes flattened via models.py to_dict(), so z_score is a float
+    z = abs(indicators.get("z_score", 0) or 0)
+
+    if z >= 2.0:
+        z_factor = 0.4     # Should be filtered by hard cap, but defend anyway
+    elif z >= 1.5:
+        z_factor = 0.55
+    elif z >= 1.0:
+        z_factor = 0.7
+    elif z >= 0.5:
+        z_factor = 0.85
+    else:
+        z_factor = 0.95
+
+    # Yield zone penalty (daily % = settlement_avg * ppd * 100)
+    settlement_avg = abs(opp.get("settlement_avg", 0) or 0)
+    ppd = opp.get("payments_per_day", 3) or 3
+    if settlement_avg <= 0:
+        # Fallback to current rate when settlement_avg is absent
+        settlement_avg = abs(opp.get("funding_rate",
+                                     opp.get("rate_differential", 0)) or 0)
+    yield_day_pct = settlement_avg * ppd * 100
+
+    if yield_day_pct >= 0.25:
+        yield_factor = 0.5      # probable spike
+    elif yield_day_pct >= 0.15:
+        yield_factor = 0.75     # suspicious zone
+    elif yield_day_pct >= 0.03:
+        yield_factor = 1.0      # sweet spot (no penalty)
+    elif yield_day_pct >= 0.01:
+        yield_factor = 0.95
+    else:
+        yield_factor = 0.9      # very low yield, low conviction
+
+    # Spike flags from indicators are the strongest red flags
+    if indicators.get("is_spike_incoming") or indicators.get("is_spike_ending"):
+        yield_factor = min(yield_factor, 0.5)
+
+    # Combine multiplicatively, floor at 0.4
+    return max(0.4, z_factor * yield_factor)
 
 
 def mean_reversion_factor(current_rate: float, avg_rate: float,
@@ -323,8 +393,8 @@ def analyze_switch(position: dict, opportunities: list,
 
         # Mean reversion discount (current position may recover)
         mr_factor = mean_reversion_factor(current_market_rate, current_rate, hist_rates)
-        # New opportunity risk discount
-        new_opp_risk = 0.8
+        # New opportunity risk discount (v10.3: dynamic by z-score + yield zone)
+        new_opp_risk = candidate_risk_factor(opp)
 
         adjusted_value = net_switch_value * mr_factor * new_opp_risk
 
@@ -363,6 +433,7 @@ def analyze_switch(position: dict, opportunities: list,
             "adjusted_switch_value": adjusted_value,
             "break_even_h": be_switch_h,
             "mr_factor": mr_factor,
+            "candidate_risk": round(new_opp_risk, 3),
             "improvement_pct": round(improvement_pct, 1),
             "stability_grade": opp.get("stability_grade", "?"),
             "consistency": opp.get("history", {}).get("pct",
@@ -377,18 +448,26 @@ def analyze_switch(position: dict, opportunities: list,
     best = alternatives[0] if alternatives else None
     recommendation = "HOLD"
 
+    # v10.3: score improvement threshold lowered from +15 to +10 because
+    # hard caps + stronger z-penalty compress the score distribution. We
+    # also require the candidate to clear a minimum absolute score (55) so
+    # a near-hard-capped alternative never triggers SWITCH.
     if best and best["adjusted_switch_value"] > 0:
+        alt_clears_floor = best["score"] >= 55
         if (best["break_even_h"] < 24 and
-                best["score"] > current_score + 15):
+                best["score"] > current_score + 10 and
+                alt_clears_floor):
             recommendation = "SWITCH"
-        elif best["break_even_h"] < 48:
+        elif best["break_even_h"] < 48 and alt_clears_floor:
             recommendation = "CONSIDER"
 
     # Factor in position health: if health is very low, lower threshold for switching
     if position_health["health_score"] < 30 and best:
-        if best["adjusted_switch_value"] > 0 and best["break_even_h"] < 48:
+        alt_clears_floor = best["score"] >= 55
+        if (best["adjusted_switch_value"] > 0 and
+                best["break_even_h"] < 48 and alt_clears_floor):
             recommendation = "SWITCH"
-        elif best["adjusted_switch_value"] > 0:
+        elif best["adjusted_switch_value"] > 0 and alt_clears_floor:
             recommendation = "CONSIDER"
 
     # Decision summary for the user
