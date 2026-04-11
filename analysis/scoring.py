@@ -1,20 +1,35 @@
-"""Opportunity scoring v10.2 — aligned with plan v8.0 priorities.
+"""Opportunity scoring v10.3 — recalibrated from 90-day backtest results.
 
 Unified formula for spot-perp and cross-exchange opportunities.
-v10.2: rebalanced to plan priorities — higher weight on stability
-and yield sustainability, advanced indicators as bonus/penalty overlay.
+
+v10.3 changes (from v10.2):
+  * Acceleration bonus REMOVED — backtest showed it was inverted signal
+    (accel ON: −79% APR avg, OFF: −20%). Slope is still computed for
+    telemetry but no longer awards points (see indicators.py).
+  * Z-score penalty strengthened: new scale 0 to −30 (was 0 to −10).
+    Control group showed z≥1.5 predicts −264% APR — old penalty of −2
+    was not disuasive.
+  * Weights rebalanced toward validated predictors: Consistency and
+    Stability had the only positive Spearman correlations (0.55 / 0.31).
+    Yield and Liquidity had NEGATIVE Pearson (−0.35 / −0.28) so their
+    weight was reduced and Yield was made non-monotonic.
+  * Hard caps added for anti-spike scenarios (high z, immature streak
+    at high percentile, current rate > 1.5x historical mean).
+  * Reality penalty trigger lowered from 2.0x to 1.5x.
+  * Bug fix: the extra −5 penalty for z>3 was reading the wrong key
+    (`value` vs `z`) and never fired. Removed (now subsumed in new scale).
 
 Base dimensions (100 pts max):
-  1. Stability      (25 pts) — CV + min_ratio
-  2. Consistency     (20 pts) — streak + favorable %
-  3. Liquidity       (15 pts) — 24h volume
-  4. Yield           (20 pts) — settlement-based daily yield
+  1. Stability       (30 pts) — CV + min_ratio
+  2. Consistency     (30 pts) — streak + favorable %
+  3. Liquidity       (10 pts) — 24h volume (filter, not differentiator)
+  4. Yield           (15 pts) — non-monotonic, sweet-spot penalizes spikes
   5. Fee Efficiency  (10 pts) — fee_drag ratio
-  6. Trend           (10 pts) — momentum + regime + percentile
+  6. Trend           ( 5 pts) — momentum + regime + percentile (tie-breaker)
 
-Overlay (bonus/penalty, capped within 0-100):
-  - Acceleration bonus  (+2 pts)
-  - Mean Reversion penalty (-10 pts max via z-score)
+Overlay (applied to final score, clamped to 0-100):
+  - Mean Reversion penalty (0 to −30 pts via z-score)
+  - Hard caps when spike conditions detected
 """
 import math
 from analysis.indicators import compute_all_indicators
@@ -53,77 +68,82 @@ def opportunity_score(params: dict) -> int:
     current_rate = abs(params.get("current_rate", 0))
     rates = params.get("rates", [])
 
-    # ── 1. ESTABILIDAD (25 pts) ──────────────────────────────────
+    # ── 1. ESTABILIDAD (30 pts) ──────────────────────────────────
     if cv < 0.2 and min_ratio > 0.5:
-        sc += 25
+        sc += 30
     elif cv < 0.3 and min_ratio > 0.3:
-        sc += 20
+        sc += 24
     elif cv < 0.3:
-        sc += 16
+        sc += 19
     elif cv < 0.5:
-        sc += 11
+        sc += 13
     elif cv < 0.8:
-        sc += 7
+        sc += 8
     elif cv < 1.2:
-        sc += 3
+        sc += 4
     else:
         sc += 1
 
-    # ── 2. CONSISTENCIA (20 pts) ─────────────────────────────────
+    # ── 2. CONSISTENCIA (30 pts) ─────────────────────────────────
     if streak >= 12 and pct >= 90:
-        sc += 20
+        sc += 30
     elif streak >= 8 and pct >= 85:
-        sc += 16
+        sc += 24
     elif streak >= 5 and pct >= 80:
-        sc += 13
+        sc += 20
     elif streak >= 3 and pct >= 70:
-        sc += 10
-    elif pct >= 60:
-        sc += 6
-    else:
-        sc += 2
-
-    # ── 3. LIQUIDEZ (15 pts) ─────────────────────────────────────
-    if volume >= 100e6:
         sc += 15
-    elif volume >= 50e6:
-        sc += 12
-    elif volume >= 20e6:
+    elif pct >= 60:
         sc += 9
+    else:
+        sc += 3
+
+    # ── 3. LIQUIDEZ (10 pts) ─────────────────────────────────────
+    # Used as a filter more than a differentiator (Pearson was negative).
+    if volume >= 50e6:
+        sc += 10
+    elif volume >= 20e6:
+        sc += 8
     elif volume >= 10e6:
         sc += 6
     elif volume >= 5e6:
-        sc += 3
+        sc += 4
+    elif volume >= 1e6:
+        sc += 2
     else:
-        sc += 1
+        sc += 0
 
-    # ── 4. YIELD DIARIO — settlement-based (20 pts) ─────────────
+    # ── 4. YIELD DIARIO — settlement-based, non-monotonic (15 pts)
+    # Sweet spot 0.03–0.10% daily; extreme yields are penalized because
+    # they strongly correlate with imminent mean reversion.
     yield_day_pct = settlement_avg * ppd * 100
 
+    # Reality check: current rate is abnormally high vs historical avg
     reality_penalty = False
-    if settlement_avg > 0 and current_rate > settlement_avg * 2:
+    if settlement_avg > 0 and current_rate > settlement_avg * 1.5:
         reality_penalty = True
 
     if reality_penalty:
-        if yield_day_pct >= 0.15:
-            sc += 13
-        elif yield_day_pct >= 0.10:
-            sc += 9
-        elif yield_day_pct >= 0.06:
-            sc += 6
-        else:
-            sc += 2
-    else:
-        if yield_day_pct >= 0.15:
-            sc += 20
-        elif yield_day_pct >= 0.10:
-            sc += 17
-        elif yield_day_pct >= 0.06:
-            sc += 13
+        # Treat as suspect: dampen all yield points
+        if yield_day_pct >= 0.10:
+            sc += 4
         elif yield_day_pct >= 0.03:
-            sc += 9
+            sc += 6
         elif yield_day_pct >= 0.01:
-            sc += 5
+            sc += 4
+        else:
+            sc += 1
+    else:
+        if 0.03 <= yield_day_pct < 0.10:
+            sc += 15   # sweet spot
+        elif 0.10 <= yield_day_pct < 0.15:
+            sc += 12
+        elif 0.01 <= yield_day_pct < 0.03:
+            sc += 10
+        elif 0.15 <= yield_day_pct < 0.25:
+            sc += 6    # zona de sospecha
+        elif yield_day_pct >= 0.25:
+            sc += 2    # probable spike
         else:
             sc += 1
 
@@ -139,26 +159,34 @@ def opportunity_score(params: dict) -> int:
     else:
         sc += 1
 
-    # ── 6. TREND (10 pts) — momentum + regime + percentile ──────
+    # ── 6. TREND (5 pts) — momentum + regime + percentile ───────
+    # Reduced from 10 to 5 pts: Pearson correlations were negative, so
+    # these serve only as tie-breakers among otherwise-equivalent picks.
     indicators = compute_all_indicators(current_rate, rates)
 
-    # Momentum: 0-5 pts (capped from the full indicator)
-    mom_pts = min(5, indicators["momentum"]["points"])
-    # Percentile: 0-3 pts
-    pctl_pts = min(3, indicators["percentile"]["points"])
-    # Regime: 0-2 pts
-    reg_pts = min(2, indicators["regime"]["points"])
+    mom_pts = min(3, indicators["momentum"]["points"])
+    pctl_pts = min(1, indicators["percentile"]["points"])
+    reg_pts = min(1, indicators["regime"]["points"])
     sc += mom_pts + pctl_pts + reg_pts
 
-    # ── Overlay: Acceleration bonus (+2 pts) ─────────────────────
-    sc += indicators["acceleration"]["bonus"]      # 0-2 pts
+    # ── Overlay: Mean Reversion penalty (0 to -30 pts) ───────────
+    # Accel bonus removed — see indicators.acceleration_bonus() docstring.
+    sc += indicators["z_score"]["penalty"]
 
-    # ── Overlay: Mean Reversion penalty (up to -10 pts) ──────────
-    sc += indicators["z_score"]["penalty"]         # 0 to -5 pts
-    # Strengthen penalty for extreme z-scores
-    z_val = indicators["z_score"].get("value", 0)
-    if z_val > 3.0:
-        sc -= 5  # extra -5 for extreme spikes (total -10 max)
+    # ── Hard caps: anti-spike safety brakes ──────────────────────
+    # These override the score when known failure modes are detected.
+    z_val = indicators["z_score"].get("z", 0)
+    percentile = indicators["percentile"].get("percentile", 0)
+
+    # Cap 1: z-score high → spike in progress, mean reversion imminent
+    if z_val > 2.0:
+        sc = min(sc, 40)
+    # Cap 2: immature trade sitting at a historical high → likely peak
+    if streak < 3 and percentile >= 80:
+        sc = min(sc, 45)
+    # Cap 3: current rate is >1.5x the historical mean → suspect
+    if reality_penalty:
+        sc = min(sc, 50)
 
     # Store indicators in params for caller to access
     params["_indicators"] = indicators
