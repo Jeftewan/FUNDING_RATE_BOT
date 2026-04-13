@@ -20,6 +20,7 @@ class DBPersistence:
         """Load per-user state as a dict (matching StateManager format)."""
         from core.database import db
         from core.db_models import UserConfig, UserPosition, UserHistory
+        from core.encryption import decrypt_value
 
         config = UserConfig.query.filter_by(user_id=user_id).first()
         positions = UserPosition.query.filter_by(user_id=user_id, status="active").all()
@@ -37,7 +38,8 @@ class DBPersistence:
             "alert_minutes_before": config.alert_minutes_before if config else 10,
             "email_enabled": config.email_enabled if config else False,
             "wa_phone": config.wa_phone if config else "",
-            "wa_apikey": "",  # Never load decrypted apikey into state
+            # Decrypted at runtime so the notifier can actually send alerts.
+            "wa_apikey": decrypt_value(config.wa_apikey_encrypted) if config and config.wa_apikey_encrypted else "",
             "positions": [self._pos_to_dict(p) for p in positions],
             "history": [self._hist_to_dict(h) for h in history],
             "total_earned": sum(p.earned_real for p in positions),
@@ -48,6 +50,7 @@ class DBPersistence:
         """Save user config fields to DB."""
         from core.database import db
         from core.db_models import UserConfig
+        from core.encryption import encrypt_value
 
         config = UserConfig.query.filter_by(user_id=user_id).first()
         if not config:
@@ -59,6 +62,11 @@ class DBPersistence:
                      "alert_minutes_before", "email_enabled", "wa_phone"):
             if key in data:
                 setattr(config, key, data[key])
+
+        # CallMeBot API key is stored encrypted at rest.
+        if "wa_apikey" in data:
+            plain = str(data["wa_apikey"]).strip()
+            config.wa_apikey_encrypted = encrypt_value(plain) if plain else ""
 
         db.session.commit()
 

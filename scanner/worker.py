@@ -300,12 +300,13 @@ class ScannerWorker:
 
         # Switch analysis removed from auto-loop — now on-demand via /api/positions/ai
 
-        # Send WhatsApp alerts
+        # Send WhatsApp alerts — route per-user so each user gets their own alerts
+        # using their own CallMeBot credentials loaded from DB.
         if alerts:
             log.info(f"Alerts detected: {[a['type'] for a in alerts]}")
             if self.email_notifier:
                 try:
-                    sent = self.email_notifier.send_alerts(alerts)
+                    sent = self._dispatch_alerts_per_user(alerts)
                     log.info(f"WhatsApp: {sent}/{len(alerts)} alert(s) sent")
                     if sent > 0:
                         for a in alerts:
@@ -317,6 +318,105 @@ class ScannerWorker:
                     log.error(f"WhatsApp error: {e}")
 
         self._cleanup_events()
+
+    def _dispatch_alerts_per_user(self, alerts: list) -> int:
+        """Send each alert using the WhatsApp credentials of its owning user.
+
+        Groups alerts by user_id, loads that user's config from DB, syncs the
+        shared notifier's state for the duration of the send, and restores the
+        previous state afterwards. This avoids the previous bug where alerts
+        were silently dropped because the shared in-memory state was empty at
+        startup (wa_apikey never got persisted/loaded).
+        """
+        if not self.email_notifier:
+            return 0
+
+        # Group alerts by user_id (alerts without a user_id go to the shared
+        # bucket and fall through to the legacy state-based send).
+        by_user: dict = {}
+        orphans: list = []
+        for a in alerts:
+            uid = a.get("user_id")
+            if uid:
+                by_user.setdefault(uid, []).append(a)
+            else:
+                orphans.append(a)
+
+        sent_total = 0
+
+        # Snapshot current shared state so we can restore it after per-user sends.
+        with self.state_manager.lock:
+            s = self.state_manager.state
+            prev_enabled = s.get("email_enabled", False)
+            prev_phone = s.get("wa_phone", "")
+            prev_apikey = s.get("wa_apikey", "")
+
+        try:
+            for uid, user_alerts in by_user.items():
+                cfg = self._load_user_whatsapp_config(uid)
+                if not cfg or not cfg.get("email_enabled") or not cfg.get("wa_phone") or not cfg.get("wa_apikey"):
+                    log.info(
+                        f"WhatsApp: skipping {len(user_alerts)} alert(s) for user {uid} "
+                        f"(config incomplete/disabled)"
+                    )
+                    continue
+
+                with self.state_manager.lock:
+                    s = self.state_manager.state
+                    s["email_enabled"] = True
+                    s["wa_phone"] = cfg["wa_phone"]
+                    s["wa_apikey"] = cfg["wa_apikey"]
+
+                try:
+                    sent_total += self.email_notifier.send_alerts(user_alerts)
+                except Exception as e:
+                    log.error(f"WhatsApp send failed for user {uid}: {e}")
+
+            if orphans:
+                # Legacy fallback: send with whatever is currently in state
+                with self.state_manager.lock:
+                    s = self.state_manager.state
+                    s["email_enabled"] = prev_enabled
+                    s["wa_phone"] = prev_phone
+                    s["wa_apikey"] = prev_apikey
+                try:
+                    sent_total += self.email_notifier.send_alerts(orphans)
+                except Exception as e:
+                    log.error(f"WhatsApp send failed for orphan alerts: {e}")
+        finally:
+            # Always restore the previous shared state so other callers
+            # (e.g. /api/test_email) see consistent values.
+            with self.state_manager.lock:
+                s = self.state_manager.state
+                s["email_enabled"] = prev_enabled
+                s["wa_phone"] = prev_phone
+                s["wa_apikey"] = prev_apikey
+            if self.email_notifier:
+                try:
+                    self.email_notifier._sync_from_state()
+                except Exception:
+                    pass
+
+        return sent_total
+
+    def _load_user_whatsapp_config(self, user_id) -> dict:
+        """Load a user's WhatsApp config (email_enabled/wa_phone/wa_apikey) from DB."""
+        if not self._flask_app:
+            return {}
+        try:
+            with self._flask_app.app_context():
+                db_persist = self._get_db_persist()
+                if not db_persist:
+                    return {}
+                us = db_persist.load_user_state(user_id)
+                return {
+                    "email_enabled": us.get("email_enabled", False),
+                    "wa_phone": us.get("wa_phone", ""),
+                    "wa_apikey": us.get("wa_apikey", ""),
+                }
+        except Exception as e:
+            log.error(f"Failed to load WhatsApp config for user {user_id}: {e}")
+            return {}
 
     def _batch_save_earnings(self, positions: list):
         """Save earnings for multiple positions to DB (background thread)."""
@@ -868,11 +968,10 @@ class ScannerWorker:
         if payments < 1:
             return
 
-        if cfr > 0:
-            exposure = pos.get("exposure", pos["capital_used"] / 2)
-            earn_per_payment = exposure * cfr
-        else:
-            earn_per_payment = 0
+        # Short-perp side: receives when cfr > 0, PAYS when cfr < 0.
+        # Always apply the sign so negative rates are recorded as losses.
+        exposure = pos.get("exposure", pos["capital_used"] / 2)
+        earn_per_payment = exposure * cfr
 
         self._record_earnings(pos, earn_per_payment * payments, cfr, now, payments)
 
@@ -999,11 +1098,10 @@ class ScannerWorker:
         if full_ivs < 1:
             return
 
-        if cfr > 0:
-            exposure = pos.get("exposure", pos["capital_used"] / 2)
-            earn_per_iv = exposure * cfr
-        else:
-            earn_per_iv = 0
+        # Short-perp side: receives when cfr > 0, PAYS when cfr < 0.
+        # Always apply the sign so negative rates are recorded as losses.
+        exposure = pos.get("exposure", pos["capital_used"] / 2)
+        earn_per_iv = exposure * cfr
 
         self._record_earnings(pos, earn_per_iv * full_ivs, cfr, now, full_ivs)
 
@@ -1027,6 +1125,8 @@ class ScannerWorker:
 
         if earned_now > 0:
             log.info(f"  +${earned_now:.4f} {pos['symbol']} ({full_ivs}ivs @ {rate*100:.4f}%)")
+        elif earned_now < 0:
+            log.info(f"  -${abs(earned_now):.4f} {pos['symbol']} ({full_ivs}ivs @ {rate*100:.4f}%) [pago funding]")
 
     # ── Alerts ────────────────────────────────────────────────
 
