@@ -418,6 +418,63 @@ class ScannerWorker:
             log.error(f"Failed to load WhatsApp config for user {user_id}: {e}")
             return {}
 
+    def _broadcast_alerts_all_users(self, alerts: list) -> int:
+        """Send alerts to every user who has WhatsApp notifications enabled.
+
+        Used for market-wide alerts (EXCEPTIONAL_OPPORTUNITY, etc.) that are
+        not tied to a specific user's position.  Loads all enabled users from
+        the DB, temporarily sets each one's credentials in the shared notifier,
+        sends, and restores previous state.
+        """
+        if not self.email_notifier or not alerts or not self._flask_app:
+            return 0
+
+        try:
+            with self._flask_app.app_context():
+                db_persist = self._get_db_persist()
+                if not db_persist:
+                    return 0
+                user_configs = db_persist.get_all_users_whatsapp()
+        except Exception as e:
+            log.error(f"Broadcast: failed to load user configs: {e}")
+            return 0
+
+        if not user_configs:
+            log.debug("Broadcast: no users with WhatsApp enabled, skipping")
+            return 0
+
+        # Snapshot current shared state so we can restore it afterwards.
+        with self.state_manager.lock:
+            s = self.state_manager.state
+            prev_enabled = s.get("email_enabled", False)
+            prev_phone = s.get("wa_phone", "")
+            prev_apikey = s.get("wa_apikey", "")
+
+        sent_total = 0
+        try:
+            for cfg in user_configs:
+                with self.state_manager.lock:
+                    s = self.state_manager.state
+                    s["email_enabled"] = True
+                    s["wa_phone"] = cfg["wa_phone"]
+                    s["wa_apikey"] = cfg["wa_apikey"]
+                try:
+                    sent_total += self.email_notifier.send_alerts(alerts)
+                except Exception as e:
+                    log.error(f"Broadcast: send failed for user {cfg['user_id']}: {e}")
+        finally:
+            with self.state_manager.lock:
+                s = self.state_manager.state
+                s["email_enabled"] = prev_enabled
+                s["wa_phone"] = prev_phone
+                s["wa_apikey"] = prev_apikey
+            try:
+                self.email_notifier._sync_from_state()
+            except Exception:
+                pass
+
+        return sent_total
+
     def _batch_save_earnings(self, positions: list):
         """Save earnings for multiple positions to DB (background thread)."""
         if not self._flask_app:
@@ -702,19 +759,20 @@ class ScannerWorker:
             f"{len(all_data)} pairs, {n_sp} spot-perp, {n_cx} cross-exchange"
         )
 
-        # Send exceptional opportunity alerts via WhatsApp (max 1 per scan)
+        # Send exceptional opportunity alerts via WhatsApp to ALL users with
+        # notifications enabled (max 1 best alert per scan, broadcast to everyone).
         if exceptional_alerts and self.email_notifier:
             try:
                 exceptional_alerts.sort(
                     key=lambda a: a.get("_score", 0), reverse=True
                 )
                 best = exceptional_alerts[:1]  # Only the single best new exceptional
-                sent = self.email_notifier.send_alerts(best)
+                sent = self._broadcast_alerts_all_users(best)
                 if sent > 0:
-                    log.info(f"Exceptional alert sent: {best[0].get('symbol')} "
-                             f"(score {best[0].get('_score')})")
+                    log.info(f"Exceptional alert broadcast: {best[0].get('symbol')} "
+                             f"(score {best[0].get('_score')}) → {sent} user(s)")
             except Exception as e:
-                log.warning(f"Exceptional alert send failed: {e}")
+                log.warning(f"Exceptional alert broadcast failed: {e}")
 
         # 8. Store funding rate snapshots in background (non-blocking)
         snapshot_data = all_data + defi_data

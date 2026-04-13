@@ -70,6 +70,28 @@ class DBPersistence:
 
         db.session.commit()
 
+    def get_all_users_whatsapp(self) -> list:
+        """Return WhatsApp credentials for every user that has notifications enabled.
+
+        Result: [{"user_id": int, "wa_phone": str, "wa_apikey": str}, ...]
+        Only includes rows where email_enabled=True and both phone and apikey are set.
+        """
+        from core.db_models import UserConfig
+        from core.encryption import decrypt_value
+
+        configs = UserConfig.query.filter_by(email_enabled=True).all()
+        result = []
+        for cfg in configs:
+            phone = cfg.wa_phone or ""
+            apikey = decrypt_value(cfg.wa_apikey_encrypted) if cfg.wa_apikey_encrypted else ""
+            if phone and apikey:
+                result.append({
+                    "user_id": cfg.user_id,
+                    "wa_phone": phone,
+                    "wa_apikey": apikey,
+                })
+        return result
+
     def save_position(self, user_id: int, pos_dict: dict) -> int:
         """Create a new position in DB. Returns position ID."""
         from core.database import db
