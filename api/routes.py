@@ -538,14 +538,17 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         stale_keys = {k for k in scanner_worker._notified_alerts if closed_sym in k}
         scanner_worker._notified_alerts -= stale_keys
 
-        # Send WhatsApp notification
+        # Send WhatsApp notification — route per-user via the dispatcher so
+        # the user's own credentials are loaded from DB even if the in-memory
+        # state wasn't previously synced for this session.
         if scanner_worker.email_notifier:
             try:
-                scanner_worker.email_notifier.send_alert({
+                close_alert = {
                     "type": "POSITION_CLOSED",
                     "severity": "INFO",
                     "symbol": closed_sym,
                     "exchange": "",
+                    "user_id": uid,
                     "message": (
                         f"Posicion cerrada ({reason}). "
                         f"Ganancia: ${result['earned']:.2f} | "
@@ -554,7 +557,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                         f"Duracion: {result['hours']:.1f}h | "
                         f"Pagos: {result['payments']}"
                     ),
-                })
+                }
+                scanner_worker._dispatch_alerts_per_user([close_alert])
             except Exception as e:
                 log.warning(f"WhatsApp close notification failed: {e}")
 
