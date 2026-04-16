@@ -32,14 +32,27 @@ SYSTEM_PROMPT = (
     "Responde SOLO JSON valido:\n"
     '{"analyses":[{"id":"_id","signal":"COMPRAR|MANTENER|EVITAR",'
     '"confidence":1-10,"analysis":"texto explicativo 40-60 palabras"}]}\n\n'
-    "CAMPOS que recibiras:\n"
-    "sc=score(0-100), apr=retorno anual%, beh=horas para recuperar fees, "
-    "d1k=ingreso diario por $1000, n3d=ingreso neto 3 dias por $1000, "
-    "vol=volumen 24h en millones USD, fr/diff=funding rate actual%, "
-    "mom=momentum(accelerating/decelerating/flat/negative), z=z-score(desviacion vs media), "
-    "pct=percentil historico, reg=regimen volatilidad, grade=estabilidad(A/B/C/D), "
-    "ehd=dias estimados que se mantendra favorable, con=consistencia%(periodos favorables), "
-    "fd=fee drag(fees/ganancia bruta, menor=mejor), spike/rev=flags de spike\n\n"
+    "CAMPOS que recibiras (SIEMPRE presentes, sin excepciones):\n"
+    "- sym: simbolo del par (ej BTC, ETH)\n"
+    "- mode: 'sp'=spot-perp, 'cross'=cross-exchange\n"
+    "- sc: score 0-100 (ya incluye todas las penalizaciones y hard caps)\n"
+    "- apr: retorno anual estimado en %\n"
+    "- beh: horas para recuperar fees (break-even)\n"
+    "- d1k: ingreso diario USD por cada $1000 invertidos\n"
+    "- n3d: ingreso neto USD en 3 dias por cada $1000 invertidos\n"
+    "- vol: volumen 24h en millones USD\n"
+    "- fr: funding rate actual en % (solo mode sp)\n"
+    "- diff: diferencial de funding rate en % (solo mode cross)\n"
+    "- grade: grado de estabilidad (A=muy estable, B=estable, C=moderado, D=inestable)\n"
+    "- ehd: dias estimados que la tasa se mantendra favorable\n"
+    "- con: consistencia en % — porcentaje de periodos historicos que fueron favorables (0-100)\n"
+    "- fd: fee drag — ratio fees/ganancia bruta (0.0-1.0, menor=mejor, 0.2=20% se va en fees)\n"
+    "- mom: momentum — 'flat'=estable, 'accelerating'=acelerando(peligro), 'decelerating'=desacelerando(peligro), 'negative'=negativo\n"
+    "- z: z-score — cuantas desviaciones estandar esta la tasa actual vs su media historica (0=normal, >1.5=sobreextendido, >2.0=critico)\n"
+    "- pctl: percentil historico — en que percentil de su historial esta la tasa actual (0-100, 90=tasa esta en el top 10%)\n"
+    "- reg: regimen de volatilidad — 'low', 'normal', 'high'\n"
+    "- spike: true si se detecta spike entrante (solo cuando aplica)\n"
+    "- rev: true si se detecta reversion en curso (solo cuando aplica)\n\n"
     "REGLAS de decision:\n"
     "COMPRAR: sc>=55 + con>=65 + z<1.5 + mom not in (accelerating, negative) + vol>1M + grade in (A,B,C)\n"
     "EVITAR: SOLO cuando hay riesgo claro e inminente: z>=2.0 | (mom=accelerating AND z>1.0) | "
@@ -89,10 +102,14 @@ def _get_groq_key(config) -> str:
 
 
 def _slim_opp(opp: dict) -> dict:
-    """Extract relevant fields for AI analysis — rich enough for good analysis."""
-    ind = opp.get("indicators", {})
+    """Extract relevant fields for AI analysis.
+
+    Every key is ALWAYS present so the AI never has to guess about missing
+    data.  The key names exactly match what SYSTEM_PROMPT documents.
+    """
+    ind = opp.get("indicators", {}) or {}
     is_cross = opp.get("mode") == "cross_exchange"
-    hist = opp.get("history", {})
+    hist = opp.get("history", {}) or {}
 
     slim = {
         "id": opp.get("_id", ""),
@@ -106,6 +123,9 @@ def _slim_opp(opp: dict) -> dict:
         "vol": round((opp.get("volume_24h", 0) or 0) / 1e6, 1),
         "grade": opp.get("stability_grade", "D"),
         "ehd": opp.get("estimated_hold_days", 0),
+        # Always include consistency and fee drag (0 is a valid value)
+        "con": round(hist.get("pct", hist.get("favorable_pct", 0)) or 0),
+        "fd": round(hist.get("fee_drag", 0) or 0, 2),
     }
 
     if is_cross:
@@ -113,25 +133,15 @@ def _slim_opp(opp: dict) -> dict:
     else:
         slim["fr"] = round((opp.get("funding_rate", 0) or 0) * 100, 4)
 
-    # Consistency & fee drag from history
-    if hist:
-        con = hist.get("pct", hist.get("favorable_pct", 0))
-        if con:
-            slim["con"] = round(con)
-        fd = hist.get("fee_drag", 0)
-        if fd:
-            slim["fd"] = round(fd, 2)
-
-    # Indicadores aplanados
-    if ind:
-        slim["mom"] = ind.get("momentum_signal", "flat")
-        slim["z"] = round(ind.get("z_score", 0), 1)
-        slim["pct"] = round(ind.get("percentile", 0))
-        slim["reg"] = ind.get("regime", "normal")
-        if ind.get("is_spike_incoming"):
-            slim["spike"] = True
-        if ind.get("is_spike_ending"):
-            slim["rev"] = True
+    # Indicators — always present with defaults
+    slim["mom"] = ind.get("momentum_signal", "flat") or "flat"
+    slim["z"] = round(ind.get("z_score", 0) or 0, 1)
+    slim["pctl"] = round(ind.get("percentile", 0) or 0)
+    slim["reg"] = ind.get("regime", "normal") or "normal"
+    if ind.get("is_spike_incoming"):
+        slim["spike"] = True
+    if ind.get("is_spike_ending"):
+        slim["rev"] = True
 
     return slim
 

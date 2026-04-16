@@ -1315,12 +1315,13 @@ function updateStatus(data) {
   if (data.scan_count !== undefined)
     document.getElementById('st-scan').textContent = 'Scan #' + data.scan_count;
   if (data.last_scan) {
-    const ts = typeof data.last_scan === 'number' && data.last_scan > 1e9
-      ? new Date(data.last_scan * 1000)
-      : null;
-    document.getElementById('st-time').textContent = ts
-      ? ts.toLocaleTimeString()
-      : data.last_scan;
+    let display = data.last_scan;
+    const v = Number(data.last_scan);
+    if (!isNaN(v) && v > 1e9) {
+      const d = new Date(v * 1000);
+      display = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+    }
+    document.getElementById('st-time').textContent = display;
   }
 }
 
