@@ -58,6 +58,19 @@ def _run_migrations(db):
         # History: add exposure and leverage columns
         "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS exposure FLOAT DEFAULT 0",
         "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS leverage INTEGER DEFAULT 1",
+        # Fee accounting v2: split round-trip entry_fees into entry + exit
+        # halves and expose per-position overrides so the user can enter
+        # the real fees once a position is open.
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS exit_fees_est FLOAT DEFAULT 0",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS entry_fees_real FLOAT",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS exit_fees_real FLOAT",
+        # One-shot backfill: legacy rows stored round-trip fees under
+        # entry_fees.  Split them 50/50 so the new PnL helper (which adds
+        # entry + exit) stays consistent with historical numbers.
+        "UPDATE user_positions SET exit_fees_est = entry_fees / 2, "
+        "entry_fees = entry_fees / 2 "
+        "WHERE (exit_fees_est IS NULL OR exit_fees_est = 0) "
+        "AND entry_fees > 0 AND entry_fees_real IS NULL",
     ]
     for sql in migrations:
         try:

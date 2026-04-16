@@ -196,8 +196,10 @@ def _compute_position_health(position: dict, current_market_rate: float,
     """
     entry_fr = position.get("entry_fr", 0)
     earned = position.get("earned_real", 0)
-    entry_fees = position.get("entry_fees", 0)
-    est_fees = entry_fees * 2
+    # Prefer user-entered real fees over estimates (fixes the old double-count
+    # where `entry_fees * 2` ran on top of an already-round-trip value).
+    from portfolio.manager import position_fees as _pf
+    _e, _x, est_fees, _is_real = _pf(position)
     elapsed_h = position.get("elapsed_h", 0) or 0
     payments = position.get("payments") or []
     fr_reversed = ((entry_fr > 0 and current_market_rate < 0)

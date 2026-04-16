@@ -124,6 +124,9 @@ class ScannerWorker:
             "payment_count": pos.payment_count or 0,
             "avg_rate": pos.avg_rate or 0,
             "entry_fees": pos.entry_fees or 0,
+            "exit_fees_est": getattr(pos, "exit_fees_est", 0) or 0,
+            "entry_fees_real": getattr(pos, "entry_fees_real", None),
+            "exit_fees_real": getattr(pos, "exit_fees_real", None),
             "payments": pos.payments_json or [],
         }
 
@@ -811,11 +814,15 @@ class ScannerWorker:
 
                 now = datetime.now(timezone.utc)
 
-                # Build batch of rows to insert
+                # Build batch of rows to insert.  Track per-exchange skip
+                # counts so we can spot adapters returning next_funding_ts=0.
                 rows = []
+                skipped_by_exchange: dict = {}
                 for d in all_data:
                     funding_ts = d.get("next_funding_ts", 0)
                     if not funding_ts:
+                        ex = d.get("exchange", "?")
+                        skipped_by_exchange[ex] = skipped_by_exchange.get(ex, 0) + 1
                         continue
                     rows.append({
                         "symbol": d.get("symbol", ""),
@@ -827,6 +834,12 @@ class ScannerWorker:
                         "funding_ts": int(funding_ts),
                         "captured_at": now,
                     })
+
+                if skipped_by_exchange:
+                    log.warning(
+                        f"Snapshot filter: dropped {sum(skipped_by_exchange.values())} "
+                        f"rows with funding_ts<=0 — {skipped_by_exchange}"
+                    )
 
                 if not rows:
                     return
@@ -853,10 +866,28 @@ class ScannerWorker:
                     if deleted:
                         log.info(f"Cleaned {deleted} old rate snapshots")
 
-                log.info(f"Stored {inserted} rate snapshots (batch of {len(rows)})")
+                # Distinguish "constraint dedup'd as expected" from "all
+                # timestamps are stale — investigate".  The unique constraint
+                # (symbol, exchange, funding_ts) naturally dedupes within a
+                # single funding window, so Stored 0 is the common case and
+                # only a concern when every funding_ts is in the past.
+                now_ms = int(time.time() * 1000)
+                min_ts = min(r["funding_ts"] for r in rows)
+                max_ts = max(r["funding_ts"] for r in rows)
+                if inserted == 0 and max_ts <= now_ms:
+                    log.warning(
+                        f"Snapshots 0/{len(rows)} inserted — all next_funding_ts "
+                        f"are in the past (min={min_ts}, max={max_ts}). "
+                        f"Exchanges may be returning stale data."
+                    )
+                else:
+                    log.info(
+                        f"Stored {inserted}/{len(rows)} rate snapshots "
+                        f"(funding_ts range: {min_ts}..{max_ts})"
+                    )
 
         except Exception as e:
-            log.warning(f"Rate snapshot storage failed (non-critical): {e}")
+            log.exception(f"Rate snapshot storage failed (non-critical): {e}")
 
     # ── Score Snapshot Storage (rolling window) ────────────────
 

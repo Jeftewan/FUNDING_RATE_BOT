@@ -231,6 +231,13 @@ class DefiExchangeManager:
                 fr = float(item.get("lastFundingRate", "0"))
                 price = float(item.get("markPrice", "0"))
                 next_ts = int(item.get("nextFundingTime", 0))
+                # Aster occasionally returns 0 or a stale past value — fall
+                # back to the next hour boundary so the snapshot unique
+                # constraint can advance.  Same helper already used by
+                # Hyperliquid/GMX/Lighter/Extended adapters above.
+                now_ms = int(time.time() * 1000)
+                if next_ts <= 0 or next_ts <= now_ms:
+                    next_ts = _calc_next_hourly_ts()
 
                 if price <= 0:
                     continue

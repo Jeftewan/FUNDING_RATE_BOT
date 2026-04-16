@@ -182,7 +182,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 "opportunities": filtered,
                 "total_unfiltered": len(opps),
                 "coinglass": s.get("coinglass_data", []),
-                "last_scan": s.get("last_scan_time", "—"),
+                "last_scan": s.get("last_scan", 0),
                 "scan_count": s.get("scan_count", 0),
                 "scanning": s.get("scanning", False),
             })
@@ -205,7 +205,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             return jsonify({
                 "opportunities": opps,
                 "total_unfiltered": len(opps),
-                "last_scan": s.get("last_scan_time", "—"),
+                "last_scan": s.get("last_scan", 0),
                 "scan_count": s.get("scan_count", 0),
                 "scanning": s.get("scanning", False),
             })
@@ -364,8 +364,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 el_h = (time.time() - pos["entry_time"] / 1000) / 3600
 
                 earned = pos.get("earned_real", 0)
-                entry_fees = pos.get("entry_fees", 0)
-                est_fees = entry_fees * 2  # entry + exit
+                from portfolio.manager import position_fees as _pf
+                entry_fee_val, exit_fee_val, est_fees, fees_is_real = _pf(pos)
                 net_earned = earned - est_fees
 
                 fr_reversed = ((pos["entry_fr"] > 0 and cfr < 0) or
@@ -388,6 +388,9 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "intervals": int(el_h / ih),
                     "est_earned": earned,
                     "est_fees_total": est_fees,
+                    "entry_fees_effective": entry_fee_val,
+                    "exit_fees_effective": exit_fee_val,
+                    "fees_is_real": fees_is_real,
                     "net_earned": net_earned,
                     "current_apr": current_apr,
                     "fr_reversed": fr_reversed,
@@ -455,8 +458,9 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             ih = pos.get("ih", 8)
             el_h = (now - pos["entry_time"] / 1000) / 3600
             earned = pos.get("earned_real", 0)
-            entry_fees = pos.get("entry_fees", 0)
-            net_earned = earned - entry_fees * 2
+            from portfolio.manager import position_fees as _pf
+            _e, _x, _fees_total, _ = _pf(pos)
+            net_earned = earned - _fees_total
             exposure = pos.get("exposure", pos["capital_used"] / 2)
             ipd = 24 / ih
             daily = exposure * abs(cfr) * ipd
@@ -489,10 +493,16 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @app.route("/api/close_position", methods=["POST"])
     @auth_required
     def api_close_position():
-        """Close a position manually."""
+        """Close a position manually.
+
+        Body may include `exit_fees_real` (USD) to record the actual exit
+        trading cost — this overrides the estimate in the PnL and is
+        persisted on the position before closing.
+        """
         data = flask_req.json or {}
         pos_id = data.get("position_id", "")
         reason = data.get("reason", "manual")
+        exit_fees_real = data.get("exit_fees_real")
 
         uid = get_current_user_id()
 
@@ -504,14 +514,31 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 return jsonify({"ok": False, "msg": "Posicion no encontrada"})
 
             from core.db_models import UserPosition
+            from core.database import db as _db
             pos = UserPosition.query.filter_by(id=db_pos_id, user_id=uid, status="active").first()
             if not pos:
                 return jsonify({"ok": False, "msg": "Posicion no encontrada"})
 
+            # Persist the user-supplied real exit fees before computing PnL
+            if exit_fees_real is not None:
+                try:
+                    val = float(exit_fees_real)
+                    if val >= 0:
+                        pos.exit_fees_real = val
+                        _db.session.commit()
+                except (TypeError, ValueError):
+                    pass
+
             ih = pos.ih or 8
             el_h = (time.time() - pos.entry_time / 1000) / 3600
             earned = pos.earned_real or 0
-            fees = (pos.entry_fees or 0) * 2
+            from portfolio.manager import position_fees as _pf
+            _e, _x, fees, _ = _pf({
+                "entry_fees": pos.entry_fees or 0,
+                "exit_fees_est": pos.exit_fees_est or 0,
+                "entry_fees_real": pos.entry_fees_real,
+                "exit_fees_real": pos.exit_fees_real,
+            })
             net_earned = earned - fees
 
             result_data = {
@@ -563,6 +590,87 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 log.warning(f"WhatsApp close notification failed: {e}")
 
         return jsonify({"ok": True, "result": result})
+
+    # ── Update real fees on an open position ───────────────────
+    @app.route("/api/positions/<pos_id>/fees", methods=["PATCH", "POST"])
+    @auth_required
+    def api_update_position_fees(pos_id):
+        """Let the user enter the real fees they actually paid.
+
+        Body: { "entry_fees_real"?: float, "exit_fees_real"?: float }
+        Any missing key is left untouched.  Sending null clears an
+        existing override (reverts to the estimate).
+        """
+        uid = get_current_user_id()
+        if not uid or not get_db_persist():
+            return jsonify({"ok": False, "msg": "DB no disponible"}), 400
+
+        try:
+            db_pos_id = int(pos_id)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "msg": "ID invalido"}), 400
+
+        from core.database import db as _db
+        from core.db_models import UserPosition
+        pos = UserPosition.query.filter_by(
+            id=db_pos_id, user_id=uid, status="active"
+        ).first()
+        if not pos:
+            return jsonify({"ok": False, "msg": "Posicion no encontrada"}), 404
+
+        data = flask_req.json or {}
+        updated = []
+
+        if "entry_fees_real" in data:
+            v = data["entry_fees_real"]
+            if v is None or v == "":
+                pos.entry_fees_real = None
+                updated.append("entry_fees_real=null")
+            else:
+                try:
+                    pos.entry_fees_real = max(0.0, float(v))
+                    updated.append(f"entry_fees_real={pos.entry_fees_real}")
+                except (TypeError, ValueError):
+                    return jsonify({"ok": False, "msg": "entry_fees_real invalido"}), 400
+
+        if "exit_fees_real" in data:
+            v = data["exit_fees_real"]
+            if v is None or v == "":
+                pos.exit_fees_real = None
+                updated.append("exit_fees_real=null")
+            else:
+                try:
+                    pos.exit_fees_real = max(0.0, float(v))
+                    updated.append(f"exit_fees_real={pos.exit_fees_real}")
+                except (TypeError, ValueError):
+                    return jsonify({"ok": False, "msg": "exit_fees_real invalido"}), 400
+
+        if not updated:
+            return jsonify({"ok": False, "msg": "Nada que actualizar"}), 400
+
+        _db.session.commit()
+        log.info(f"Position {db_pos_id} fees updated: {', '.join(updated)}")
+
+        from portfolio.manager import position_fees as _pf
+        entry, exit_, total, is_real = _pf({
+            "entry_fees": pos.entry_fees or 0,
+            "exit_fees_est": pos.exit_fees_est or 0,
+            "entry_fees_real": pos.entry_fees_real,
+            "exit_fees_real": pos.exit_fees_real,
+        })
+
+        return jsonify({
+            "ok": True,
+            "position_id": db_pos_id,
+            "entry_fees": entry,
+            "exit_fees": exit_,
+            "fees_total": total,
+            "fees_is_real": is_real,
+            "entry_fees_real": pos.entry_fees_real,
+            "exit_fees_real": pos.exit_fees_real,
+            "entry_fees_est": pos.entry_fees or 0,
+            "exit_fees_est": pos.exit_fees_est or 0,
+        })
 
     # ── History ────────────────────────────────────────────────
     @app.route("/api/history")

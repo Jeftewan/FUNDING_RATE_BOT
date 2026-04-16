@@ -821,7 +821,17 @@ function renderPositions(data) {
         <div class="pos-field"><span class="label">APR</span><span class="value" style="color:${frColor}">${p.current_apr?.toFixed(1)}%</span></div>
         <div class="pos-field"><span class="label">Prom</span><span class="value">${p.avg_rate ? (p.avg_rate*100).toFixed(4) + '%' : '—'}</span></div>
         <div class="pos-field"><span class="label">Ganancia</span><span class="value" style="color:var(--green)">$${p.est_earned?.toFixed(2)}</span></div>
-        <div class="pos-field"><span class="label">Fees</span><span class="value" style="color:var(--red)">$${p.est_fees_total?.toFixed(2)}</span></div>
+        <div class="pos-field pos-field-fees">
+          <span class="label">
+            Fees
+            ${p.fees_is_real
+              ? '<span class="fee-real" title="Fees reales confirmados">\u2713</span>'
+              : '<span class="fee-warn" title="Estos fees son estimados. Pulsa el valor para introducir los reales que pagaste.">\u26A0</span>'}
+          </span>
+          <span class="value fees-clickable" onclick="editPosFees('${posId}')" title="Editar fees reales" style="color:var(--red); cursor:pointer; text-decoration:underline dotted">
+            $${p.est_fees_total?.toFixed(2)}
+          </span>
+        </div>
         <div class="pos-field"><span class="label">Neto</span><span class="value" style="color:${earnColor};font-weight:700">$${p.net_earned?.toFixed(2)}</span></div>
       </div>
 
@@ -959,12 +969,29 @@ function renderPositions(data) {
 }
 
 async function closePos(posId, symbol) {
-  if (!await showConfirm(`Cerrar posicion ${symbol}?`)) return;
+  // Look up the position so we can pre-populate the estimated exit fee
+  let estExit = 0;
+  let estEntry = 0;
+  try {
+    const pos = (_lastPosData?.positions || []).find(p => String(p.id) === String(posId));
+    if (pos) {
+      estExit = pos.exit_fees_effective ?? pos.exit_fees_est ?? 0;
+      estEntry = pos.entry_fees_effective ?? pos.entry_fees ?? 0;
+    }
+  } catch (_) { /* noop */ }
+
+  const confirmed = await showCloseModal(symbol, estEntry, estExit);
+  if (!confirmed) return;
+
   try {
     const res = await fetch('/api/close_position', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ position_id: posId, reason: 'manual' }),
+      body: JSON.stringify({
+        position_id: posId,
+        reason: 'manual',
+        exit_fees_real: confirmed.exit_fees_real,
+      }),
     });
     const data = await res.json();
     if (data.ok) {
@@ -977,6 +1004,140 @@ async function closePos(posId, symbol) {
   } catch (e) {
     showToast('Error al cerrar posicion', 'error');
   }
+}
+
+// ── Fee editor modal ─────────────────────────────────────────
+function showCloseModal(symbol, estEntry, estExit) {
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `
+      <div class="confirm-box" style="max-width:420px">
+        <div class="confirm-msg" style="text-align:left">
+          <div style="font-size:15px;font-weight:600;margin-bottom:8px">Cerrar posicion ${symbol}</div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-bottom:12px">
+            Opcional: introduce las fees reales de salida que pagaste.
+            Si lo dejas vacio, se usa el estimado de $${(estExit || 0).toFixed(2)}.
+          </div>
+          <label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">
+            Fees reales de salida (USD)
+          </label>
+          <input type="number" step="0.01" min="0" id="close-exit-fees" placeholder="${(estExit || 0).toFixed(2)}"
+                 style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px" />
+        </div>
+        <div class="confirm-actions">
+          <button class="btn btn-secondary" data-action="cancel">Cancelar</button>
+          <button class="btn btn-danger" data-action="ok">Cerrar posicion</button>
+        </div>
+      </div>`;
+    const close = (val) => { overlay.remove(); resolve(val); };
+    overlay.querySelector('[data-action="ok"]').onclick = () => {
+      const raw = overlay.querySelector('#close-exit-fees').value;
+      const val = raw === '' ? null : parseFloat(raw);
+      close({ exit_fees_real: (isNaN(val) || val < 0) ? null : val });
+    };
+    overlay.querySelector('[data-action="cancel"]').onclick = () => close(false);
+    overlay.onclick = (e) => { if (e.target === overlay) close(false); };
+    const onEsc = (e) => { if (e.key === 'Escape') { document.removeEventListener('keydown', onEsc); close(false); } };
+    document.addEventListener('keydown', onEsc);
+    document.body.appendChild(overlay);
+    setTimeout(() => overlay.querySelector('#close-exit-fees').focus(), 50);
+  });
+}
+
+async function editPosFees(posId) {
+  const pos = (_lastPosData?.positions || []).find(p => String(p.id) === String(posId));
+  if (!pos) { showToast('Posicion no encontrada', 'error'); return; }
+
+  const entryCur = pos.entry_fees_real ?? pos.entry_fees_effective ?? pos.entry_fees ?? 0;
+  const exitCur = pos.exit_fees_real ?? pos.exit_fees_effective ?? pos.exit_fees_est ?? 0;
+  const entryEst = pos.entry_fees ?? 0;
+  const exitEst = pos.exit_fees_est ?? 0;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `
+    <div class="confirm-box" style="max-width:460px">
+      <div class="confirm-msg" style="text-align:left">
+        <div style="font-size:15px;font-weight:600;margin-bottom:4px">Fees reales — ${pos.symbol}</div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px">
+          Introduce las fees que realmente pagaste. Vacio = usar estimado.
+        </div>
+
+        <label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">
+          Fees entrada (USD) <span style="opacity:.6">— estimado $${entryEst.toFixed(2)}</span>
+        </label>
+        <input type="number" step="0.01" min="0" id="fee-entry"
+               value="${pos.entry_fees_real != null ? entryCur.toFixed(2) : ''}"
+               placeholder="${entryEst.toFixed(2)}"
+               style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;margin-bottom:12px" />
+
+        <label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">
+          Fees salida (USD) <span style="opacity:.6">— estimado $${exitEst.toFixed(2)}</span>
+        </label>
+        <input type="number" step="0.01" min="0" id="fee-exit"
+               value="${pos.exit_fees_real != null ? exitCur.toFixed(2) : ''}"
+               placeholder="${exitEst.toFixed(2)}"
+               style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px" />
+      </div>
+      <div class="confirm-actions">
+        <button class="btn btn-secondary" data-action="clear" title="Volver al estimado">Limpiar</button>
+        <button class="btn btn-secondary" data-action="cancel">Cancelar</button>
+        <button class="btn btn-primary" data-action="ok">Guardar</button>
+      </div>
+    </div>`;
+
+  const cleanup = () => overlay.remove();
+  document.body.appendChild(overlay);
+  setTimeout(() => overlay.querySelector('#fee-entry').focus(), 50);
+
+  const send = async (body) => {
+    try {
+      const res = await fetch(`/api/positions/${encodeURIComponent(posId)}/fees`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast('Fees actualizadas', 'success');
+        cleanup();
+        loadPositions();
+      } else {
+        showToast(data.msg || 'Error al actualizar fees', 'error');
+      }
+    } catch (e) {
+      showToast('Error de red al actualizar fees', 'error');
+    }
+  };
+
+  overlay.querySelector('[data-action="ok"]').onclick = () => {
+    const eRaw = overlay.querySelector('#fee-entry').value;
+    const xRaw = overlay.querySelector('#fee-exit').value;
+    const body = {};
+    if (eRaw !== '') {
+      const v = parseFloat(eRaw);
+      if (isNaN(v) || v < 0) { showToast('Fees de entrada invalidas', 'error'); return; }
+      body.entry_fees_real = v;
+    } else {
+      body.entry_fees_real = null;
+    }
+    if (xRaw !== '') {
+      const v = parseFloat(xRaw);
+      if (isNaN(v) || v < 0) { showToast('Fees de salida invalidas', 'error'); return; }
+      body.exit_fees_real = v;
+    } else {
+      body.exit_fees_real = null;
+    }
+    send(body);
+  };
+  overlay.querySelector('[data-action="clear"]').onclick = () => {
+    send({ entry_fees_real: null, exit_fees_real: null });
+  };
+  overlay.querySelector('[data-action="cancel"]').onclick = cleanup;
+  overlay.onclick = (e) => { if (e.target === overlay) cleanup(); };
+  const onEsc = (e) => { if (e.key === 'Escape') { document.removeEventListener('keydown', onEsc); cleanup(); } };
+  document.addEventListener('keydown', onEsc);
 }
 
 let _lastHistoryData = [];
@@ -1153,8 +1314,14 @@ function updateStatus(data) {
   if (data.status) document.getElementById('st-status').innerHTML = '<i class="status-dot"></i>' + data.status;
   if (data.scan_count !== undefined)
     document.getElementById('st-scan').textContent = 'Scan #' + data.scan_count;
-  if (data.last_scan)
-    document.getElementById('st-time').textContent = data.last_scan;
+  if (data.last_scan) {
+    const ts = typeof data.last_scan === 'number' && data.last_scan > 1e9
+      ? new Date(data.last_scan * 1000)
+      : null;
+    document.getElementById('st-time').textContent = ts
+      ? ts.toLocaleTimeString()
+      : data.last_scan;
+  }
 }
 
 // ── Audio alert ───────────────────────────────────────────────

@@ -85,6 +85,19 @@ class ExchangeManager:
             except Exception as e:
                 log.error(f"Failed to init {name}: {e}")
 
+        # Wire slippage + fee loader so analysis/fees.py can hit real data
+        try:
+            from analysis.slippage import bind_exchange_manager
+            bind_exchange_manager(self)
+        except Exception as e:
+            log.debug(f"slippage bind skipped: {e}")
+
+        try:
+            from analysis.fee_loader import load_fees_async
+            load_fees_async(self._exchanges, EXCHANGE_NAMES)
+        except Exception as e:
+            log.debug(f"fee_loader skipped: {e}")
+
     def get_exchange(self, name: str):
         return self._exchanges.get(name.lower())
 
@@ -220,9 +233,13 @@ class ExchangeManager:
                 ih = self._get_funding_interval(exchange_name, info, data, symbol)
                 ipd = 24 / ih if ih > 0 else 3
 
-                # If next funding timestamp is missing (e.g. Bitget bulk endpoint),
-                # calculate from known schedule (fixed intervals at 00:00, 08:00, 16:00 UTC etc.)
-                if not next_ts or next_ts <= 0:
+                # If next funding timestamp is missing (e.g. Bitget bulk endpoint)
+                # OR is in the past (some exchanges briefly return the LAST
+                # payment time around rollover), calculate from the fixed UTC
+                # schedule.  A past timestamp would otherwise freeze the
+                # snapshot unique constraint (symbol, exchange, funding_ts).
+                now_ms = int(time.time() * 1000)
+                if not next_ts or next_ts <= 0 or next_ts <= now_ms:
                     next_ts = self._calc_next_funding_ts(ih)
 
                 # Minutes to next funding
