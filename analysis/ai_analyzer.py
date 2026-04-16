@@ -329,8 +329,9 @@ def _slim_position(pos: dict) -> dict:
     # Last 5 rates for better trend detection
     recent = [round(p["rate"] * 100, 4) for p in payments[-5:]] if payments else []
 
-    entry_fees = pos.get("entry_fees", 0) or 0
-    est_fees = entry_fees * 2  # entry + exit estimate
+    # Prefer user-entered real fees; otherwise sum entry estimate + exit estimate.
+    from portfolio.manager import position_fees as _pf
+    _e, _x, est_fees, _is_real = _pf(pos)
 
     slim = {
         "id": str(pos.get("id", "")),

@@ -124,6 +124,9 @@ class ScannerWorker:
             "payment_count": pos.payment_count or 0,
             "avg_rate": pos.avg_rate or 0,
             "entry_fees": pos.entry_fees or 0,
+            "exit_fees_est": getattr(pos, "exit_fees_est", 0) or 0,
+            "entry_fees_real": getattr(pos, "entry_fees_real", None),
+            "exit_fees_real": getattr(pos, "exit_fees_real", None),
             "payments": pos.payments_json or [],
         }
 

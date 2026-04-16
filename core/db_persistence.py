@@ -128,6 +128,9 @@ class DBPersistence:
             long_exchange=pos_dict.get("long_exchange", ""),
             short_exchange=pos_dict.get("short_exchange", ""),
             entry_fees=pos_dict.get("entry_fees", 0),
+            exit_fees_est=pos_dict.get("exit_fees_est", 0),
+            entry_fees_real=pos_dict.get("entry_fees_real"),
+            exit_fees_real=pos_dict.get("exit_fees_real"),
             payments_json=[],
         )
         db.session.add(pos)
@@ -242,6 +245,9 @@ class DBPersistence:
             "payment_count": pos.payment_count,
             "avg_rate": pos.avg_rate,
             "entry_fees": pos.entry_fees,
+            "exit_fees_est": pos.exit_fees_est or 0,
+            "entry_fees_real": pos.entry_fees_real,
+            "exit_fees_real": pos.exit_fees_real,
             "payments": pos.payments_json or [],
         }
 

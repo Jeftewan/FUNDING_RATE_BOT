@@ -85,6 +85,19 @@ class ExchangeManager:
             except Exception as e:
                 log.error(f"Failed to init {name}: {e}")
 
+        # Wire slippage + fee loader so analysis/fees.py can hit real data
+        try:
+            from analysis.slippage import bind_exchange_manager
+            bind_exchange_manager(self)
+        except Exception as e:
+            log.debug(f"slippage bind skipped: {e}")
+
+        try:
+            from analysis.fee_loader import load_fees_async
+            load_fees_async(self._exchanges, EXCHANGE_NAMES)
+        except Exception as e:
+            log.debug(f"fee_loader skipped: {e}")
+
     def get_exchange(self, name: str):
         return self._exchanges.get(name.lower())
 

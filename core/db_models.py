@@ -94,7 +94,14 @@ class UserPosition(db.Model):
     payment_count = db.Column(db.Integer, default=0)
     avg_rate = db.Column(db.Float, default=0)
     status = db.Column(db.String(10), default="active", index=True)  # active / closed
+    # Fee accounting: `entry_fees` now stores the ENTRY-only estimate
+    # (half of the old round-trip value).  `exit_fees_est` is the symmetric
+    # exit estimate. `entry_fees_real` / `exit_fees_real` are user-entered
+    # actuals that, when present, override the estimates in every PnL calc.
     entry_fees = db.Column(db.Float, default=0)
+    exit_fees_est = db.Column(db.Float, default=0)
+    entry_fees_real = db.Column(db.Float, nullable=True)
+    exit_fees_real = db.Column(db.Float, nullable=True)
     payments_json = db.Column(db.JSON, default=list)  # [{ts, rate, earned, cumulative}]
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at = db.Column(db.DateTime, nullable=True)

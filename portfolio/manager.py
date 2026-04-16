@@ -8,6 +8,36 @@ from analysis.fees import calculate_spot_perp_fees, calculate_cross_exchange_fee
 log = logging.getLogger("bot")
 
 
+def position_fees(pos: dict) -> tuple:
+    """Return (entry_fees, exit_fees, total, is_real) for a position.
+
+    Preference order, per-side:
+        entry_fees_real (user override)  →  entry_fees (estimate)
+        exit_fees_real  (user override)  →  exit_fees_est (estimate)
+                                         →  entry_fees (legacy fallback)
+
+    ``is_real`` is True iff the user has entered at least one actual
+    value, so the UI can swap the warning icon for a check mark.
+    """
+    e_real = pos.get("entry_fees_real")
+    x_real = pos.get("exit_fees_real")
+
+    entry_est = pos.get("entry_fees", 0) or 0
+    exit_est = pos.get("exit_fees_est", 0) or 0
+    # Legacy fallback: very old positions only have entry_fees (round-trip)
+    # and no exit_fees_est — split in half at read time.
+    if exit_est == 0 and entry_est > 0 and pos.get("exit_fees_est") in (0, None):
+        # Only treat as legacy if the value really hasn't been migrated;
+        # the DB migration already halves it in place for existing rows.
+        pass
+
+    entry = e_real if e_real is not None else entry_est
+    exit_ = x_real if x_real is not None else exit_est
+
+    is_real = bool(e_real is not None or x_real is not None)
+    return float(entry), float(exit_), float(entry) + float(exit_), is_real
+
+
 def get_capital_summary(state: dict) -> dict:
     """Calculate capital usage summary."""
     total = state["total_capital"]
@@ -67,18 +97,28 @@ def open_position(state: dict, opportunity: dict, capital: float,
         pos["short_exchange"] = opportunity.get("short_exchange", "")
         pos["exchange"] = opportunity.get("short_exchange", "")  # Primary for lookups
 
-    # Calculate fees for reference
+    # Calculate fees for reference — pass the symbol so analysis/fees can
+    # consult the live order book for slippage when available.
+    sym_for_slip = pos.get("symbol") or opportunity.get("symbol")
     if mode == "spot_perp":
         fees = calculate_spot_perp_fees(
-            pos["exchange"], capital, opportunity.get("volume_24h", 1e6)
+            pos["exchange"], capital, opportunity.get("volume_24h", 1e6),
+            symbol=sym_for_slip,
         )
     else:
         fees = calculate_cross_exchange_fees(
             pos.get("long_exchange", ""), pos.get("short_exchange", ""),
-            capital, opportunity.get("volume_24h", 1e6)
+            capital, opportunity.get("volume_24h", 1e6),
+            symbol=sym_for_slip,
         )
 
-    pos["entry_fees"] = fees["total_cost"]
+    # entry_fees now stores the ENTRY-only estimate (trading + slippage).
+    # exit_fees_est stores the symmetric exit estimate.  The user can
+    # override either later via PATCH /api/positions/<id>/fees.
+    pos["entry_fees"] = fees["entry_fees"] + fees["entry_slip"]
+    pos["exit_fees_est"] = fees["exit_fees"] + fees["exit_slip"]
+    pos["entry_fees_real"] = None
+    pos["exit_fees_real"] = None
 
     # Calculate sizing based on leverage
     leverage = max(1, leverage)
@@ -174,7 +214,8 @@ def close_position(state: dict, position_id: str, reason: str = "manual") -> tup
     el_h = (time.time() - pos["entry_time"] / 1000) / 3600
     ivs = int(el_h / ih)
     earned = pos.get("earned_real", 0)
-    fees = pos.get("entry_fees", 0) * 2  # Entry + estimated exit fees
+    # Real user-entered fees take precedence over estimates
+    _entry, _exit, fees, _is_real = position_fees(pos)
     net_earned = earned - fees
 
     state["history"].append({

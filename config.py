@@ -38,18 +38,59 @@ class Config:
     BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "")
     DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 
-    # Fee structure per exchange (maker/taker in %)
+    # Fee structure per exchange (maker/taker in %).
+    # NEW shape exposes maker+taker for spot and futures; legacy `spot`/`fut`
+    # keys are kept as aliases of the taker values so existing callers don't
+    # break.  Values are sourced from exchanges' public fee pages at the base
+    # (non-VIP) tier; they are overridden at runtime by analysis/fee_loader.py
+    # which pulls real values via CCXT when available.
     FEES = {
-        "Binance": {"spot": 0.10, "fut": 0.05},
-        "Bybit": {"spot": 0.10, "fut": 0.06},
-        "OKX": {"spot": 0.10, "fut": 0.05},
-        "Bitget": {"spot": 0.10, "fut": 0.06},
+        "Binance": {
+            "spot_maker": 0.10, "spot_taker": 0.10,
+            "fut_maker": 0.02, "fut_taker": 0.05,
+            "spot": 0.10, "fut": 0.05,
+        },
+        "Bybit": {
+            "spot_maker": 0.10, "spot_taker": 0.10,
+            "fut_maker": 0.02, "fut_taker": 0.055,
+            "spot": 0.10, "fut": 0.055,
+        },
+        "OKX": {
+            "spot_maker": 0.08, "spot_taker": 0.10,
+            "fut_maker": 0.02, "fut_taker": 0.05,
+            "spot": 0.10, "fut": 0.05,
+        },
+        "Bitget": {
+            "spot_maker": 0.10, "spot_taker": 0.10,
+            "fut_maker": 0.02, "fut_taker": 0.06,
+            "spot": 0.10, "fut": 0.06,
+        },
         # DeFi exchanges (perp-only, no spot fees)
-        "Hyperliquid": {"spot": 0, "fut": 0.035},
-        "GMX": {"spot": 0, "fut": 0.07},
-        "Aster": {"spot": 0, "fut": 0.05},
-        "Lighter": {"spot": 0, "fut": 0.04},
-        "Extended": {"spot": 0, "fut": 0.05},
+        "Hyperliquid": {
+            "spot_maker": 0, "spot_taker": 0,
+            "fut_maker": 0.01, "fut_taker": 0.035,
+            "spot": 0, "fut": 0.035,
+        },
+        "GMX": {
+            "spot_maker": 0, "spot_taker": 0,
+            "fut_maker": 0.07, "fut_taker": 0.07,
+            "spot": 0, "fut": 0.07,
+        },
+        "Aster": {
+            "spot_maker": 0, "spot_taker": 0,
+            "fut_maker": 0.02, "fut_taker": 0.05,
+            "spot": 0, "fut": 0.05,
+        },
+        "Lighter": {
+            "spot_maker": 0, "spot_taker": 0,
+            "fut_maker": 0, "fut_taker": 0.04,
+            "spot": 0, "fut": 0.04,
+        },
+        "Extended": {
+            "spot_maker": 0, "spot_taker": 0,
+            "fut_maker": 0.02, "fut_taker": 0.05,
+            "spot": 0, "fut": 0.05,
+        },
     }
 
     # DeFi exchanges
