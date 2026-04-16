@@ -182,7 +182,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 "opportunities": filtered,
                 "total_unfiltered": len(opps),
                 "coinglass": s.get("coinglass_data", []),
-                "last_scan": s.get("last_scan_time", "—"),
+                "last_scan": s.get("last_scan", 0),
                 "scan_count": s.get("scan_count", 0),
                 "scanning": s.get("scanning", False),
             })
@@ -205,7 +205,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             return jsonify({
                 "opportunities": opps,
                 "total_unfiltered": len(opps),
-                "last_scan": s.get("last_scan_time", "—"),
+                "last_scan": s.get("last_scan", 0),
                 "scan_count": s.get("scan_count", 0),
                 "scanning": s.get("scanning", False),
             })

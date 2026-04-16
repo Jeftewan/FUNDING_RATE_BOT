@@ -1314,8 +1314,14 @@ function updateStatus(data) {
   if (data.status) document.getElementById('st-status').innerHTML = '<i class="status-dot"></i>' + data.status;
   if (data.scan_count !== undefined)
     document.getElementById('st-scan').textContent = 'Scan #' + data.scan_count;
-  if (data.last_scan)
-    document.getElementById('st-time').textContent = data.last_scan;
+  if (data.last_scan) {
+    const ts = typeof data.last_scan === 'number' && data.last_scan > 1e9
+      ? new Date(data.last_scan * 1000)
+      : null;
+    document.getElementById('st-time').textContent = ts
+      ? ts.toLocaleTimeString()
+      : data.last_scan;
+  }
 }
 
 // ── Audio alert ───────────────────────────────────────────────
