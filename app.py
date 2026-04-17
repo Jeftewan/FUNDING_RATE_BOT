@@ -46,7 +46,7 @@ defi_manager = DefiExchangeManager(Config)
 # ── Arbitrage Scanner ─────────────────────────────────────────
 from analysis.arbitrage import ArbitrageScanner
 
-arb_scanner = ArbitrageScanner(exchange_manager, Config)
+arb_scanner = ArbitrageScanner(exchange_manager, Config, defi_manager=defi_manager)
 
 # ── Coinglass Client (optional) ───────────────────────────────
 from coinglass.client import CoinglassClient

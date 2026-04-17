@@ -13,10 +13,22 @@ NOTIONAL = 1000  # Reference notional for comparison
 
 
 class ArbitrageScanner:
-    def __init__(self, exchange_manager, config):
+    def __init__(self, exchange_manager, config, defi_manager=None):
         self.exchange_manager = exchange_manager
+        self.defi_manager = defi_manager
         self.config = config
         self.aggregator = FundingAggregator()
+        self._defi_exchanges = set(getattr(config, "DEFI_EXCHANGES", []))
+
+    def _fetch_history(self, symbol: str, exchange: str, limit: int):
+        """Route history fetch to the correct manager (CEX vs DeFi)."""
+        if self.defi_manager and exchange in self._defi_exchanges:
+            return self.defi_manager.fetch_funding_history(
+                symbol, exchange, limit=limit
+            )
+        return self.exchange_manager.fetch_funding_history(
+            symbol, exchange, limit=limit
+        )
 
     def scan_spot_perp_opportunities(
         self, all_rates: dict, min_volume: float = None, limit: int = 20
@@ -54,7 +66,7 @@ class ArbitrageScanner:
     def _analyze_spot_perp(self, fr: FundingRate) -> SpotPerpOpportunity:
         """Analyze a single spot-perp opportunity."""
         n_payments_3d = int(fr.payments_per_day * 3)
-        history_obj = self.exchange_manager.fetch_funding_history(
+        history_obj = self._fetch_history(
             fr.symbol, fr.exchange, limit=max(n_payments_3d + 5, 15)
         )
 
@@ -107,6 +119,7 @@ class ArbitrageScanner:
             "fee_drag": fee_drag,
             "current_rate": fr.rate,
             "rates": rates,
+            "mode": "spot_perp",
         }
         sc = opportunity_score(score_params)
         grade = stability_grade(sc)
@@ -213,10 +226,10 @@ class ArbitrageScanner:
         # Fetch history from both exchanges
         n_long_3d = int(long_ppd * 3)
         n_short_3d = int(short_ppd * 3)
-        long_hist = self.exchange_manager.fetch_funding_history(
+        long_hist = self._fetch_history(
             symbol, long_fr.exchange, limit=max(n_long_3d + 5, 15)
         )
-        short_hist = self.exchange_manager.fetch_funding_history(
+        short_hist = self._fetch_history(
             symbol, short_fr.exchange, limit=max(n_short_3d + 5, 15)
         )
 
@@ -261,6 +274,15 @@ class ArbitrageScanner:
         settlement_avg = (abs(diff_hist.get("avg_diff", 0))
                           if diff_series else abs(differential))
 
+        long_is_defi = long_fr.exchange in self._defi_exchanges
+        short_is_defi = short_fr.exchange in self._defi_exchanges
+        if long_is_defi and short_is_defi:
+            cross_mode = "defi"
+        elif long_is_defi or short_is_defi:
+            cross_mode = "defi"  # mixed uses DeFi-side thresholds (weaker leg)
+        else:
+            cross_mode = "cross_exchange"
+
         cross_score_params = {
             "cv": diff_hist.get("cv", 999),
             "min_ratio": diff_hist.get("min_ratio", 0),
@@ -272,6 +294,7 @@ class ArbitrageScanner:
             "fee_drag": fee_ratio,
             "current_rate": differential,
             "rates": diff_series,
+            "mode": cross_mode,
         }
         sc = opportunity_score(cross_score_params)
 
