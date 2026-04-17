@@ -378,10 +378,69 @@ class DefiExchangeManager:
     # ── Helpers ───────────────────────────────────────────────────
 
     def fetch_funding_history(self, symbol: str, exchange: str,
-                              limit: int = 15):
-        """Stub: DeFi history not yet implemented. Return empty."""
+                              limit: int = 30):
+        """Build FundingHistory from locally-persisted snapshots.
+
+        DeFi protocols don't expose a historical funding_rate_history
+        endpoint, but we accumulate their rates into
+        funding_rate_snapshots on every scan. We reconstruct the history
+        from that table (ordered by funding_ts ASC, deduped by funding_ts).
+        """
         from core.models import FundingHistory
-        return FundingHistory(symbol=symbol, exchange=exchange)
+        try:
+            from core.db_models import db, FundingRateSnapshot
+        except Exception:
+            return FundingHistory(symbol=symbol, exchange=exchange)
+
+        try:
+            rows = (
+                db.session.query(
+                    FundingRateSnapshot.rate,
+                    FundingRateSnapshot.funding_ts,
+                )
+                .filter(
+                    FundingRateSnapshot.symbol == symbol,
+                    FundingRateSnapshot.exchange == exchange,
+                )
+                .order_by(FundingRateSnapshot.funding_ts.desc())
+                .limit(limit)
+                .all()
+            )
+        except Exception as e:
+            log.debug(f"DeFi history query failed {symbol}@{exchange}: {e}")
+            return FundingHistory(symbol=symbol, exchange=exchange)
+
+        if not rows:
+            return FundingHistory(symbol=symbol, exchange=exchange)
+
+        rows = list(reversed(rows))  # chronological
+        rates = [float(r.rate) for r in rows]
+        timestamps = [int(r.funding_ts) for r in rows]
+
+        import math
+        avg = sum(rates) / len(rates)
+        variance = sum((r - avg) ** 2 for r in rates) / len(rates)
+        stddev = math.sqrt(variance)
+
+        fr_sign = 1 if rates[-1] >= 0 else -1
+        fav = sum(1 for r in rates
+                  if (fr_sign > 0 and r > 0) or (fr_sign < 0 and r < 0))
+        fav_pct = fav / len(rates) * 100
+
+        streak = 0
+        for r in reversed(rates):
+            if (fr_sign > 0 and r > 0) or (fr_sign < 0 and r < 0):
+                streak += 1
+            else:
+                break
+
+        return FundingHistory(
+            symbol=symbol, exchange=exchange,
+            rates=rates, timestamps=timestamps,
+            avg=avg, stddev=stddev,
+            consistency_pct=fav_pct,
+            streak=streak, favorable_pct=fav_pct,
+        )
 
     def fetch_spot_availability(self, symbol: str, exchange: str) -> bool:
         """DeFi exchanges are perp-only, no spot."""
