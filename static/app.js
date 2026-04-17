@@ -1220,8 +1220,8 @@ async function loadConfig() {
     document.getElementById('cfg-min-days').value = cfg.min_stability_days;
     document.getElementById('cfg-alert-min').value = cfg.alert_minutes_before;
     document.getElementById('cfg-email-on').checked = cfg.email_enabled;
-    document.getElementById('cfg-wa-phone').value = cfg.wa_phone || '';
-    document.getElementById('cfg-wa-apikey').value = cfg.wa_apikey || '';
+    document.getElementById('cfg-tg-token').value = cfg.tg_bot_token || '';
+    document.getElementById('cfg-tg-chatid').value = cfg.tg_chat_id || '';
   } catch (e) {
     console.error('loadConfig error:', e);
   }
@@ -1238,8 +1238,8 @@ async function saveConfig() {
     min_stability_days: parseInt(document.getElementById('cfg-min-days').value),
     alert_minutes_before: parseInt(document.getElementById('cfg-alert-min').value),
     email_enabled: document.getElementById('cfg-email-on').checked,
-    wa_phone: document.getElementById('cfg-wa-phone').value,
-    wa_apikey: document.getElementById('cfg-wa-apikey').value,
+    tg_bot_token: document.getElementById('cfg-tg-token').value,
+    tg_chat_id: document.getElementById('cfg-tg-chatid').value,
   };
 
   try {

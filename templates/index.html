@@ -115,19 +115,20 @@
       </div>
     </div>
     <div class="cfg-section">
-      <h3>WhatsApp</h3>
+      <h3>Telegram</h3>
       <div class="cfg-grid">
         <label class="full"><input type="checkbox" id="cfg-email-on"> Notificaciones habilitadas</label>
-        <label>Telefono<input type="text" id="cfg-wa-phone" class="inp" placeholder="5491155551234"></label>
-        <label>API Key<input type="text" id="cfg-wa-apikey" class="inp" placeholder="123456"></label>
+        <label>Bot Token<input type="text" id="cfg-tg-token" class="inp" placeholder="123456:ABC-DEF..."></label>
+        <label>Chat ID<input type="text" id="cfg-tg-chatid" class="inp" placeholder="123456789"></label>
       </div>
       <p style="font-size:10px;color:#555;margin:8px 0 4px;line-height:1.6">
-        1. Guarda <b>+34 644 31 89 93</b> en contactos<br>
-        2. Envia "<b>I allow callmebot to send me messages</b>" a ese numero<br>
-        3. Espera tu API key e ingresala aqui
+        1. Abre Telegram y busca <b>@BotFather</b><br>
+        2. Envia <b>/newbot</b>, sigue las instrucciones y copia el <b>Bot Token</b><br>
+        3. Busca tu bot y envia <b>/start</b><br>
+        4. Busca <b>@userinfobot</b> y envia <b>/start</b> para obtener tu <b>Chat ID</b>
       </p>
       <div class="cfg-actions">
-        <button class="btn btn-secondary" onclick="testEmail()">Prueba WhatsApp</button>
+        <button class="btn btn-secondary" onclick="testEmail()">Prueba Telegram</button>
         <span id="email-status"></span>
       </div>
     </div>
