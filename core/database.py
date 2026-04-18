@@ -64,6 +64,9 @@ def _run_migrations(db):
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS exit_fees_est FLOAT DEFAULT 0",
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS entry_fees_real FLOAT",
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS exit_fees_real FLOAT",
+        # Telegram notification columns (replaces CallMeBot WhatsApp)
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS tg_chat_id VARCHAR(64) DEFAULT ''",
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS tg_bot_token_encrypted VARCHAR(512) DEFAULT ''",
         # One-shot backfill: legacy rows stored round-trip fees under
         # entry_fees.  Split them 50/50 so the new PnL helper (which adds
         # entry + exit) stays consistent with historical numbers.

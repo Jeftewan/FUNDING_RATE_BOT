@@ -79,8 +79,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "max_positions": us.get("max_positions", 5),
                     "alert_minutes_before": us.get("alert_minutes_before", 5),
                     "email_enabled": us.get("email_enabled", False),
-                    "wa_phone": us.get("wa_phone", ""),
-                    "wa_apikey": us.get("wa_apikey", ""),
+                    "tg_chat_id": us.get("tg_chat_id", ""),
+                    "tg_bot_token": us.get("tg_bot_token", ""),
                 })
             # Fallback defaults if no DB
             return jsonify({
@@ -88,7 +88,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 "min_volume": 1000000, "min_apr": 10, "min_score": 40,
                 "min_stability_days": 3, "max_positions": 5,
                 "alert_minutes_before": 5, "email_enabled": False,
-                "wa_phone": "", "wa_apikey": "",
+                "tg_chat_id": "", "tg_bot_token": "",
             })
 
         # POST — save config to DB
@@ -113,21 +113,21 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 db_data["alert_minutes_before"] = int(data["alert_minutes_before"])
             if "email_enabled" in data:
                 db_data["email_enabled"] = bool(data["email_enabled"])
-            if "wa_phone" in data:
-                db_data["wa_phone"] = str(data["wa_phone"]).strip()
-            if "wa_apikey" in data:
-                db_data["wa_apikey"] = str(data["wa_apikey"]).strip()
+            if "tg_chat_id" in data:
+                db_data["tg_chat_id"] = str(data["tg_chat_id"]).strip()
+            if "tg_bot_token" in data:
+                db_data["tg_bot_token"] = str(data["tg_bot_token"]).strip()
 
             get_db_persist().save_user_config(uid, db_data)
 
-            # Sync WhatsApp settings to notifier state for current session
+            # Sync Telegram settings to notifier state for current session
             with state_manager.lock:
                 s = state_manager.state
-                for k in ("email_enabled", "wa_phone", "wa_apikey"):
+                for k in ("email_enabled", "tg_chat_id", "tg_bot_token"):
                     if k in db_data:
                         s[k] = db_data[k]
-                    elif k == "wa_apikey" and "wa_apikey" in data:
-                        s[k] = str(data["wa_apikey"]).strip()
+                    elif k == "tg_bot_token" and "tg_bot_token" in data:
+                        s[k] = str(data["tg_bot_token"]).strip()
             if scanner_worker.email_notifier:
                 scanner_worker.email_notifier._sync_from_state()
 
@@ -713,29 +713,26 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         threading.Thread(target=scanner_worker._run_scan, daemon=True).start()
         return jsonify({"ok": True})
 
-    # ── Test WhatsApp ─────────────────────────────────────────
+    # ── Test Telegram ─────────────────────────────────────────
     @app.route("/api/test_email", methods=["POST"])
-    def api_test_whatsapp():
-        """Send a test WhatsApp message via CallMeBot.
+    def api_test_telegram():
+        """Send a test Telegram message via Bot API.
 
-        This tests the FULL alert pipeline (send_alerts → send_alert)
-        using a simulated RATE_REVERSAL alert, not just the raw HTTP call.
-        This way we verify: enabled check, cooldown, formatting, and delivery.
+        Tests the FULL alert pipeline (send_alerts -> send_alert)
+        using a simulated alert, not just the raw HTTP call.
         """
         n = scanner_worker.email_notifier
         if not n:
             return jsonify({"ok": False, "msg": "Notifier no disponible"})
 
         n._sync_from_state()
-        if not all([n.wa_phone, n.wa_apikey]):
-            return jsonify({"ok": False, "msg": "Configura telefono y API key primero"})
+        if not all([n.tg_chat_id, n.tg_bot_token]):
+            return jsonify({"ok": False, "msg": "Configura Bot Token y Chat ID primero"})
 
-        # Clear cooldown for test alerts so they always send
         test_keys = [k for k in n._sent_cache if k.startswith("TEST_")]
         for k in test_keys:
             del n._sent_cache[k]
 
-        # Simulate a real alert through the full pipeline
         test_alert = {
             "type": "TEST_ALERT",
             "severity": "CRITICAL",
@@ -744,25 +741,22 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             "message": "Prueba de alerta automatica — pipeline completo OK",
         }
 
-        # Use send_alerts (the same function the monitor uses)
         sent = n.send_alerts([test_alert])
         if sent > 0:
-            return jsonify({"ok": True, "msg": f"WhatsApp enviado a {n.wa_phone} (pipeline completo)"})
+            return jsonify({"ok": True, "msg": f"Telegram enviado a chat {n.tg_chat_id} (pipeline completo)"})
 
-        # If send_alerts failed, diagnose why
         diag = []
         if not n.enabled:
             diag.append(f"Notificaciones deshabilitadas (email_enabled={n.enabled})")
-        if not n.wa_phone:
-            diag.append("Telefono vacio")
-        if not n.wa_apikey:
-            diag.append("API key vacia")
+        if not n.tg_chat_id:
+            diag.append("Chat ID vacio")
+        if not n.tg_bot_token:
+            diag.append("Bot Token vacio")
 
         if not diag:
-            # send_alerts returned 0 but config looks OK — try raw send
             try:
-                n._send_whatsapp("✅ Funding Bot — Prueba de WhatsApp OK")
-                return jsonify({"ok": True, "msg": f"WhatsApp enviado (fallback directo) a {n.wa_phone}"})
+                n._send_telegram("\u2705 Funding Bot — Prueba de Telegram OK")
+                return jsonify({"ok": True, "msg": f"Telegram enviado (fallback directo) a chat {n.tg_chat_id}"})
             except Exception as e:
                 diag.append(f"Error HTTP: {str(e)[:200]}")
 
@@ -794,11 +788,11 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             positions = user_state.get("positions", [])
 
         diag = {
-            "whatsapp": {
+            "telegram": {
                 "notifier_exists": n is not None,
                 "enabled": n.enabled if n else False,
-                "phone_set": bool(n.wa_phone) if n else False,
-                "apikey_set": bool(n.wa_apikey) if n else False,
+                "chat_id_set": bool(n.tg_chat_id) if n else False,
+                "token_set": bool(n.tg_bot_token) if n else False,
                 "email_enabled_in_state": s.get("email_enabled", False),
                 "cooldown_cache": {k: f"{time.time() - v:.0f}s ago"
                                    for k, v in (n._sent_cache if n else {}).items()},

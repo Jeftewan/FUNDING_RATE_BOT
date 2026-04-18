@@ -303,8 +303,7 @@ class ScannerWorker:
 
         # Switch analysis removed from auto-loop — now on-demand via /api/positions/ai
 
-        # Send WhatsApp alerts — route per-user so each user gets their own alerts
-        # using their own CallMeBot credentials loaded from DB.
+        # Send Telegram alerts — route per-user so each user gets their own alerts.
         if alerts:
             log.info(f"Alerts detected: {[a['type'] for a in alerts]}")
             if self.email_notifier:
@@ -323,19 +322,15 @@ class ScannerWorker:
         self._cleanup_events()
 
     def _dispatch_alerts_per_user(self, alerts: list) -> int:
-        """Send each alert using the WhatsApp credentials of its owning user.
+        """Send each alert using the Telegram credentials of its owning user.
 
         Groups alerts by user_id, loads that user's config from DB, syncs the
         shared notifier's state for the duration of the send, and restores the
-        previous state afterwards. This avoids the previous bug where alerts
-        were silently dropped because the shared in-memory state was empty at
-        startup (wa_apikey never got persisted/loaded).
+        previous state afterwards.
         """
         if not self.email_notifier:
             return 0
 
-        # Group alerts by user_id (alerts without a user_id go to the shared
-        # bucket and fall through to the legacy state-based send).
         by_user: dict = {}
         orphans: list = []
         for a in alerts:
@@ -347,19 +342,18 @@ class ScannerWorker:
 
         sent_total = 0
 
-        # Snapshot current shared state so we can restore it after per-user sends.
         with self.state_manager.lock:
             s = self.state_manager.state
             prev_enabled = s.get("email_enabled", False)
-            prev_phone = s.get("wa_phone", "")
-            prev_apikey = s.get("wa_apikey", "")
+            prev_chat_id = s.get("tg_chat_id", "")
+            prev_token = s.get("tg_bot_token", "")
 
         try:
             for uid, user_alerts in by_user.items():
-                cfg = self._load_user_whatsapp_config(uid)
-                if not cfg or not cfg.get("email_enabled") or not cfg.get("wa_phone") or not cfg.get("wa_apikey"):
+                cfg = self._load_user_telegram_config(uid)
+                if not cfg or not cfg.get("email_enabled") or not cfg.get("tg_chat_id") or not cfg.get("tg_bot_token"):
                     log.info(
-                        f"WhatsApp: skipping {len(user_alerts)} alert(s) for user {uid} "
+                        f"Telegram: skipping {len(user_alerts)} alert(s) for user {uid} "
                         f"(config incomplete/disabled)"
                     )
                     continue
@@ -367,33 +361,30 @@ class ScannerWorker:
                 with self.state_manager.lock:
                     s = self.state_manager.state
                     s["email_enabled"] = True
-                    s["wa_phone"] = cfg["wa_phone"]
-                    s["wa_apikey"] = cfg["wa_apikey"]
+                    s["tg_chat_id"] = cfg["tg_chat_id"]
+                    s["tg_bot_token"] = cfg["tg_bot_token"]
 
                 try:
                     sent_total += self.email_notifier.send_alerts(user_alerts)
                 except Exception as e:
-                    log.error(f"WhatsApp send failed for user {uid}: {e}")
+                    log.error(f"Telegram send failed for user {uid}: {e}")
 
             if orphans:
-                # Legacy fallback: send with whatever is currently in state
                 with self.state_manager.lock:
                     s = self.state_manager.state
                     s["email_enabled"] = prev_enabled
-                    s["wa_phone"] = prev_phone
-                    s["wa_apikey"] = prev_apikey
+                    s["tg_chat_id"] = prev_chat_id
+                    s["tg_bot_token"] = prev_token
                 try:
                     sent_total += self.email_notifier.send_alerts(orphans)
                 except Exception as e:
-                    log.error(f"WhatsApp send failed for orphan alerts: {e}")
+                    log.error(f"Telegram send failed for orphan alerts: {e}")
         finally:
-            # Always restore the previous shared state so other callers
-            # (e.g. /api/test_email) see consistent values.
             with self.state_manager.lock:
                 s = self.state_manager.state
                 s["email_enabled"] = prev_enabled
-                s["wa_phone"] = prev_phone
-                s["wa_apikey"] = prev_apikey
+                s["tg_chat_id"] = prev_chat_id
+                s["tg_bot_token"] = prev_token
             if self.email_notifier:
                 try:
                     self.email_notifier._sync_from_state()
@@ -402,8 +393,8 @@ class ScannerWorker:
 
         return sent_total
 
-    def _load_user_whatsapp_config(self, user_id) -> dict:
-        """Load a user's WhatsApp config (email_enabled/wa_phone/wa_apikey) from DB."""
+    def _load_user_telegram_config(self, user_id) -> dict:
+        """Load a user's Telegram config from DB."""
         if not self._flask_app:
             return {}
         try:
@@ -414,20 +405,18 @@ class ScannerWorker:
                 us = db_persist.load_user_state(user_id)
                 return {
                     "email_enabled": us.get("email_enabled", False),
-                    "wa_phone": us.get("wa_phone", ""),
-                    "wa_apikey": us.get("wa_apikey", ""),
+                    "tg_chat_id": us.get("tg_chat_id", ""),
+                    "tg_bot_token": us.get("tg_bot_token", ""),
                 }
         except Exception as e:
-            log.error(f"Failed to load WhatsApp config for user {user_id}: {e}")
+            log.error(f"Failed to load Telegram config for user {user_id}: {e}")
             return {}
 
     def _broadcast_alerts_all_users(self, alerts: list) -> int:
-        """Send alerts to every user who has WhatsApp notifications enabled.
+        """Send alerts to every user who has Telegram notifications enabled.
 
         Used for market-wide alerts (EXCEPTIONAL_OPPORTUNITY, etc.) that are
-        not tied to a specific user's position.  Loads all enabled users from
-        the DB, temporarily sets each one's credentials in the shared notifier,
-        sends, and restores previous state.
+        not tied to a specific user's position.
         """
         if not self.email_notifier or not alerts or not self._flask_app:
             return 0
@@ -437,21 +426,20 @@ class ScannerWorker:
                 db_persist = self._get_db_persist()
                 if not db_persist:
                     return 0
-                user_configs = db_persist.get_all_users_whatsapp()
+                user_configs = db_persist.get_all_users_telegram()
         except Exception as e:
             log.error(f"Broadcast: failed to load user configs: {e}")
             return 0
 
         if not user_configs:
-            log.debug("Broadcast: no users with WhatsApp enabled, skipping")
+            log.debug("Broadcast: no users with Telegram enabled, skipping")
             return 0
 
-        # Snapshot current shared state so we can restore it afterwards.
         with self.state_manager.lock:
             s = self.state_manager.state
             prev_enabled = s.get("email_enabled", False)
-            prev_phone = s.get("wa_phone", "")
-            prev_apikey = s.get("wa_apikey", "")
+            prev_chat_id = s.get("tg_chat_id", "")
+            prev_token = s.get("tg_bot_token", "")
 
         sent_total = 0
         try:
@@ -459,8 +447,8 @@ class ScannerWorker:
                 with self.state_manager.lock:
                     s = self.state_manager.state
                     s["email_enabled"] = True
-                    s["wa_phone"] = cfg["wa_phone"]
-                    s["wa_apikey"] = cfg["wa_apikey"]
+                    s["tg_chat_id"] = cfg["tg_chat_id"]
+                    s["tg_bot_token"] = cfg["tg_bot_token"]
                 try:
                     sent_total += self.email_notifier.send_alerts(alerts)
                 except Exception as e:
@@ -469,8 +457,8 @@ class ScannerWorker:
             with self.state_manager.lock:
                 s = self.state_manager.state
                 s["email_enabled"] = prev_enabled
-                s["wa_phone"] = prev_phone
-                s["wa_apikey"] = prev_apikey
+                s["tg_chat_id"] = prev_chat_id
+                s["tg_bot_token"] = prev_token
             try:
                 self.email_notifier._sync_from_state()
             except Exception:

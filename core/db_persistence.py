@@ -37,9 +37,8 @@ class DBPersistence:
             "max_positions": config.max_positions if config else 5,
             "alert_minutes_before": config.alert_minutes_before if config else 10,
             "email_enabled": config.email_enabled if config else False,
-            "wa_phone": config.wa_phone if config else "",
-            # Decrypted at runtime so the notifier can actually send alerts.
-            "wa_apikey": decrypt_value(config.wa_apikey_encrypted) if config and config.wa_apikey_encrypted else "",
+            "tg_chat_id": config.tg_chat_id if config else "",
+            "tg_bot_token": decrypt_value(config.tg_bot_token_encrypted) if config and config.tg_bot_token_encrypted else "",
             "positions": [self._pos_to_dict(p) for p in positions],
             "history": [self._hist_to_dict(h) for h in history],
             "total_earned": sum(p.earned_real for p in positions),
@@ -59,22 +58,21 @@ class DBPersistence:
 
         for key in ("total_capital", "scan_interval", "min_volume", "min_apr",
                      "min_score", "min_stability_days", "max_positions",
-                     "alert_minutes_before", "email_enabled", "wa_phone"):
+                     "alert_minutes_before", "email_enabled", "tg_chat_id"):
             if key in data:
                 setattr(config, key, data[key])
 
-        # CallMeBot API key is stored encrypted at rest.
-        if "wa_apikey" in data:
-            plain = str(data["wa_apikey"]).strip()
-            config.wa_apikey_encrypted = encrypt_value(plain) if plain else ""
+        if "tg_bot_token" in data:
+            plain = str(data["tg_bot_token"]).strip()
+            config.tg_bot_token_encrypted = encrypt_value(plain) if plain else ""
 
         db.session.commit()
 
-    def get_all_users_whatsapp(self) -> list:
-        """Return WhatsApp credentials for every user that has notifications enabled.
+    def get_all_users_telegram(self) -> list:
+        """Return Telegram credentials for every user that has notifications enabled.
 
-        Result: [{"user_id": int, "wa_phone": str, "wa_apikey": str}, ...]
-        Only includes rows where email_enabled=True and both phone and apikey are set.
+        Result: [{"user_id": int, "tg_chat_id": str, "tg_bot_token": str}, ...]
+        Only includes rows where email_enabled=True and both chat_id and token are set.
         """
         from core.db_models import UserConfig
         from core.encryption import decrypt_value
@@ -82,13 +80,13 @@ class DBPersistence:
         configs = UserConfig.query.filter_by(email_enabled=True).all()
         result = []
         for cfg in configs:
-            phone = cfg.wa_phone or ""
-            apikey = decrypt_value(cfg.wa_apikey_encrypted) if cfg.wa_apikey_encrypted else ""
-            if phone and apikey:
+            chat_id = cfg.tg_chat_id or ""
+            token = decrypt_value(cfg.tg_bot_token_encrypted) if cfg.tg_bot_token_encrypted else ""
+            if chat_id and token:
                 result.append({
                     "user_id": cfg.user_id,
-                    "wa_phone": phone,
-                    "wa_apikey": apikey,
+                    "tg_chat_id": chat_id,
+                    "tg_bot_token": token,
                 })
         return result
 

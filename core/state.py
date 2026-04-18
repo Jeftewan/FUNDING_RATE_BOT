@@ -29,10 +29,10 @@ class StateManager:
             "last_scan_time": "—",
             "last_scan": 0,
 
-            # --- WhatsApp config (synced from DB for notifier) ---
+            # --- Telegram config (synced from DB for notifier) ---
             "email_enabled": False,
-            "wa_phone": "",
-            "wa_apikey": "",
+            "tg_chat_id": "",
+            "tg_bot_token": "",
 
             # --- Configuración editable (defaults, overridden by DB) ---
             "total_capital": 1000,
