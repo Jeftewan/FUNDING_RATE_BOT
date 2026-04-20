@@ -71,7 +71,6 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 us = get_db_persist().load_user_state(uid)
                 return jsonify({
                     "total_capital": us.get("total_capital", 1000),
-                    "scan_minutes": us.get("scan_interval", 300) // 60,
                     "min_volume": us.get("min_volume", 1000000),
                     "min_apr": us.get("min_apr", 10),
                     "min_score": us.get("min_score", 40),
@@ -84,7 +83,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 })
             # Fallback defaults if no DB
             return jsonify({
-                "total_capital": 1000, "scan_minutes": 5,
+                "total_capital": 1000,
                 "min_volume": 1000000, "min_apr": 10, "min_score": 40,
                 "min_stability_days": 3, "max_positions": 5,
                 "alert_minutes_before": 5, "email_enabled": False,
@@ -97,8 +96,6 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             db_data = {}
             if "total_capital" in data:
                 db_data["total_capital"] = float(data["total_capital"])
-            if "scan_minutes" in data:
-                db_data["scan_interval"] = max(1, int(data["scan_minutes"])) * 60
             if "min_volume" in data:
                 db_data["min_volume"] = float(data["min_volume"])
             if "min_apr" in data:

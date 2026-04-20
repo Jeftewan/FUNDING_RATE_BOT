@@ -29,7 +29,6 @@ class DBPersistence:
 
         state = {
             "total_capital": config.total_capital if config else 1000,
-            "scan_interval": config.scan_interval if config else 300,
             "min_volume": config.min_volume if config else 1000000,
             "min_apr": config.min_apr if config else 10,
             "min_score": config.min_score if config else 40,
@@ -56,7 +55,7 @@ class DBPersistence:
             config = UserConfig(user_id=user_id)
             db.session.add(config)
 
-        for key in ("total_capital", "scan_interval", "min_volume", "min_apr",
+        for key in ("total_capital", "min_volume", "min_apr",
                      "min_score", "min_stability_days", "max_positions",
                      "alert_minutes_before", "email_enabled", "tg_chat_id"):
             if key in data:

@@ -1212,7 +1212,6 @@ async function loadConfig() {
     const res = await fetch('/api/config');
     const cfg = await res.json();
     document.getElementById('cfg-capital').value = cfg.total_capital;
-    document.getElementById('cfg-scan-min').value = cfg.scan_minutes;
     document.getElementById('cfg-max-pos').value = cfg.max_positions;
     document.getElementById('cfg-min-vol').value = cfg.min_volume;
     document.getElementById('cfg-min-apr').value = cfg.min_apr;
@@ -1230,7 +1229,6 @@ async function loadConfig() {
 async function saveConfig() {
   const data = {
     total_capital: parseFloat(document.getElementById('cfg-capital').value),
-    scan_minutes: parseInt(document.getElementById('cfg-scan-min').value),
     max_positions: parseInt(document.getElementById('cfg-max-pos').value),
     min_volume: parseFloat(document.getElementById('cfg-min-vol').value),
     min_apr: parseFloat(document.getElementById('cfg-min-apr').value),
