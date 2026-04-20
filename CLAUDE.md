@@ -117,6 +117,8 @@ Puntaje **0–100**, normalizado. Pesos validados con backtest de 90 días sobre
 **Hard caps:** z>2.5 → máx 39; streak<3 con percentil≥80 → máx 50; reality penalty → máx 61.  
 **Thin history** (<5 muestras): defaults neutros (stability=15, consistency=20) para no penalizar símbolos nuevos/DeFi.
 
+Para **cross_exchange / DeFi**, los indicadores (momentum, z-score, percentile, regime) se calculan sobre `period_diffs` — diferencial por-período emparejado por timestamp — en lugar del `diff_series` diario. Esto garantiza ≥5-15 muestras incluso con pocos días de histórico. Ver `analysis/arbitrage.py:_analyze_differential_history`.
+
 El parámetro `mode` (`spot_perp` / `cross_exchange` / `defi`) ajusta los umbrales de liquidez.
 
 Grades: A ≥85, B ≥70, C ≥55, D <55.
@@ -132,6 +134,8 @@ Grades: A ≥85, B ≥70, C ≥55, D <55.
 | `defi` | Short perp en DeFi (sin hedge spot) | `exchanges/defi_manager.py` + cross_exchange path |
 
 El historial DeFi se construye desde `funding_rate_snapshots` (no hay API histórica en DeFi). Ver `exchanges/defi_manager.py:fetch_funding_history()`.
+
+**Posiciones CEX+DeFi**: `api/routes.py:/api/positions` y `/api/positions/ai` combinan `all_data + defi_data` para resolver ambas piernas. `current_fr = short_fr − long_fr` con tasas vigentes de ambos exchanges; `mins_next = min(next_payment_CEX, next_payment_DeFi)`. La actualización de earnings en `_monitor_tick` ya usaba `combined` desde antes.
 
 ---
 
@@ -158,7 +162,7 @@ El historial DeFi se construye desde `funding_rate_snapshots` (no hay API histó
 |-------|-------------|
 | `total_capital` | Valida capital disponible al abrir posición (`portfolio/manager.py:43`) |
 | `max_positions` | Bloquea abrir más posiciones (`portfolio/manager.py:68`) |
-| `min_volume` | Filtra candidatos en scan de arbitraje (`scanner/worker.py:603-608`) |
+| `min_volume` | Filtra ambas piernas individualmente en todos los escaneos: spot_perp, cross_exchange CEX, cross DeFi-only y cross CEX+DeFi (`scanner/worker.py`, `analysis/arbitrage.py:scan_cross_exchange_opportunities`) |
 | `min_apr` | Filtra oportunidades en `/api/opportunities` |
 | `min_score` | Filtra oportunidades en `/api/opportunities` |
 | `min_stability_days` | Filtra por `estimated_hold_days` en `/api/opportunities` |
@@ -227,7 +231,7 @@ ARBITRAGE_MODES       # Default: spot_perp,cross_exchange
 
 ### Mejoras identificadas
 
-- **DeFi history fiabilidad**: `fetch_funding_history` en `defi_manager.py` depende de que los snapshots existan en DB. En deploys nuevos o símbolos nuevos, thin-history (<5 muestras) da scoring neutro — correcto pero subóptimo para toma de decisiones.
+- **DeFi history fiabilidad**: `fetch_funding_history` en `defi_manager.py` depende de que los snapshots existan en DB. En deploys nuevos o símbolos nuevos, thin-history (<5 muestras) da scoring neutro — correcto pero subóptimo para toma de decisiones. Nota: GMX, Aster, Lighter y Extended reportan `volume_24h=0`; con el filtro `min_volume` ahora aplicado a cada pierna, estos pares quedan excluidos a menos que el usuario baje `min_volume` a 0.
 - **Alertas sin posiciones activas**: el scanner solo corre cuando hay posiciones abiertas o se fuerza manualmente. Si no hay posiciones, las oportunidades excepcionales no se escanean automáticamente.
 - **Tests**: no hay suite de tests automatizados. El proyecto depende del syntax check via `python -c "import ast; ast.parse(...)"`.
 - **Rate limits DeFi**: los adaptadores DeFi no tienen retry exponencial ante errores HTTP 429/503.
@@ -266,6 +270,7 @@ curl -X POST http://localhost:5000/api/force
 
 | Hash | Cambio |
 |------|--------|
+| `f6ae4a7` | Fix min_volume por pierna en DeFi/CEX+DeFi, indicadores cross, current_fr en posiciones |
 | `a344317` | Quitar campo `scan_interval` (muerto) del frontend y API |
 | `310bbca` | Migrar notificaciones de CallMeBot WhatsApp a Telegram Bot API |
 | `7d853dd` | Scoring v10.5: normalizar a 100, mode-aware, historial DeFi desde snapshots |

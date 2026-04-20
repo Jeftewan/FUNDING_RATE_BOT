@@ -287,7 +287,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         uid = get_current_user_id()
         with state_manager.lock:
             s = state_manager.state
-            all_data = s.get("all_data", [])
+            # Merge CEX and DeFi rates so cross-exchange positions with a DeFi
+            # leg can resolve both sides (current_fr = short - long, mins_next
+            # = earliest of the two).
+            all_data = s.get("all_data", []) + s.get("defi_data", [])
 
             if uid and get_db_persist():
                 user_state = get_db_persist().load_user_state(uid)
@@ -418,7 +421,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         uid = get_current_user_id()
         with state_manager.lock:
             s = state_manager.state
-            all_data = s.get("all_data", [])
+            all_data = s.get("all_data", []) + s.get("defi_data", [])
 
             if uid and get_db_persist():
                 user_state = get_db_persist().load_user_state(uid)
@@ -435,7 +438,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         # ── Build enriched position data ───────────────────────
         with state_manager.lock:
             s = state_manager.state
-            all_data = s.get("all_data", [])
+            all_data = s.get("all_data", []) + s.get("defi_data", [])
 
         pdata = []
         switch_results_out = {}
