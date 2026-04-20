@@ -36,7 +36,6 @@ class StateManager:
 
             # --- Configuración editable (defaults, overridden by DB) ---
             "total_capital": 1000,
-            "scan_interval": 300,
             "min_volume": 1_000_000,
             "min_apr": 10,
             "min_score": 40,
