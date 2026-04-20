@@ -619,9 +619,10 @@ class ScannerWorker:
                     for fr in rates:
                         defi_data.append(fr.to_dict())
 
-                # DeFi cross-exchange opportunities (same logic as CEX)
+                # DeFi cross-exchange opportunities (same logic as CEX).
+                # Both legs must meet the user's min_volume threshold.
                 defi_cross = self.arb_scanner.scan_cross_exchange_opportunities(
-                    defi_rates, min_volume=0  # DeFi often has low/no volume data
+                    defi_rates, min_volume=min_volume
                 )
                 for o in defi_cross:
                     d = o.to_dict()
@@ -629,10 +630,11 @@ class ScannerWorker:
                     d["is_defi"] = True
                     defi_opportunities.append(d)
 
-                # Also scan CEX vs DeFi cross-exchange
+                # Also scan CEX vs DeFi cross-exchange. Both legs must meet
+                # min_volume so CEX+DeFi mixed pairs are filtered symmetrically.
                 combined_rates = {**all_rates, **defi_rates}
                 cex_defi_cross = self.arb_scanner.scan_cross_exchange_opportunities(
-                    combined_rates, min_volume=0
+                    combined_rates, min_volume=min_volume
                 )
                 for o in cex_defi_cross:
                     d = o.to_dict()

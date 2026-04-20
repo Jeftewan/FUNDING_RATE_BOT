@@ -259,7 +259,8 @@ class ArbitrageScanner:
 
         # Analyze historical differential: consistency, stability, streak, trend
         diff_hist = {"consistency_pct": 0, "streak": 0, "cv": 999,
-                     "min_ratio": 0, "trend": 1.0, "diff_series": []}
+                     "min_ratio": 0, "trend": 1.0, "diff_series": [],
+                     "period_diffs": []}
         if (long_hist.rates and long_hist.timestamps
                 and short_hist.rates and short_hist.timestamps):
             diff_hist = self._analyze_differential_history(
@@ -269,6 +270,11 @@ class ArbitrageScanner:
         fee_ratio = fees["total_cost"] / revenue_3d_usd if revenue_3d_usd > 0 else 1
         diff_hist["fee_drag"] = fee_ratio
         diff_series = diff_hist.get("diff_series", [])
+        # Per-period differentials give enough samples for momentum/z-score/
+        # percentile/regime to compute (daily aggregates alone rarely clear the
+        # 5-10 sample thresholds required by indicators.py).
+        period_diffs = diff_hist.get("period_diffs", [])
+        rates_for_indicators = period_diffs if len(period_diffs) >= 5 else diff_series
 
         # Settlement-based yield: avg of historical daily differentials
         settlement_avg = (abs(diff_hist.get("avg_diff", 0))
@@ -293,7 +299,7 @@ class ArbitrageScanner:
             "payments_per_day": (long_ppd + short_ppd) / 2,
             "fee_drag": fee_ratio,
             "current_rate": differential,
-            "rates": diff_series,
+            "rates": rates_for_indicators,
             "mode": cross_mode,
         }
         sc = opportunity_score(cross_score_params)
@@ -370,6 +376,7 @@ class ArbitrageScanner:
 
         empty = {
             "consistency_pct": 0, "streak": 0, "diff_series": [],
+            "period_diffs": [],
             "avg_diff": 0, "stddev_diff": 0, "cv": 999,
             "min_ratio": 0, "trend": 1.0,
         }
@@ -394,6 +401,20 @@ class ArbitrageScanner:
             short_sum = sum(short_days[day])
             long_sum = sum(long_days[day])
             diff_series.append(short_sum - long_sum)
+
+        # Per-period differential series: pair each short-side rate with the
+        # long-side rate that was active at the same timestamp (nearest match
+        # within one bucket). Produces many more samples than the daily
+        # aggregate, so indicators.py can compute momentum/z-score/percentile.
+        long_pairs = sorted(zip(long_hist.timestamps, long_hist.rates))
+        short_pairs = sorted(zip(short_hist.timestamps, short_hist.rates))
+        period_diffs = []
+        if long_pairs and short_pairs:
+            li = 0
+            for ts, sr in short_pairs:
+                while li + 1 < len(long_pairs) and long_pairs[li + 1][0] <= ts:
+                    li += 1
+                period_diffs.append(sr - long_pairs[li][1])
 
         n = len(diff_series)
 
@@ -434,6 +455,7 @@ class ArbitrageScanner:
             "consistency_pct": consistency_pct,
             "streak": streak,
             "diff_series": diff_series,
+            "period_diffs": period_diffs,
             "avg_diff": avg_diff,
             "stddev_diff": stddev_diff,
             "cv": cv,
