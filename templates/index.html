@@ -146,6 +146,19 @@
         Email: <strong style="color:#fff">{{ user_email }}</strong>
       </div>
     </div>
+
+    <div class="cfg-section" id="billing-section">
+      <h3>Plan y facturación</h3>
+      <div id="billing-status" style="font-size:12px;color:var(--text-secondary);margin:8px 0">
+        Cargando...
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button class="btn" onclick="openPlansModal()">Cambiar plan</button>
+        <button class="btn btn-secondary" onclick="openBillingPortal()" id="btn-billing-portal" style="display:none">Gestionar suscripción</button>
+      </div>
+      <div id="billing-invoices" style="margin-top:14px"></div>
+    </div>
+
     <div class="cfg-section">
       <h3>API Keys</h3>
       <p style="font-size:10px;color:#555;margin-bottom:10px">Tus keys se almacenan encriptadas.</p>
@@ -157,6 +170,22 @@
     </div>
   </div>
   {% endif %}
+
+  <!-- ═══ PLANS MODAL ═══ -->
+  <div id="plans-modal" class="modal-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;align-items:center;justify-content:center;padding:16px;overflow-y:auto">
+    <div class="modal-box" style="background:var(--bg-card,#1a1d2e);border:1px solid #2d3148;border-radius:12px;padding:24px;width:100%;max-width:840px;margin:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px">
+        <h2 style="font-size:18px">Elige tu plan</h2>
+        <button class="btn btn-secondary" onclick="closePlansModal()">✕</button>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:center;margin-bottom:18px">
+        <button class="btn" id="period-monthly-btn" onclick="setPeriod('monthly')">Mensual</button>
+        <button class="btn btn-secondary" id="period-annual-btn" onclick="setPeriod('annual')">Anual · 2 meses gratis</button>
+      </div>
+      <div id="plans-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px"></div>
+      <div id="plans-msg" style="margin-top:14px;font-size:12px;min-height:18px"></div>
+    </div>
+  </div>
 
   <!-- ═══ HELP TAB ═══ -->
   <div id="page-help" class="page">

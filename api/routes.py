@@ -49,6 +49,22 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             return f(*args, **kwargs)
         return decorated
 
+    def plan_required(f):
+        """Reject request when user has no active plan or trial."""
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            if db_enabled:
+                from flask_login import current_user
+                from billing.plans import user_has_active_plan
+                if current_user.is_authenticated and not user_has_active_plan(current_user):
+                    return jsonify({
+                        "ok": False,
+                        "error": "plan_required",
+                        "msg": "Tu período de prueba ha vencido. Elige un plan para continuar.",
+                    }), 403
+            return f(*args, **kwargs)
+        return decorated
+
     @app.before_request
     def _before():
         scanner_worker.start()
@@ -235,6 +251,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     # ── Open Position ──────────────────────────────────────────
     @app.route("/api/open_position", methods=["POST"])
     @auth_required
+    @plan_required
     def api_open_position():
         """Open a new position from an opportunity."""
         data = flask_req.json or {}
@@ -257,9 +274,19 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             # Load user state from DB for capital checks
             if uid and get_db_persist():
                 user_state = get_db_persist().load_user_state(uid)
+                # Plan limit overrides user config setting
+                plan_max = user_state.get("max_positions", 5)
+                if db_enabled:
+                    try:
+                        from flask_login import current_user
+                        from billing.plans import get_effective_plan, get_plan_limits
+                        limits = get_plan_limits(get_effective_plan(current_user))
+                        plan_max = limits['max_positions']
+                    except Exception:
+                        pass
                 merged = {
                     "total_capital": user_state.get("total_capital", 1000),
-                    "max_positions": user_state.get("max_positions", 5),
+                    "max_positions": plan_max,
                     "positions": user_state.get("positions", []),
                     "history": user_state.get("history", []),
                     "total_earned": user_state.get("total_earned", 0),

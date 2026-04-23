@@ -110,6 +110,23 @@ if Config.USE_DB and Config.DATABASE_URL:
             init_auth(app, Config)
             log.info("SaaS mode enabled: PostgreSQL + email/password auth")
 
+            # Register billing + admin blueprints (only in SaaS mode)
+            from billing.routes import billing_bp
+            from admin.routes import admin_bp
+
+            # Expose Stripe config via app.config for blueprints
+            for k in (
+                "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET",
+                "STRIPE_PRICE_BASIC_MONTHLY", "STRIPE_PRICE_BASIC_ANNUAL",
+                "STRIPE_PRICE_STANDARD_MONTHLY", "STRIPE_PRICE_STANDARD_ANNUAL",
+                "STRIPE_PRICE_PRO_MONTHLY", "STRIPE_PRICE_PRO_ANNUAL",
+            ):
+                app.config[k] = getattr(Config, k, "")
+
+            app.register_blueprint(billing_bp)
+            app.register_blueprint(admin_bp)
+            log.info("Billing + admin blueprints registered")
+
     except Exception as e:
         log.error(f"Failed to initialize SaaS mode: {e}")
         db_enabled = False

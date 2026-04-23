@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin — Funding Rate Bot</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; }
+    header { background: #1a1d2e; border-bottom: 1px solid #2d3148; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+    header h1 { font-size: 18px; font-weight: 600; color: #a78bfa; }
+    header a { color: #64748b; font-size: 13px; text-decoration: none; }
+    header a:hover { color: #e2e8f0; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+    /* Summary cards */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin-bottom: 32px; }
+    .card { background: #1a1d2e; border: 1px solid #2d3148; border-radius: 10px; padding: 20px; }
+    .card .label { font-size: 12px; color: #64748b; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+    .card .value { font-size: 28px; font-weight: 700; color: #e2e8f0; }
+    .card .value.green { color: #4ade80; }
+    .card .value.yellow { color: #facc15; }
+    .card .value.purple { color: #a78bfa; }
+
+    /* Filters */
+    .filters { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+    .filters input, .filters select { background: #1a1d2e; border: 1px solid #2d3148; color: #e2e8f0; border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+    .filters input:focus, .filters select:focus { outline: none; border-color: #a78bfa; }
+
+    /* Table */
+    .table-wrap { background: #1a1d2e; border: 1px solid #2d3148; border-radius: 10px; overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    thead th { padding: 12px 16px; text-align: left; color: #64748b; font-weight: 500; border-bottom: 1px solid #2d3148; white-space: nowrap; }
+    tbody tr { border-bottom: 1px solid #1e2235; }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: #1e2235; }
+    td { padding: 12px 16px; }
+
+    /* Badges */
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
+    .badge-basic { background: #1e3a5f; color: #60a5fa; }
+    .badge-standard { background: #1a3327; color: #4ade80; }
+    .badge-pro { background: #2d1b69; color: #a78bfa; }
+    .badge-none { background: #2d1f1f; color: #f87171; }
+    .badge-trial { background: #3d2c00; color: #facc15; }
+    .badge-override { background: #3d0028; color: #f472b6; }
+    .badge-active { background: #1a3327; color: #4ade80; }
+    .badge-expired { background: #2d1f1f; color: #f87171; }
+
+    /* Buttons */
+    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border-radius: 8px; font-size: 12px; font-weight: 500; cursor: pointer; border: none; transition: opacity .15s; }
+    .btn:hover { opacity: .85; }
+    .btn-sm { padding: 4px 10px; font-size: 11px; }
+    .btn-primary { background: #7c3aed; color: #fff; }
+    .btn-secondary { background: #2d3148; color: #e2e8f0; }
+    .btn-danger { background: #7f1d1d; color: #fca5a5; }
+
+    /* Modal */
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 100; align-items: center; justify-content: center; }
+    .modal-overlay.open { display: flex; }
+    .modal { background: #1a1d2e; border: 1px solid #2d3148; border-radius: 12px; padding: 28px; width: 100%; max-width: 480px; }
+    .modal h2 { font-size: 16px; font-weight: 600; margin-bottom: 20px; }
+    .form-group { margin-bottom: 16px; }
+    .form-group label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; }
+    .form-group select, .form-group input, .form-group textarea { width: 100%; background: #0f1117; border: 1px solid #2d3148; color: #e2e8f0; border-radius: 8px; padding: 8px 12px; font-size: 13px; }
+    .form-group select:focus, .form-group input:focus { outline: none; border-color: #a78bfa; }
+    .form-group .checkbox-row { display: flex; align-items: center; gap: 8px; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 20px; }
+    .msg { font-size: 12px; color: #4ade80; margin-top: 8px; min-height: 18px; }
+    .msg.error { color: #f87171; }
+
+    .loading { color: #64748b; font-size: 13px; padding: 24px; text-align: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>⚙ Admin Panel</h1>
+    <a href="/">← Volver al dashboard</a>
+  </header>
+
+  <div class="container">
+    <!-- Summary cards -->
+    <div class="cards" id="summary-cards">
+      <div class="card"><div class="label">Total usuarios</div><div class="value" id="s-total">—</div></div>
+      <div class="card"><div class="label">Activos (pagando)</div><div class="value green" id="s-active">—</div></div>
+      <div class="card"><div class="label">En trial</div><div class="value yellow" id="s-trial">—</div></div>
+      <div class="card"><div class="label">Vencidos / sin plan</div><div class="value" id="s-expired">—</div></div>
+      <div class="card"><div class="label">Overrides admin</div><div class="value purple" id="s-overrides">—</div></div>
+      <div class="card"><div class="label">MRR estimado</div><div class="value green" id="s-mrr">—</div></div>
+    </div>
+
+    <!-- Filters -->
+    <div class="filters">
+      <input type="text" id="search" placeholder="Buscar por email..." oninput="renderTable()">
+      <select id="filter-plan" onchange="renderTable()">
+        <option value="">Todos los planes</option>
+        <option value="basic">Basic</option>
+        <option value="standard">Standard</option>
+        <option value="pro">Pro</option>
+        <option value="none">Sin plan</option>
+      </select>
+      <select id="filter-status" onchange="renderTable()">
+        <option value="">Todos los estados</option>
+        <option value="active">Activo</option>
+        <option value="trial">En trial</option>
+        <option value="expired">Vencido</option>
+        <option value="override">Override</option>
+      </select>
+    </div>
+
+    <!-- Table -->
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Email</th>
+            <th>Plan</th>
+            <th>Estado</th>
+            <th>Vencimiento</th>
+            <th>Trial</th>
+            <th>Stripe customer</th>
+            <th>Registrado</th>
+            <th>Acción</th>
+          </tr>
+        </thead>
+        <tbody id="users-tbody">
+          <tr><td colspan="8" class="loading">Cargando usuarios...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Edit plan modal -->
+  <div class="modal-overlay" id="edit-modal">
+    <div class="modal">
+      <h2>Editar plan de usuario</h2>
+      <div id="modal-email" style="color:#94a3b8;font-size:13px;margin-bottom:16px;"></div>
+
+      <div class="form-group">
+        <label>Plan</label>
+        <select id="m-plan">
+          <option value="none">Sin plan</option>
+          <option value="basic">Basic</option>
+          <option value="standard">Standard</option>
+          <option value="pro">Pro</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>Período de facturación</label>
+        <select id="m-period">
+          <option value="">N/A</option>
+          <option value="monthly">Mensual</option>
+          <option value="annual">Anual</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label>Fecha de vencimiento (ISO)</label>
+        <input type="datetime-local" id="m-expires">
+      </div>
+
+      <div class="form-group">
+        <label>Override perpetuo (no depende de Stripe)</label>
+        <div class="checkbox-row">
+          <input type="checkbox" id="m-override" style="width:auto;">
+          <span style="font-size:13px;color:#e2e8f0;">Activar licencia perpetua</span>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Nota de override</label>
+        <input type="text" id="m-override-note" placeholder="Ej: Socio fundador, Tester, etc.">
+      </div>
+
+      <div class="form-group">
+        <label>Cuenta activa</label>
+        <div class="checkbox-row">
+          <input type="checkbox" id="m-is-active" style="width:auto;" checked>
+          <span style="font-size:13px;color:#e2e8f0;">Usuario activo (puede iniciar sesión)</span>
+        </div>
+      </div>
+
+      <div class="msg" id="modal-msg"></div>
+
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeModal()">Cancelar</button>
+        <button class="btn btn-primary" onclick="saveUserPlan()">Guardar</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let allUsers = [];
+    let editingUserId = null;
+
+    async function loadSummary() {
+      try {
+        const r = await fetch('/admin/api/billing/summary');
+        const d = await r.json();
+        document.getElementById('s-total').textContent = d.total_users;
+        document.getElementById('s-active').textContent = d.active;
+        document.getElementById('s-trial').textContent = d.in_trial;
+        document.getElementById('s-expired').textContent = d.expired;
+        document.getElementById('s-overrides').textContent = d.overrides;
+        document.getElementById('s-mrr').textContent = '$' + d.mrr_usd.toLocaleString('en', {minimumFractionDigits: 0});
+      } catch(e) { console.error('Summary error', e); }
+    }
+
+    async function loadUsers() {
+      try {
+        const r = await fetch('/admin/api/users');
+        const d = await r.json();
+        allUsers = d.users || [];
+        renderTable();
+      } catch(e) {
+        document.getElementById('users-tbody').innerHTML = '<tr><td colspan="8" class="loading">Error al cargar usuarios</td></tr>';
+      }
+    }
+
+    function renderTable() {
+      const search = document.getElementById('search').value.toLowerCase();
+      const planFilter = document.getElementById('filter-plan').value;
+      const statusFilter = document.getElementById('filter-status').value;
+
+      let filtered = allUsers.filter(u => {
+        if (search && !u.email.toLowerCase().includes(search)) return false;
+        if (planFilter && u.plan !== planFilter) return false;
+        if (statusFilter) {
+          const st = getStatus(u);
+          if (statusFilter === 'active' && st !== 'active') return false;
+          if (statusFilter === 'trial' && st !== 'trial') return false;
+          if (statusFilter === 'expired' && st !== 'expired') return false;
+          if (statusFilter === 'override' && !u.plan_override) return false;
+        }
+        return true;
+      });
+
+      const tbody = document.getElementById('users-tbody');
+      if (!filtered.length) {
+        tbody.innerHTML = '<tr><td colspan="8" class="loading">No hay usuarios con estos filtros</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = filtered.map(u => {
+        const st = getStatus(u);
+        const planBadge = u.plan_override
+          ? `<span class="badge badge-${u.plan}">${u.plan.toUpperCase()}</span> <span class="badge badge-override">OVERRIDE</span>`
+          : `<span class="badge badge-${u.plan}">${u.plan.toUpperCase()}</span>`;
+        const statusBadge = st === 'active' ? `<span class="badge badge-active">ACTIVO</span>`
+          : st === 'trial' ? `<span class="badge badge-trial">TRIAL ${u.trial_days_remaining}d</span>`
+          : `<span class="badge badge-expired">VENCIDO</span>`;
+        const expires = u.plan_expires_at ? u.plan_expires_at.slice(0,10) : '—';
+        const trial = u.trial_ends_at ? u.trial_ends_at.slice(0,10) : '—';
+        const customer = u.stripe_customer_id
+          ? `<span style="font-size:11px;color:#64748b;">${u.stripe_customer_id.slice(0,15)}…</span>`
+          : '—';
+        const created = u.created_at ? u.created_at.slice(0,10) : '—';
+        return `<tr>
+          <td style="font-weight:500;">${u.email}</td>
+          <td>${planBadge}</td>
+          <td>${statusBadge}</td>
+          <td style="color:#94a3b8;">${expires}</td>
+          <td style="color:#94a3b8;">${trial}</td>
+          <td>${customer}</td>
+          <td style="color:#64748b;">${created}</td>
+          <td><button class="btn btn-sm btn-secondary" onclick="openModal(${u.id})">Editar</button></td>
+        </tr>`;
+      }).join('');
+    }
+
+    function getStatus(u) {
+      if (u.plan_override && u.plan !== 'none') return 'active';
+      if (u.is_active_plan && u.plan !== 'none') return 'active';
+      if (u.trial_days_remaining > 0) return 'trial';
+      return 'expired';
+    }
+
+    function openModal(userId) {
+      const u = allUsers.find(x => x.id === userId);
+      if (!u) return;
+      editingUserId = userId;
+      document.getElementById('modal-email').textContent = u.email;
+      document.getElementById('m-plan').value = u.plan || 'none';
+      document.getElementById('m-period').value = u.plan_billing_period || '';
+      document.getElementById('m-override').checked = u.plan_override;
+      document.getElementById('m-override-note').value = u.plan_override_note || '';
+      document.getElementById('m-is-active').checked = u.is_active;
+      document.getElementById('modal-msg').textContent = '';
+      // Convert ISO to datetime-local format
+      if (u.plan_expires_at) {
+        document.getElementById('m-expires').value = u.plan_expires_at.slice(0, 16);
+      } else {
+        document.getElementById('m-expires').value = '';
+      }
+      document.getElementById('edit-modal').classList.add('open');
+    }
+
+    function closeModal() {
+      document.getElementById('edit-modal').classList.remove('open');
+      editingUserId = null;
+    }
+
+    async function saveUserPlan() {
+      if (!editingUserId) return;
+      const msgEl = document.getElementById('modal-msg');
+      msgEl.className = 'msg';
+      msgEl.textContent = 'Guardando...';
+
+      const payload = {
+        plan: document.getElementById('m-plan').value,
+        plan_billing_period: document.getElementById('m-period').value || null,
+        plan_override: document.getElementById('m-override').checked,
+        plan_override_note: document.getElementById('m-override-note').value || null,
+        is_active: document.getElementById('m-is-active').checked,
+      };
+      const expiresVal = document.getElementById('m-expires').value;
+      payload.plan_expires_at = expiresVal ? expiresVal + ':00' : null;
+
+      try {
+        const r = await fetch(`/admin/api/users/${editingUserId}/plan`, {
+          method: 'PATCH',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload),
+        });
+        const d = await r.json();
+        if (r.ok && d.ok) {
+          msgEl.textContent = '✓ Guardado correctamente';
+          // Update local data
+          const idx = allUsers.findIndex(u => u.id === editingUserId);
+          if (idx !== -1) {
+            allUsers[idx] = {...allUsers[idx], ...payload};
+          }
+          renderTable();
+          setTimeout(closeModal, 800);
+        } else {
+          msgEl.className = 'msg error';
+          msgEl.textContent = d.error || 'Error al guardar';
+        }
+      } catch(e) {
+        msgEl.className = 'msg error';
+        msgEl.textContent = 'Error de red';
+      }
+    }
+
+    // Close modal on overlay click
+    document.getElementById('edit-modal').addEventListener('click', function(e) {
+      if (e.target === this) closeModal();
+    });
+
+    loadSummary();
+    loadUsers();
+  </script>
+</body>
+</html>

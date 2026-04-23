@@ -1,6 +1,7 @@
 """Authentication routes: email + password login/register."""
 import logging
 import re
+from datetime import datetime, timedelta
 from flask import Blueprint, request, jsonify, redirect, render_template
 from flask_login import login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -42,6 +43,7 @@ def register():
     user = User(
         email=email,
         password_hash=generate_password_hash(password),
+        trial_ends_at=datetime.utcnow() + timedelta(days=7),
     )
     db.session.add(user)
     db.session.flush()

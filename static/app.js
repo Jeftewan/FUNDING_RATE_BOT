@@ -639,6 +639,10 @@ async function enterPosition(oppId, idx) {
     if (data.ok) {
       showStepsModal(data);
       loadCurrentOpps();
+    } else if (data.error === 'plan_required') {
+      showToast(data.msg, 'warning');
+      switchTab('account');
+      setTimeout(openPlansModal, 400);
     } else {
       showToast(data.msg, 'error');
     }
@@ -1342,6 +1346,8 @@ function playBeep() {
 const EXCHANGES = ['Binance', 'Bybit', 'OKX', 'Bitget'];
 
 async function loadAccount() {
+  loadBillingStatus();
+  loadBillingInvoices();
   const el = document.getElementById('exchange-keys-list');
   if (!el) return;
   try {
@@ -1423,6 +1429,165 @@ async function deleteAccount() {
   } catch (e) {
     showToast('Error al eliminar cuenta', 'error');
   }
+}
+
+// ── Billing ───────────────────────────────────────────────────
+let _billingStatus = null;
+let _selectedPeriod = 'monthly';
+
+const PLAN_FEATURES = {
+  basic: ['1 posición activa', 'Scanner multi-exchange', 'Scoring IA', 'Historial + CSV'],
+  standard: ['Todo lo de Basic', 'Hasta 5 posiciones', 'Alertas Telegram en tiempo real', 'Soporte prioritario'],
+  pro: ['Todo lo de Standard', 'Posiciones ilimitadas', 'Automatización completa (próx.)', 'Protección SL/TP auto', 'Acceso anticipado'],
+};
+
+async function loadBillingStatus() {
+  const el = document.getElementById('billing-status');
+  if (!el) return;
+  try {
+    const res = await fetch('/api/billing/status');
+    if (!res.ok) return;
+    _billingStatus = await res.json();
+    renderBillingStatus();
+  } catch (e) { console.error('billing status error', e); }
+}
+
+function renderBillingStatus() {
+  const el = document.getElementById('billing-status');
+  if (!el || !_billingStatus) return;
+  const s = _billingStatus;
+  let statusLabel, statusColor;
+  if (s.plan_override) {
+    statusLabel = 'Licencia perpetua (admin)';
+    statusColor = '#a78bfa';
+  } else if (s.is_active && s.plan !== 'none') {
+    statusLabel = 'Activo';
+    statusColor = '#22c55e';
+  } else if (s.trial_days_remaining > 0) {
+    statusLabel = `Prueba: ${s.trial_days_remaining} día(s) restantes`;
+    statusColor = '#facc15';
+  } else {
+    statusLabel = 'Sin plan activo';
+    statusColor = '#ef4444';
+  }
+
+  const planLabel = s.plan === 'none' ? '—' : s.plan.charAt(0).toUpperCase() + s.plan.slice(1);
+  const nextBill = s.plan_expires_at ? new Date(s.plan_expires_at).toLocaleDateString() : '—';
+  const period = s.billing_period === 'annual' ? 'Anual' : (s.billing_period === 'monthly' ? 'Mensual' : '—');
+
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px">
+      <div><div style="color:#666;font-size:10px;text-transform:uppercase">Plan</div><div style="color:#fff;font-weight:600">${planLabel}</div></div>
+      <div><div style="color:#666;font-size:10px;text-transform:uppercase">Estado</div><div style="color:${statusColor};font-weight:600">${statusLabel}</div></div>
+      <div><div style="color:#666;font-size:10px;text-transform:uppercase">Período</div><div style="color:#fff">${period}</div></div>
+      <div><div style="color:#666;font-size:10px;text-transform:uppercase">Próximo cobro</div><div style="color:#fff">${nextBill}</div></div>
+    </div>
+  `;
+
+  const portalBtn = document.getElementById('btn-billing-portal');
+  if (portalBtn) portalBtn.style.display = s.plan !== 'none' && !s.plan_override ? '' : 'none';
+}
+
+async function loadBillingInvoices() {
+  const el = document.getElementById('billing-invoices');
+  if (!el) return;
+  try {
+    const res = await fetch('/api/billing/invoices');
+    if (!res.ok) return;
+    const data = await res.json();
+    const invoices = data.invoices || [];
+    if (!invoices.length) { el.innerHTML = ''; return; }
+    el.innerHTML = `
+      <div style="color:#666;font-size:10px;text-transform:uppercase;margin-bottom:6px">Historial de pagos</div>
+      <table style="width:100%;font-size:12px;border-collapse:collapse">
+        <tbody>
+          ${invoices.map(i => `
+            <tr style="border-bottom:1px solid #2d3148">
+              <td style="padding:6px 0">${i.date}</td>
+              <td style="padding:6px 0;color:#fff">$${i.amount.toFixed(2)} ${i.currency}</td>
+              <td style="padding:6px 0;color:${i.status === 'paid' ? '#22c55e' : '#facc15'}">${i.status}</td>
+              <td style="padding:6px 0;text-align:right">${i.pdf ? `<a href="${i.pdf}" target="_blank" style="color:#60a5fa;font-size:11px">PDF</a>` : ''}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
+  } catch (e) { console.error('invoices error', e); }
+}
+
+function openPlansModal() {
+  if (!_billingStatus) return;
+  renderPlansGrid();
+  document.getElementById('plans-modal').style.display = 'flex';
+}
+
+function closePlansModal() {
+  document.getElementById('plans-modal').style.display = 'none';
+  document.getElementById('plans-msg').textContent = '';
+}
+
+function setPeriod(p) {
+  _selectedPeriod = p;
+  const m = document.getElementById('period-monthly-btn');
+  const a = document.getElementById('period-annual-btn');
+  if (m) m.className = p === 'monthly' ? 'btn' : 'btn btn-secondary';
+  if (a) a.className = p === 'annual' ? 'btn' : 'btn btn-secondary';
+  renderPlansGrid();
+}
+
+function renderPlansGrid() {
+  const grid = document.getElementById('plans-grid');
+  if (!grid || !_billingStatus) return;
+  const plans = _billingStatus.plans || {};
+  const current = _billingStatus.plan;
+  grid.innerHTML = Object.entries(plans).map(([key, p]) => {
+    const price = _selectedPeriod === 'annual' ? p.price_annual : p.price_monthly;
+    const suffix = _selectedPeriod === 'annual' ? '/año' : '/mes';
+    const isCurrent = key === current;
+    const features = PLAN_FEATURES[key] || [];
+    return `
+      <div style="border:1px solid ${isCurrent ? '#a78bfa' : '#2d3148'};border-radius:10px;padding:18px;background:#0f1117">
+        <div style="font-weight:600;font-size:15px;margin-bottom:4px">${p.label}</div>
+        <div style="font-size:24px;font-weight:700;color:#fff;margin-bottom:10px">$${price}<span style="font-size:12px;color:#666;font-weight:400">${suffix}</span></div>
+        <ul style="list-style:none;padding:0;margin:0 0 14px 0;font-size:12px;color:#94a3b8">
+          ${features.map(f => `<li style="padding:3px 0">✓ ${f}</li>`).join('')}
+        </ul>
+        <button class="btn ${isCurrent ? 'btn-secondary' : 'btn-primary'}"
+                style="width:100%"
+                ${isCurrent ? 'disabled' : ''}
+                onclick="startCheckout('${key}')">
+          ${isCurrent ? 'Plan actual' : 'Elegir'}
+        </button>
+      </div>
+    `;
+  }).join('');
+}
+
+async function startCheckout(plan) {
+  const msg = document.getElementById('plans-msg');
+  msg.style.color = '#94a3b8';
+  msg.textContent = 'Redirigiendo a Stripe...';
+  try {
+    const res = await fetch('/api/billing/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan, period: _selectedPeriod }),
+    });
+    const data = await res.json();
+    if (res.ok && data.url) {
+      window.location.href = data.url;
+    } else {
+      msg.style.color = '#ef4444';
+      msg.textContent = data.error || 'Error al iniciar pago';
+    }
+  } catch (e) {
+    msg.style.color = '#ef4444';
+    msg.textContent = 'Error de red';
+  }
+}
+
+function openBillingPortal() {
+  window.location.href = '/api/billing/portal';
 }
 
 // ── Auth ─────────────────────────────────────────────────────

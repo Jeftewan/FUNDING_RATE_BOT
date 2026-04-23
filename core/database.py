@@ -74,6 +74,15 @@ def _run_migrations(db):
         "entry_fees = entry_fees / 2 "
         "WHERE (exit_fees_est IS NULL OR exit_fees_est = 0) "
         "AND entry_fees > 0 AND entry_fees_real IS NULL",
+        # Billing / subscription columns
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'none'",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_billing_period VARCHAR(10)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMP",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(100)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(100)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_override BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_override_note VARCHAR(255)",
     ]
     for sql in migrations:
         try:

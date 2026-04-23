@@ -358,6 +358,13 @@ class ScannerWorker:
                     )
                     continue
 
+                if not cfg.get("alerts_allowed", True):
+                    log.info(
+                        f"Telegram: skipping {len(user_alerts)} alert(s) for user {uid} "
+                        f"(plan does not include real-time alerts)"
+                    )
+                    continue
+
                 with self.state_manager.lock:
                     s = self.state_manager.state
                     s["email_enabled"] = True
@@ -403,10 +410,24 @@ class ScannerWorker:
                 if not db_persist:
                     return {}
                 us = db_persist.load_user_state(user_id)
+
+                # Check plan-based alerts permission
+                alerts_allowed = True
+                try:
+                    from core.db_models import User
+                    from billing.plans import get_effective_plan, get_plan_limits
+                    user = User.query.get(user_id)
+                    if user:
+                        limits = get_plan_limits(get_effective_plan(user))
+                        alerts_allowed = limits.get('alerts', False)
+                except Exception:
+                    pass
+
                 return {
                     "email_enabled": us.get("email_enabled", False),
                     "tg_chat_id": us.get("tg_chat_id", ""),
                     "tg_bot_token": us.get("tg_bot_token", ""),
+                    "alerts_allowed": alerts_allowed,
                 }
         except Exception as e:
             log.error(f"Failed to load Telegram config for user {user_id}: {e}")
