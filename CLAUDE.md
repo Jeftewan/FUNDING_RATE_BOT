@@ -1,6 +1,6 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-04-20**, rama activa `claude/crypto-arbitrage-bot-CjNiO`.
+Estado del proyecto al **2026-04-23**, rama activa `claude/optimize-ram-usage-9qlvb`.
 
 ---
 
@@ -221,6 +221,34 @@ ARBITRAGE_MODES       # Default: spot_perp,cross_exchange
 
 ---
 
+## Gestión de memoria (proceso long-running en Railway)
+
+El proceso corre indefinidamente — varias estructuras in-memory fueron acotadas para evitar crecimiento continuo:
+
+| Estructura | Archivo | Límite aplicado |
+|---|---|---|
+| `_notified_alerts` (set) | `scanner/worker.py` | Reset cuando supera 500 entradas (`_cleanup_events`) |
+| `_sl_tp_review_sent` (dict) | `scanner/worker.py` | Purga entradas con >24h (`_cleanup_events`) |
+| `_switch_results` (dict) | `scanner/worker.py` | Descarta posiciones cerradas al final de `run_switch_analysis` |
+| `_sent_cache` (dict) | `notifications/email.py` | Purga entradas con TTL vencido (×10 del cooldown) en cada `send_alert` |
+| `_hist_stats_cache` (module dict) | `core/db_persistence.py` | Cap de 300 entradas; elimina la mitad más antigua cuando se supera |
+
+`_scanned_events` ya tenía su propio reset a 200 entradas desde antes.
+
+---
+
+## switch_analyzer.py — notas de implementación
+
+`analysis/switch_analyzer.py` compara la posición actual contra las top 15 oportunidades del último scan. Aspectos importantes para futuras ediciones:
+
+- **Clave de identificación mode-aware**: para `spot_perp` la clave es `symbol_exchange`; para `cross_exchange`/`defi` es `symbol_longExchange_shortExchange`. El helper interno `_opp_key(opp)` construye esta clave. Usar siempre este helper al comparar oportunidades contra la posición actual.
+- **Campo de tasa según mode**: `spot_perp` → `funding_rate`; `cross_exchange`/`defi` → `rate_differential`. El mismo patrón aplica a `candidate_risk_factor` para el fallback de `settlement_avg`.
+- **`current_market_rate` para cross-exchange**: se recomputa desde las dos piernas (`short_fr − long_fr`) en lugar de buscar por un único campo `"fr"`.
+- **`avg_rate` zero-safe**: la comparación usa `if avg_rate is not None and avg_rate != 0` en lugar de `or` para preservar valores legítimamente iguales a cero.
+- **Switch analysis es on-demand**: se llama desde `/api/positions/ai`, no desde el loop del monitor.
+
+---
+
 ## Pendiente / Lo que falta
 
 ### Funcionalidad incompleta (infraestructura lista, falta conectar)
@@ -270,6 +298,7 @@ curl -X POST http://localhost:5000/api/force
 
 | Hash | Cambio |
 |------|--------|
+| `f410ecb` | RAM: acotar caches in-memory; fix switch_analyzer cross-exchange (opp_rate, current_score, market_rate) |
 | `f6ae4a7` | Fix min_volume por pierna en DeFi/CEX+DeFi, indicadores cross, current_fr en posiciones |
 | `a344317` | Quitar campo `scan_interval` (muerto) del frontend y API |
 | `310bbca` | Migrar notificaciones de CallMeBot WhatsApp a Telegram Bot API |
