@@ -40,6 +40,12 @@ class EmailNotifier:
 
         alert_key = f"{alert['type']}_{alert['symbol']}_{alert.get('exchange', '')}"
         now = time.time()
+        # Purge expired entries so _sent_cache doesn't grow unbounded across
+        # the lifetime of the process (bot runs for weeks on the same key set).
+        expiry = self._cooldown_seconds * 10
+        expired = [k for k, ts in self._sent_cache.items() if now - ts > expiry]
+        for k in expired:
+            del self._sent_cache[k]
         if alert_key in self._sent_cache:
             if now - self._sent_cache[alert_key] < self._cooldown_seconds:
                 remaining = self._cooldown_seconds - (now - self._sent_cache[alert_key])
