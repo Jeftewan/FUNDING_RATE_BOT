@@ -114,12 +114,13 @@ if Config.USE_DB and Config.DATABASE_URL:
             from billing.routes import billing_bp
             from admin.routes import admin_bp
 
-            # Expose Stripe config via app.config for blueprints
+            # Expose Lemon Squeezy config via app.config for blueprints
             for k in (
-                "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET",
-                "STRIPE_PRICE_BASIC_MONTHLY", "STRIPE_PRICE_BASIC_ANNUAL",
-                "STRIPE_PRICE_STANDARD_MONTHLY", "STRIPE_PRICE_STANDARD_ANNUAL",
-                "STRIPE_PRICE_PRO_MONTHLY", "STRIPE_PRICE_PRO_ANNUAL",
+                "LEMONSQUEEZY_API_KEY", "LEMONSQUEEZY_WEBHOOK_SECRET",
+                "LEMONSQUEEZY_STORE_ID",
+                "LEMONSQUEEZY_VARIANT_BASIC_MONTHLY", "LEMONSQUEEZY_VARIANT_BASIC_ANNUAL",
+                "LEMONSQUEEZY_VARIANT_STANDARD_MONTHLY", "LEMONSQUEEZY_VARIANT_STANDARD_ANNUAL",
+                "LEMONSQUEEZY_VARIANT_PRO_MONTHLY", "LEMONSQUEEZY_VARIANT_PRO_ANNUAL",
             ):
                 app.config[k] = getattr(Config, k, "")
 

@@ -3,11 +3,11 @@ from flask import Blueprint, request, jsonify, redirect, current_app
 from flask_login import login_required, current_user
 
 from billing.plans import get_plan_limits, user_has_active_plan, trial_days_remaining, PLAN_LIMITS
-from billing.stripe_client import (
+from billing.lemonsqueezy_client import (
     create_checkout_session,
     create_customer_portal_session,
     get_customer_invoices,
-    handle_webhook_event,
+    verify_webhook_signature,
     apply_webhook_event,
 )
 
@@ -37,6 +37,7 @@ def billing_status():
         'plan_expires_at': expires.isoformat() if expires else None,
         'trial_days_remaining': trial_days_remaining(current_user),
         'is_active': user_has_active_plan(current_user),
+        'has_portal': bool(getattr(current_user, 'customer_portal_url', None)),
         'limits': limits,
         'plans': {k: {
             'label': v['label'],
@@ -67,64 +68,62 @@ def billing_checkout():
         )
         return jsonify({'url': url})
     except ValueError as e:
-        logger.error("Checkout error: %s", e)
+        logger.error("Checkout config error: %s", e)
         return jsonify({'error': str(e)}), 500
     except Exception as e:
-        logger.error("Stripe checkout error: %s", e)
+        logger.error("Lemon Squeezy checkout error: %s", e)
         return jsonify({'error': 'Error al crear sesión de pago'}), 500
 
 
 @billing_bp.route('/api/billing/portal')
 @login_required
 def billing_portal():
-    stripe_customer_id = getattr(current_user, 'stripe_customer_id', None)
-    if not stripe_customer_id:
-        return jsonify({'error': 'No tienes una suscripción activa en Stripe'}), 400
-    try:
-        url = create_customer_portal_session(
-            stripe_customer_id,
-            return_url=_base_url() + '/',
-        )
-        return redirect(url)
-    except Exception as e:
-        logger.error("Stripe portal error: %s", e)
-        return jsonify({'error': 'Error al abrir portal de facturación'}), 500
+    url = create_customer_portal_session(current_user)
+    if not url:
+        return jsonify({'error': 'No tienes una suscripción activa'}), 400
+    return redirect(url)
 
 
 @billing_bp.route('/api/billing/invoices')
 @login_required
 def billing_invoices():
-    stripe_customer_id = getattr(current_user, 'stripe_customer_id', None)
-    if not stripe_customer_id:
+    provider_customer_id = getattr(current_user, 'provider_customer_id', None)
+    if not provider_customer_id:
         return jsonify({'invoices': []})
     try:
-        invoices = get_customer_invoices(stripe_customer_id, limit=5)
+        invoices = get_customer_invoices(provider_customer_id, limit=5)
         return jsonify({'invoices': invoices})
     except Exception as e:
-        logger.error("Stripe invoices error: %s", e)
+        logger.error("Lemon Squeezy invoices error: %s", e)
         return jsonify({'invoices': []})
 
 
 @billing_bp.route('/api/billing/webhook', methods=['POST'])
 def billing_webhook():
     payload = request.get_data()
-    sig_header = request.headers.get('Stripe-Signature', '')
-    webhook_secret = current_app.config.get('STRIPE_WEBHOOK_SECRET', '')
+    sig_header = request.headers.get('X-Signature', '')
+    webhook_secret = current_app.config.get('LEMONSQUEEZY_WEBHOOK_SECRET', '')
 
     if not webhook_secret:
-        logger.warning("STRIPE_WEBHOOK_SECRET not configured, skipping verification")
+        logger.warning("LEMONSQUEEZY_WEBHOOK_SECRET not configured")
         return jsonify({'error': 'Webhook not configured'}), 500
 
-    event = handle_webhook_event(payload, sig_header, webhook_secret)
-    if event is None:
+    if not verify_webhook_signature(payload, sig_header, webhook_secret):
+        logger.warning("Lemon Squeezy webhook signature verification failed")
         return jsonify({'error': 'Invalid signature'}), 400
+
+    try:
+        event = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return jsonify({'error': 'Invalid payload'}), 400
 
     try:
         from core.db_models import User
         from core.database import db
         apply_webhook_event(event, db.session, User)
     except Exception as e:
-        logger.error("Webhook handler error for event %s: %s", event.get('type'), e)
+        logger.error("Webhook handler error for event %s: %s",
+                     (event.get('meta') or {}).get('event_name'), e)
         return jsonify({'error': 'Handler error'}), 500
 
     return jsonify({'received': True})

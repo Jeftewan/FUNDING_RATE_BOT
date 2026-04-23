@@ -15,13 +15,14 @@ class User(db.Model):
     is_admin = db.Column(db.Boolean, default=False)
     is_active = db.Column(db.Boolean, default=True)
 
-    # Subscription / billing
+    # Subscription / billing (provider-agnostic — currently Lemon Squeezy)
     plan = db.Column(db.String(20), default='none')          # none/basic/standard/pro
     plan_billing_period = db.Column(db.String(10), nullable=True)  # monthly/annual
     plan_expires_at = db.Column(db.DateTime, nullable=True)
     trial_ends_at = db.Column(db.DateTime, nullable=True)
-    stripe_customer_id = db.Column(db.String(100), nullable=True)
-    stripe_subscription_id = db.Column(db.String(100), nullable=True)
+    provider_customer_id = db.Column(db.String(100), nullable=True)
+    provider_subscription_id = db.Column(db.String(100), nullable=True)
+    customer_portal_url = db.Column(db.String(512), nullable=True)
     plan_override = db.Column(db.Boolean, default=False)
     plan_override_note = db.Column(db.String(255), nullable=True)
 

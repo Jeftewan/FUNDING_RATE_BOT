@@ -49,7 +49,7 @@ def admin_users():
             'is_active_plan': user_has_active_plan(u),
             'plan_override': bool(u.plan_override),
             'plan_override_note': u.plan_override_note,
-            'stripe_customer_id': u.stripe_customer_id,
+            'provider_customer_id': u.provider_customer_id,
             'is_admin': u.is_admin,
             'is_active': u.is_active,
             'created_at': u.created_at.isoformat() if u.created_at else None,
@@ -62,14 +62,14 @@ def admin_users():
 def admin_user_detail(user_id):
     from core.db_models import User
     from billing.plans import user_has_active_plan, trial_days_remaining
-    from billing.stripe_client import get_customer_invoices
+    from billing.lemonsqueezy_client import get_customer_invoices
 
     u = User.query.get_or_404(user_id)
 
     invoices = []
-    if u.stripe_customer_id:
+    if u.provider_customer_id:
         try:
-            invoices = get_customer_invoices(u.stripe_customer_id, limit=10)
+            invoices = get_customer_invoices(u.provider_customer_id, limit=10)
         except Exception as e:
             log.warning("Could not fetch invoices for user %s: %s", user_id, e)
 
@@ -84,8 +84,8 @@ def admin_user_detail(user_id):
         'is_active_plan': user_has_active_plan(u),
         'plan_override': bool(u.plan_override),
         'plan_override_note': u.plan_override_note,
-        'stripe_customer_id': u.stripe_customer_id,
-        'stripe_subscription_id': u.stripe_subscription_id,
+        'provider_customer_id': u.provider_customer_id,
+        'provider_subscription_id': u.provider_subscription_id,
         'is_admin': u.is_admin,
         'is_active': u.is_active,
         'created_at': u.created_at.isoformat() if u.created_at else None,

@@ -9,4 +9,3 @@ psycopg2-binary
 cryptography
 itsdangerous
 groq
-stripe>=7.0.0

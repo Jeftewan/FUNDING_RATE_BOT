@@ -118,7 +118,7 @@
             <th>Estado</th>
             <th>Vencimiento</th>
             <th>Trial</th>
-            <th>Stripe customer</th>
+            <th>Customer ID</th>
             <th>Registrado</th>
             <th>Acción</th>
           </tr>
@@ -161,7 +161,7 @@
       </div>
 
       <div class="form-group">
-        <label>Override perpetuo (no depende de Stripe)</label>
+        <label>Override perpetuo (no depende de la pasarela)</label>
         <div class="checkbox-row">
           <input type="checkbox" id="m-override" style="width:auto;">
           <span style="font-size:13px;color:#e2e8f0;">Activar licencia perpetua</span>
@@ -252,8 +252,8 @@
           : `<span class="badge badge-expired">VENCIDO</span>`;
         const expires = u.plan_expires_at ? u.plan_expires_at.slice(0,10) : '—';
         const trial = u.trial_ends_at ? u.trial_ends_at.slice(0,10) : '—';
-        const customer = u.stripe_customer_id
-          ? `<span style="font-size:11px;color:#64748b;">${u.stripe_customer_id.slice(0,15)}…</span>`
+        const customer = u.provider_customer_id
+          ? `<span style="font-size:11px;color:#64748b;">${u.provider_customer_id.slice(0,15)}…</span>`
           : '—';
         const created = u.created_at ? u.created_at.slice(0,10) : '—';
         return `<tr>

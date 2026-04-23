@@ -74,19 +74,25 @@ def _run_migrations(db):
         "entry_fees = entry_fees / 2 "
         "WHERE (exit_fees_est IS NULL OR exit_fees_est = 0) "
         "AND entry_fees > 0 AND entry_fees_real IS NULL",
-        # Billing / subscription columns
+        # Billing / subscription columns (provider-agnostic).
+        # RENAMEs run first so a prior deploy's stripe_* column is preserved
+        # rather than replaced by an empty provider_* column.
+        "ALTER TABLE users RENAME COLUMN stripe_customer_id TO provider_customer_id",
+        "ALTER TABLE users RENAME COLUMN stripe_subscription_id TO provider_subscription_id",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(20) DEFAULT 'none'",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_billing_period VARCHAR(10)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expires_at TIMESTAMP",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMP",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(100)",
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(100)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS provider_customer_id VARCHAR(100)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS provider_subscription_id VARCHAR(100)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS customer_portal_url VARCHAR(512)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_override BOOLEAN DEFAULT FALSE",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_override_note VARCHAR(255)",
     ]
     for sql in migrations:
         try:
             db.session.execute(db.text(sql))
+            db.session.commit()
         except Exception as e:
+            db.session.rollback()
             log.debug(f"Migration skipped (likely already applied): {e}")
-    db.session.commit()

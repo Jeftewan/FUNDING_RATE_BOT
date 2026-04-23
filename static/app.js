@@ -1566,7 +1566,7 @@ function renderPlansGrid() {
 async function startCheckout(plan) {
   const msg = document.getElementById('plans-msg');
   msg.style.color = '#94a3b8';
-  msg.textContent = 'Redirigiendo a Stripe...';
+  msg.textContent = 'Redirigiendo al checkout...';
   try {
     const res = await fetch('/api/billing/checkout', {
       method: 'POST',
