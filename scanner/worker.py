@@ -551,12 +551,28 @@ class ScannerWorker:
                                 })
                                 self._notified_alerts.add(alert_key)
 
+                # Drop switch results of closed positions to bound memory.
+                active_ids = {str(p.get("id", "")) for p in positions}
+                self._switch_results = {
+                    k: v for k, v in self._switch_results.items()
+                    if k in active_ids
+                }
+
                 log.info(f"Switch analysis: {len(self._switch_results)} positions analyzed")
 
     def _cleanup_events(self):
-        """Remove old scanned events to avoid memory growth."""
+        """Remove old tracking entries to avoid memory growth."""
         if len(self._scanned_events) > 200:
             self._scanned_events.clear()
+        # Alert keys are formed as TIPO_SYMBOL_EXCHANGE with no timestamp,
+        # so we cap and reset when the set grows beyond typical volume.
+        if len(self._notified_alerts) > 500:
+            self._notified_alerts.clear()
+        # _sl_tp_review_sent stores timestamps, purge entries older than 24h.
+        cutoff = time.time() - 86400
+        self._sl_tp_review_sent = {
+            k: v for k, v in self._sl_tp_review_sent.items() if v > cutoff
+        }
 
     # ── Scan (called only by triggers or manual) ──────────────
 

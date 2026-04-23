@@ -22,6 +22,7 @@ import math
 import logging
 from analysis.fees import (calculate_spot_perp_fees, calculate_cross_exchange_fees,
                            calculate_break_even_hours)
+from portfolio.manager import position_fees as _pf
 
 log = logging.getLogger("bot")
 
@@ -114,9 +115,13 @@ def candidate_risk_factor(opp: dict) -> float:
     settlement_avg = abs(opp.get("settlement_avg", 0) or 0)
     ppd = opp.get("payments_per_day", 3) or 3
     if settlement_avg <= 0:
-        # Fallback to current rate when settlement_avg is absent
-        settlement_avg = abs(opp.get("funding_rate",
-                                     opp.get("rate_differential", 0)) or 0)
+        # Fallback to current rate when settlement_avg is absent.
+        # Pick the mode-appropriate field.
+        opp_mode = opp.get("mode", "spot_perp")
+        if opp_mode == "spot_perp":
+            settlement_avg = abs(opp.get("funding_rate", 0) or 0)
+        else:
+            settlement_avg = abs(opp.get("rate_differential", 0) or 0)
     yield_day_pct = settlement_avg * ppd * 100
 
     if yield_day_pct >= 0.25:
@@ -198,7 +203,6 @@ def _compute_position_health(position: dict, current_market_rate: float,
     earned = position.get("earned_real", 0)
     # Prefer user-entered real fees over estimates (fixes the old double-count
     # where `entry_fees * 2` ran on top of an already-round-trip value).
-    from portfolio.manager import position_fees as _pf
     _e, _x, est_fees, _is_real = _pf(position)
     elapsed_h = position.get("elapsed_h", 0) or 0
     payments = position.get("payments") or []
@@ -314,19 +318,45 @@ def analyze_switch(position: dict, opportunities: list,
     ih = position.get("ih", 8)
     ppd = 24 / ih
 
-    # Current position rate: use avg_rate if available, else last known
-    current_rate = position.get("avg_rate", 0) or position.get("last_fr_used", 0)
-    if not current_rate:
-        current_rate = position.get("entry_fr", 0)
+    # Current position rate: use avg_rate if available, else last known.
+    # Explicit None check: avg_rate=0 is a legitimate value we must respect.
+    avg_rate = position.get("avg_rate")
+    if avg_rate is not None and avg_rate != 0:
+        current_rate = avg_rate
+    else:
+        current_rate = position.get("last_fr_used", 0) or position.get("entry_fr", 0)
 
     # Find current market rate for position
     sym = position["symbol"]
-    ex = position.get("exchange", "")
+    # Build position exchange key by mode. Cross-exchange positions have
+    # long_exchange/short_exchange instead of a single exchange field.
+    if mode in ("cross_exchange", "defi"):
+        pos_long_ex = position.get("long_exchange", "")
+        pos_short_ex = position.get("short_exchange", "")
+        ex = f"{pos_long_ex}_{pos_short_ex}"
+    else:
+        ex = position.get("exchange", "")
+        pos_long_ex = ""
+        pos_short_ex = ""
+
     current_market_rate = current_rate
-    for d in all_data:
-        if d.get("symbol") == sym and d.get("exchange") == ex:
-            current_market_rate = d.get("fr", current_rate)
-            break
+    if mode == "spot_perp":
+        for d in all_data:
+            if d.get("symbol") == sym and d.get("exchange") == ex:
+                current_market_rate = d.get("fr", current_rate)
+                break
+    else:
+        # For cross-exchange/defi: recompute differential from both legs if present
+        long_fr = None
+        short_fr = None
+        for d in all_data:
+            if d.get("symbol") == sym:
+                if d.get("exchange") == pos_long_ex:
+                    long_fr = d.get("fr")
+                elif d.get("exchange") == pos_short_ex:
+                    short_fr = d.get("fr")
+        if long_fr is not None and short_fr is not None:
+            current_market_rate = short_fr - long_fr
 
     # Current projected earnings (next 72h at current rate)
     hours_remaining = 72
@@ -352,28 +382,50 @@ def analyze_switch(position: dict, opportunities: list,
         except Exception:
             pass
 
+    def _opp_key(opp: dict) -> str:
+        """Build a mode-aware symbol+exchange identifier for an opportunity."""
+        opp_mode = opp.get("mode", "spot_perp")
+        opp_sym = opp.get("symbol", "")
+        if opp_mode == "spot_perp":
+            return f"{opp_sym}_{opp.get('exchange', '')}"
+        return f"{opp_sym}_{opp.get('long_exchange', '')}_{opp.get('short_exchange', '')}"
+
+    # Position key matches opp_key format so lookup works for cross-exchange
+    if mode == "spot_perp":
+        pos_sym_ex = f"{sym}_{ex}"
+    else:
+        pos_sym_ex = f"{sym}_{pos_long_ex}_{pos_short_ex}"
+
     current_score = 0
     for opp in opportunities:
-        if (opp.get("symbol") == sym and
-                opp.get("exchange", opp.get("short_exchange", "")) == ex):
+        if opp.get("symbol") == sym and _opp_key(opp) == pos_sym_ex:
             current_score = opp.get("score", 0)
             break
 
     # Evaluate top opportunities as switch candidates
     alternatives = []
-    pos_sym_ex = f"{sym}_{ex}"
 
     for opp in opportunities[:15]:  # Top 15 by score
         opp_sym = opp.get("symbol", "")
-        opp_ex = opp.get("exchange", opp.get("short_exchange", ""))
-        opp_key = f"{opp_sym}_{opp_ex}"
+        opp_mode = opp.get("mode", "spot_perp")
+        opp_key = _opp_key(opp)
+        # Display-friendly exchange label
+        if opp_mode == "spot_perp":
+            opp_ex = opp.get("exchange", "")
+        else:
+            opp_ex = f"{opp.get('long_exchange', '')}->{opp.get('short_exchange', '')}"
 
         # Skip if same as current position
         if opp_key == pos_sym_ex:
             continue
 
         opp_score = opp.get("score", 0)
-        opp_rate = abs(opp.get("funding_rate", opp.get("rate_differential", 0)))
+        # Use mode-appropriate rate field. funding_rate is for spot_perp;
+        # cross_exchange/defi use rate_differential.
+        if opp_mode == "spot_perp":
+            opp_rate = abs(opp.get("funding_rate", 0) or 0)
+        else:
+            opp_rate = abs(opp.get("rate_differential", 0) or 0)
         opp_ppd = opp.get("payments_per_day", 3)
         opp_hold_days = opp.get("estimated_hold_days", 3)
 
@@ -422,10 +474,11 @@ def analyze_switch(position: dict, opportunities: list,
         if projected_current > 0:
             improvement_pct = ((projected_new - projected_current) / projected_current) * 100
 
+        _hist = opp.get("history") or {}
         alternatives.append({
             "symbol": opp_sym,
             "exchange": opp_ex,
-            "mode": opp.get("mode", "spot_perp"),
+            "mode": opp_mode,
             "score": opp_score,
             "apr": opp.get("apr", 0) or round(alt_apr, 1),
             "switch_cost": switch_cost["total_cost"],
@@ -438,8 +491,7 @@ def analyze_switch(position: dict, opportunities: list,
             "candidate_risk": round(new_opp_risk, 3),
             "improvement_pct": round(improvement_pct, 1),
             "stability_grade": opp.get("stability_grade", "?"),
-            "consistency": opp.get("history", {}).get("pct",
-                           opp.get("history", {}).get("favorable_pct", 0)),
+            "consistency": _hist.get("pct", _hist.get("favorable_pct", 0)),
             "_id": opp.get("_id", ""),
         })
 

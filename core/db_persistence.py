@@ -470,6 +470,13 @@ class DBPersistence:
             }
 
             _hist_stats_cache[cache_key] = (now, result)
+            # Cap cache size: drop the oldest half when over 300 entries.
+            if len(_hist_stats_cache) > 300:
+                sorted_keys = sorted(
+                    _hist_stats_cache, key=lambda k: _hist_stats_cache[k][0]
+                )
+                for k in sorted_keys[:150]:
+                    del _hist_stats_cache[k]
             return result
 
         except Exception as e:
