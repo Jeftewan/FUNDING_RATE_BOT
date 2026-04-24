@@ -527,6 +527,34 @@ function fmtVol(v) {
   return v.toFixed(0);
 }
 
+function renderEntryStrategy(es) {
+  if (!es) return '';
+  const slipColor = es.slippage_pct > 0.3 ? '#ef4444' : es.slippage_pct > 0.15 ? '#f59e0b' : '#22c55e';
+  const srcBadge = es.slippage_source === 'orderbook'
+    ? '<span class="es-badge es-live">LIVE</span>'
+    : '<span class="es-badge es-est">EST</span>';
+  const impactColor = es.book_impact_level === 'high' ? '#ef4444' : es.book_impact_level === 'medium' ? '#f59e0b' : '#22c55e';
+  const impactLabel = es.book_impact_level === 'high' ? 'ALTO' : es.book_impact_level === 'medium' ? 'MED' : 'BAJO';
+  const winColor = es.window_status === 'green' ? '#22c55e' : es.window_status === 'yellow' ? '#f59e0b' : '#ef4444';
+  const winLabel = es.window_status === 'green' ? 'OK' : es.window_status === 'yellow' ? 'PRONTO' : 'URGENTE';
+  const winTime = es.mins_to_next > 90 ? `${Math.round(es.mins_to_next / 60)}h` : `${Math.round(es.mins_to_next)}m`;
+  let basisTile = '';
+  if (es.basis_pct !== null && es.basis_pct !== undefined) {
+    const sign = es.basis_pct >= 0 ? '+' : '';
+    const basisColor = Math.abs(es.basis_pct) > 0.3 ? '#f59e0b' : '#888';
+    basisTile = `<div class="es-tile"><span class="es-label">Basis</span><span class="es-val" style="color:${basisColor}">${sign}${es.basis_pct.toFixed(3)}%</span></div>`;
+  }
+  return `<div class="entry-strategy">
+    <div class="es-grid">
+      <div class="es-tile"><span class="es-label">Slippage</span><span class="es-val" style="color:${slipColor}">${es.slippage_pct.toFixed(3)}% ${srcBadge}</span></div>
+      <div class="es-tile"><span class="es-label">Impacto libro</span><span class="es-val"><span style="color:${impactColor}">${impactLabel}</span>&nbsp;${es.book_impact_pct.toFixed(3)}%</span></div>
+      <div class="es-tile"><span class="es-label">Ventana</span><span class="es-val"><span style="color:${winColor}">${winLabel}</span>&nbsp;${winTime}</span></div>
+      ${basisTile}
+    </div>
+    <div class="es-reco">${es.recommendation}</div>
+  </div>`;
+}
+
 async function calcEst(oppId, idx) {
   const cap = parseFloat(document.getElementById('cap-' + idx).value);
   const lev = parseInt(document.getElementById('lev-' + idx).value) || 1;
@@ -568,6 +596,8 @@ async function calcEst(oppId, idx) {
           Fees: $${e.fees_total.toFixed(2)} |
           BE: ${e.break_even_hours.toFixed(1)}h
         </div>`;
+
+      html += renderEntryStrategy(e.entry_strategy);
 
       if (e.sl_tp) {
         const s = e.sl_tp;
@@ -653,6 +683,7 @@ function showStepsModal(data) {
   const steps = (data.steps || []).map(s => `<div class="step">${s}</div>`).join('');
   document.getElementById('modal-body').innerHTML = `
     ${steps}
+    ${renderEntryStrategy(data.entry_strategy)}
     <div class="est-summary">
       <div class="est-row"><span>Ganancia diaria estimada</span><span class="est-val">$${data.estimated_daily?.toFixed(2)}</span></div>
       <div class="est-row"><span>Ganancia 3 dias</span><span class="est-val">$${data.estimated_3day?.toFixed(2)}</span></div>

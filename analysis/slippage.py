@@ -17,8 +17,10 @@ log = logging.getLogger("bot.slippage")
 
 # Cache: {(display_name, symbol, side) -> (ts, pct)}
 _cache: dict = {}
+_spot_cache: dict = {}
 _cache_lock = threading.Lock()
-_TTL = 60  # seconds
+_TTL = 60      # seconds — orderbook slippage
+_SPOT_TTL = 30  # seconds — spot price
 
 # Cache of the exchange manager so we don't pass it around everywhere
 _exchange_manager = None
@@ -33,6 +35,36 @@ def bind_exchange_manager(manager):
     """
     global _exchange_manager
     _exchange_manager = manager
+
+
+def fetch_spot_price(exchange_display: str, symbol: str):
+    """Return the latest spot price for symbol on exchange, or None on failure.
+
+    Cached 30 s. Used to compute spot-perp basis in entry strategy metrics.
+    """
+    if not symbol or not exchange_display:
+        return None
+    base = symbol.upper().replace("USDT", "").replace("USD", "").replace("/", "")
+    cache_key = (exchange_display, base)
+    now = time.time()
+    with _cache_lock:
+        entry = _spot_cache.get(cache_key)
+        if entry and (now - entry[0]) < _SPOT_TTL:
+            return entry[1]
+    inst = _lookup_ccxt(exchange_display)
+    if inst is None:
+        return None
+    for sym in (f"{base}/USDT", f"{base}/USD"):
+        try:
+            ticker = inst.fetch_ticker(sym)
+            price = float(ticker.get("last") or ticker.get("close") or 0)
+            if price > 0:
+                with _cache_lock:
+                    _spot_cache[cache_key] = (now, price)
+                return price
+        except Exception:
+            continue
+    return None
 
 
 # Display-name ('Binance') → lowercase key ('binance')
