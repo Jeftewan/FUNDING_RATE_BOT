@@ -4,6 +4,7 @@ import logging
 import uuid
 from datetime import datetime
 from analysis.fees import calculate_spot_perp_fees, calculate_cross_exchange_fees
+from portfolio.actions import build_entry_strategy
 
 log = logging.getLogger("bot")
 
@@ -155,6 +156,7 @@ def open_position(state: dict, opportunity: dict, capital: float,
         "estimated_3day": est_3day,
         "fees_total": fees["total_cost"],
         "break_even_hours": break_even_h,
+        "entry_strategy": build_entry_strategy(opportunity, capital, mode, fees),
     }
 
 

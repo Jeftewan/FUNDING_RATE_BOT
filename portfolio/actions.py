@@ -96,7 +96,77 @@ def calculate_position_estimate(opportunity: dict, capital: float,
         result["exposure_per_side"] = exposure
 
     result.update(sl_tp)
+    result["entry_strategy"] = build_entry_strategy(opportunity, capital, mode, fees)
     return result
+
+
+def build_entry_strategy(opp: dict, capital: float, mode: str, fees: dict) -> dict:
+    """Compute entry-execution metrics and order-type recommendation."""
+    mins_to_next = float(opp.get("mins_to_next") or 999)
+    volume_24h = float(opp.get("volume_24h") or 1e6) or 1e6
+
+    slip_pct = fees.get("slip_pct", 0)
+    slip_source = fees.get("source", "table")
+
+    per_leg = capital / 2
+    book_impact_pct = per_leg / volume_24h * 100
+
+    book_impact_level = (
+        "high" if book_impact_pct >= 0.1
+        else "medium" if book_impact_pct >= 0.05
+        else "low"
+    )
+
+    window_status = (
+        "red" if mins_to_next <= 10
+        else "yellow" if mins_to_next <= 30
+        else "green"
+    )
+
+    basis_pct = None
+    if mode == "spot_perp":
+        try:
+            from analysis.slippage import fetch_spot_price
+            perp_price = float(opp.get("price") or 0)
+            spot_price = fetch_spot_price(opp.get("exchange", ""), opp.get("symbol", ""))
+            if spot_price and spot_price > 0 and perp_price > 0:
+                basis_pct = (perp_price - spot_price) / spot_price * 100
+        except Exception:
+            pass
+    elif mode == "cross_exchange":
+        long_price = float(opp.get("long_price") or 0)
+        short_price = float(opp.get("short_price") or 0)
+        if long_price > 0 and short_price > 0:
+            mid = (long_price + short_price) / 2
+            basis_pct = (short_price - long_price) / mid * 100
+
+    if mode == "spot_perp":
+        rec = "Limit SPOT (mid, 60s) → Market PERP al llenar"
+    else:
+        rec = "Limit simultáneo ambos exchanges (90s) → abortar si solo 1 llena"
+
+    modifiers = []
+    if book_impact_level == "high":
+        modifiers.append("dividir en 2–3 chunks")
+    if window_status == "red":
+        modifiers.append("⚠ muy cerca del pago")
+    if slip_pct > 0.3:
+        modifiers.append("⚠ slippage alto, reduce capital")
+    if basis_pct is not None and mode == "spot_perp" and basis_pct < -0.1:
+        modifiers.append("⚠ basis negativo")
+    if modifiers:
+        rec += " · " + " · ".join(modifiers)
+
+    return {
+        "slippage_pct": round(slip_pct, 3),
+        "slippage_source": slip_source,
+        "book_impact_pct": round(book_impact_pct, 4),
+        "book_impact_level": book_impact_level,
+        "window_status": window_status,
+        "mins_to_next": round(mins_to_next, 1),
+        "basis_pct": round(basis_pct, 3) if basis_pct is not None else None,
+        "recommendation": rec,
+    }
 
 
 def _calculate_sl_tp(price: float, leverage: int, exchange: str,

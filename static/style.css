@@ -508,6 +508,69 @@ body {
   margin-top: 6px;
 }
 
+/* ═══ ENTRY STRATEGY METRICS ════════════════════ */
+.entry-strategy {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: #0d0f12;
+  border-radius: var(--radius-sm);
+  border-left: 2px solid #3b82f630;
+}
+.es-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  margin-bottom: 5px;
+}
+.es-grid:has(.es-tile:nth-child(4)) {
+  grid-template-columns: repeat(4, 1fr);
+}
+.es-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 5px;
+  background: var(--bg-card);
+  border-radius: 5px;
+}
+.es-label {
+  font-size: 9px;
+  font-family: var(--font-ui);
+  color: var(--text-muted);
+  letter-spacing: .3px;
+  text-transform: uppercase;
+}
+.es-val {
+  font-size: 11px;
+  font-family: var(--font);
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-wrap: wrap;
+}
+.es-badge {
+  font-size: 8px;
+  font-family: var(--font-ui);
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  letter-spacing: .3px;
+}
+.es-live { background: var(--green-bg); color: var(--green); border: 1px solid #22c55e44; }
+.es-est  { background: #55555518; color: #777; border: 1px solid #55555530; }
+.es-reco {
+  font-size: 10px;
+  font-family: var(--font-ui);
+  color: var(--text-secondary);
+  line-height: 1.4;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+@media (max-width: 400px) {
+  .es-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
 /* ═══ AI ANALYSIS ════════════════════════════════ */
 
 .opp-ai {
