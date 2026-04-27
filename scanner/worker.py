@@ -1,10 +1,10 @@
-"""Background monitor — v8.3 minimal API calls.
+"""Background monitor — v8.4 minimal API calls.
 
-Scans happen in 4 moments:
-1. ~10 min before a funding payment (verify rate is still good)
-2. At payment time (get actual rate for earnings)
-3. 5 min after payment (refresh to get NEW next_funding_ts)
-4. Manual scan (user clicks button)
+Scans happen in 3 moments:
+1. ~10 min before a funding payment (verify rate is still good, alerts)
+2. ~3 min after a funding payment (capture exact settled rate from
+   exchange history + refresh next_funding_ts in one pass)
+3. Manual scan (user clicks button)
 
 NO periodic scan loop. Monitor runs every 30s checking timestamps
 locally (zero API calls) and triggers scans only when needed.
@@ -20,10 +20,15 @@ log = logging.getLogger("bot")
 
 # Pre-payment scan: minutes before payment to trigger verification scan
 PRE_PAYMENT_SCAN_MINS = 10
-# Payment scan: minutes after payment to fetch actual rate used
-POST_PAYMENT_SCAN_MINS = 1
-# Refresh scan: seconds after payment scan to refresh next_funding_ts
-REFRESH_AFTER_PAYMENT_SECS = 5 * 60  # 5 minutes
+# Post-settlement delay: seconds after the actual settlement before the
+# post-payment scan fires. Gives the exchange time to (a) expose the
+# settled rate via fetch_funding_rate_history and (b) update
+# nextFundingTime to the following period. Replaces the old
+# POST_PAYMENT_SCAN_MINS + REFRESH_AFTER_PAYMENT_SECS pair.
+POST_SETTLEMENT_DELAY_SECS = 3 * 60
+# Tolerance (in seconds) when matching a settlement timestamp against
+# historical entries returned by the exchange / DB snapshots.
+SETTLEMENT_RATE_TOLERANCE_SECS = 120
 
 
 class ScannerWorker:
@@ -43,7 +48,6 @@ class ScannerWorker:
         self._scan_lock = threading.Lock()
         self._scanned_events = set()
         self._notified_alerts = set()
-        self._pending_refreshes = {}
         self._sl_tp_review_sent = {}  # {position_id: last_sent_timestamp}
         self._db_persist = None  # Lazy-init DBPersistence
         self._last_switch_analysis = 0  # Timestamp of last switch analysis
@@ -159,13 +163,6 @@ class ScannerWorker:
         alerts = []
         now = time.time()
 
-        # Momento 3: Check pending refresh scans (5 min after payment)
-        for rkey, trigger_at in list(self._pending_refreshes.items()):
-            if now >= trigger_at:
-                scan_reason = f"Refresh post-pago ({rkey})"
-                del self._pending_refreshes[rkey]
-                break
-
         # Load positions from DB (all users' active positions)
         positions = self._load_all_positions_from_db()
 
@@ -182,84 +179,76 @@ class ScannerWorker:
 
             # Optimize: deduplicate positions by (symbol, exchange) for trigger checks
             # Multiple users with same symbol/exchange only need ONE trigger check
-            if not scan_reason:
-                triggered_positions = []
-                combined = all_data + defi_data
-                seen_pairs = set()  # (symbol, exchange) already checked
+            triggered_keys = []
+            triggered_labels = []
+            combined = all_data + defi_data
+            seen_pairs = set()  # (symbol, exchange) already checked
 
-                for pos in positions:
-                    sym = pos["symbol"]
-                    ex = pos["exchange"]
-                    pair_key = f"{sym}_{ex}"
+            for pos in positions:
+                sym = pos["symbol"]
+                ex = pos["exchange"]
+                pair_key = f"{sym}_{ex}"
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
 
-                    # Skip duplicate symbol/exchange pairs for trigger checking
-                    if pair_key in seen_pairs:
-                        continue
-                    seen_pairs.add(pair_key)
-
+                # Each leg of the position has its own funding schedule.
+                # For cross_exchange we evaluate both legs independently.
+                legs = []
+                if pos.get("mode") == "cross_exchange":
+                    long_ex = pos.get("long_exchange", "")
+                    short_ex = pos.get("short_exchange", pos.get("exchange", ""))
+                    long_d = next(
+                        (d for d in combined
+                         if d["symbol"] == sym and d["exchange"] == long_ex),
+                        None,
+                    )
+                    short_d = next(
+                        (d for d in combined
+                         if d["symbol"] == sym and d["exchange"] == short_ex),
+                        None,
+                    )
+                    if long_d:
+                        legs.append((long_ex, long_d))
+                    if short_d:
+                        legs.append((short_ex, short_d))
+                else:
                     cur = self._find_data(pos, all_data, defi_data)
+                    if cur:
+                        legs.append((ex, cur))
 
-                    mn = -1
-                    nts = 0
-                    if pos.get("mode") == "cross_exchange":
-                        long_ex = pos.get("long_exchange", "")
-                        short_ex = pos.get("short_exchange", pos.get("exchange", ""))
-                        long_d = next((d for d in combined if d["symbol"] == sym and d["exchange"] == long_ex), None)
-                        short_d = next((d for d in combined if d["symbol"] == sym and d["exchange"] == short_ex), None)
-                        candidates = [d for d in (long_d, short_d) if d and d.get("mins_next", -1) >= 0]
-                        if candidates:
-                            nearest = min(candidates, key=lambda d: d["mins_next"])
-                            mn = nearest["mins_next"]
-                            nts = nearest.get("next_funding_ts", 0)
-                    elif cur:
-                        mn = cur.get("mins_next", -1)
-                        nts = cur.get("next_funding_ts", 0)
+                for leg_ex, leg in legs:
+                    mn = leg.get("mins_next", -1)
+                    nts = leg.get("next_funding_ts", 0)
+                    ih = leg.get("ih", 8)
+                    interval_secs = max(1, int(ih) * 3600)
 
-                    if mn < 0:
-                        continue
-
-                    event_key = f"{pair_key}_{nts}"
-
-                    pre_key = f"pre_{event_key}"
-                    if PRE_PAYMENT_SCAN_MINS >= mn > POST_PAYMENT_SCAN_MINS:
+                    # PRE: 1-10 min before next payment (rate verification + alerts)
+                    if PRE_PAYMENT_SCAN_MINS >= mn > 0:
+                        pre_key = f"pre_{sym}_{leg_ex}_{nts}"
                         if pre_key not in self._scanned_events:
-                            triggered_positions.append((
-                                mn, f"Pre-pago {sym}@{ex} en {mn:.0f}min",
-                                [pre_key], []
-                            ))
+                            triggered_keys.append(pre_key)
+                            triggered_labels.append(
+                                f"Pre-pago {sym}@{leg_ex} en {mn:.0f}min"
+                            )
 
-                    post_key = f"post_{event_key}"
-                    if mn <= POST_PAYMENT_SCAN_MINS:
-                        if post_key not in self._scanned_events:
-                            triggered_positions.append((
-                                mn, f"Pago {sym}@{ex}",
-                                [post_key],
-                                [(pair_key, nts)]
-                            ))
+                    # POST: settlement happened ≥ POST_SETTLEMENT_DELAY_SECS ago
+                    # (and within the current interval, so we don't backfill old
+                    # payments). Captures the exact settled rate via history and
+                    # refreshes next_funding_ts in a single pass.
+                    last_pay = self._calc_last_payment_ts(nts, interval_secs, now)
+                    if last_pay > 0:
+                        elapsed = now - last_pay
+                        if POST_SETTLEMENT_DELAY_SECS <= elapsed < interval_secs:
+                            post_key = f"post_{sym}_{leg_ex}_{int(last_pay)}"
+                            if post_key not in self._scanned_events:
+                                triggered_keys.append(post_key)
+                                triggered_labels.append(f"Pago {sym}@{leg_ex}")
 
-                if triggered_positions:
-                    triggered_positions.sort(key=lambda t: t[0])
-                    groups = []
-                    current_group = [triggered_positions[0]]
-                    for tp in triggered_positions[1:]:
-                        if tp[0] - current_group[0][0] <= 5:
-                            current_group.append(tp)
-                        else:
-                            groups.append(current_group)
-                            current_group = [tp]
-                    groups.append(current_group)
-
-                    group = groups[0]
-                    labels = [tp[1] for tp in group]
-                    scan_reason = " + ".join(labels)
-
-                    for tp in group:
-                        for ek in tp[2]:
-                            self._scanned_events.add(ek)
-                        for (sk, nts_val) in tp[3]:
-                            refresh_key = f"{sk}_{nts_val}"
-                            self._pending_refreshes[refresh_key] = now + REFRESH_AFTER_PAYMENT_SECS
-                            log.info(f"Refresh programado en 5min para {sk}")
+            if triggered_keys:
+                scan_reason = " + ".join(triggered_labels)
+                for ek in triggered_keys:
+                    self._scanned_events.add(ek)
 
         # Trigger scan if needed (outside lock)
         if scan_reason:
@@ -1063,12 +1052,21 @@ class ScannerWorker:
         if payments < 1:
             return
 
-        # Short-perp side: receives when cfr > 0, PAYS when cfr < 0.
+        # Resolve the actual settled rate from history to avoid the latency
+        # divergence between the scan time and the settlement time.
+        settled_rate = self._resolve_settlement_rate(
+            pos["exchange"], pos["symbol"], last_payment_ts, fallback=cfr
+        )
+
+        # Short-perp side: receives when settled_rate > 0, PAYS when < 0.
         # Always apply the sign so negative rates are recorded as losses.
         exposure = pos.get("exposure", pos["capital_used"] / 2)
-        earn_per_payment = exposure * cfr
+        earn_per_payment = exposure * settled_rate
 
-        self._record_earnings(pos, earn_per_payment * payments, cfr, now, payments)
+        self._record_earnings(
+            pos, earn_per_payment * payments, settled_rate, now, payments,
+            payment_ts=last_payment_ts,
+        )
 
     def _update_cross_exchange_earnings(self, pos: dict, all_data: list, now: float):
         """Cross-exchange earnings: track each side's payments independently.
@@ -1109,6 +1107,11 @@ class ScannerWorker:
 
         total_earned = 0
         any_payment = False
+        last_settlement_ts = 0
+        short_settled = short_data["fr"]  # fallback if no payment on this side
+        long_settled = long_data["fr"]
+        short_payments = 0
+        long_payments = 0
 
         # --- SHORT side payments ---
         short_fr = short_data["fr"]
@@ -1120,12 +1123,17 @@ class ScannerWorker:
 
         if short_payments >= 1:
             # Short side: we are SHORT, so we RECEIVE when rate > 0
-            short_earn = exposure * short_fr * short_payments
+            if short_last_pay > 0:
+                short_settled = self._resolve_settlement_rate(
+                    short_ex, pos["symbol"], short_last_pay, fallback=short_fr
+                )
+                last_settlement_ts = max(last_settlement_ts, short_last_pay)
+            short_earn = exposure * short_settled * short_payments
             total_earned += short_earn
             pos["_short_last_update"] = now
             any_payment = True
             log.debug(f"  Cross {pos['symbol']} SHORT@{short_ex}: {short_payments} pays, "
-                       f"fr={short_fr*100:.4f}%, earn=${short_earn:.4f}")
+                       f"fr={short_settled*100:.4f}%, earn=${short_earn:.4f}")
 
         # --- LONG side payments ---
         long_fr = long_data["fr"]
@@ -1137,20 +1145,28 @@ class ScannerWorker:
 
         if long_payments >= 1:
             # Long side: we are LONG, so we PAY when rate > 0
-            long_earn = -(exposure * long_fr * long_payments)
+            if long_last_pay > 0:
+                long_settled = self._resolve_settlement_rate(
+                    long_ex, pos["symbol"], long_last_pay, fallback=long_fr
+                )
+                last_settlement_ts = max(last_settlement_ts, long_last_pay)
+            long_earn = -(exposure * long_settled * long_payments)
             total_earned += long_earn
             pos["_long_last_update"] = now
             any_payment = True
             log.debug(f"  Cross {pos['symbol']} LONG@{long_ex}: {long_payments} pays, "
-                       f"fr={long_fr*100:.4f}%, earn=${long_earn:.4f}")
+                       f"fr={long_settled*100:.4f}%, earn=${long_earn:.4f}")
 
         if not any_payment:
             return
 
-        # Record with the current differential as the rate
-        differential = short_fr - long_fr
+        # Record with the settled differential as the rate
+        differential = short_settled - long_settled
         total_payments = max(short_payments, long_payments)
-        self._record_earnings(pos, total_earned, differential, now, total_payments)
+        self._record_earnings(
+            pos, total_earned, differential, now, total_payments,
+            payment_ts=last_settlement_ts or None,
+        )
 
     def _calc_last_payment_ts(self, next_funding_ts: int, interval_secs: int,
                               now: float) -> float:
@@ -1185,6 +1201,46 @@ class ScannerWorker:
 
         return count
 
+    def _resolve_settlement_rate(self, exchange: str, symbol: str,
+                                  settlement_ts: float,
+                                  fallback: float) -> float:
+        """Return the rate the exchange actually applied at settlement_ts.
+
+        Uses the exchange's funding history (CCXT) for CEX, and snapshots
+        from funding_rate_snapshots for DeFi adapters. Falls back to the
+        provided rate (typically the current scan's cfr) if no historic
+        match is found within the tolerance window.
+        """
+        try:
+            if (self.defi_manager
+                    and self.defi_manager.is_defi_exchange(exchange)):
+                rate = self.defi_manager.fetch_settlement_rate(
+                    symbol, exchange, settlement_ts,
+                    tolerance_secs=SETTLEMENT_RATE_TOLERANCE_SECS,
+                )
+            else:
+                rate = self.exchange_manager.fetch_settlement_rate(
+                    symbol, exchange, settlement_ts,
+                    tolerance_secs=SETTLEMENT_RATE_TOLERANCE_SECS,
+                )
+        except Exception as e:
+            log.warning(f"Settlement rate lookup failed {symbol}@{exchange}: {e}")
+            rate = None
+
+        if rate is None:
+            log.warning(
+                f"Settlement rate not found {symbol}@{exchange} "
+                f"ts={int(settlement_ts)}; using fallback={fallback*100:.4f}%"
+            )
+            return fallback
+
+        if abs(rate - fallback) > 1e-9:
+            log.info(
+                f"Settled {symbol}@{exchange} ts={int(settlement_ts)}: "
+                f"cfr={fallback*100:.6f}% historic={rate*100:.6f}%"
+            )
+        return rate
+
     def _update_earnings_elapsed(self, pos: dict, cfr: float, ih: int, now: float):
         """Fallback: elapsed-time earnings when no timestamp available."""
         last_up = pos.get("last_earn_update", pos["entry_time"] / 1000)
@@ -1201,12 +1257,19 @@ class ScannerWorker:
         self._record_earnings(pos, earn_per_iv * full_ivs, cfr, now, full_ivs)
 
     def _record_earnings(self, pos: dict, earned_now: float, rate: float,
-                         now: float, full_ivs: int):
-        """Record earnings for a position (positive and negative)."""
+                         now: float, full_ivs: int,
+                         payment_ts: float = None):
+        """Record earnings for a position (positive and negative).
+
+        payment_ts (optional, seconds): timestamp of the actual settlement
+        to stamp on the payment record. Falls back to `now` when not given
+        (used by the elapsed-time fallback path).
+        """
         if "payments" not in pos:
             pos["payments"] = []
+        record_ts = int(payment_ts) if payment_ts else int(now)
         pos["payments"].append({
-            "ts": int(now),
+            "ts": record_ts,
             "rate": rate,
             "earned": earned_now,
             "cumulative": pos.get("earned_real", 0) + earned_now,

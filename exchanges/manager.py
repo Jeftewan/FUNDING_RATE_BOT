@@ -398,6 +398,32 @@ class ExchangeManager:
             log.warning(f"History fetch failed {symbol}@{display}: {e}")
             return FundingHistory(symbol=symbol, exchange=display)
 
+    def fetch_settlement_rate(self, symbol: str, exchange_name: str,
+                              target_ts: float,
+                              tolerance_secs: int = 120) -> float | None:
+        """Return the historic funding rate closest to target_ts (seconds, UTC).
+
+        Uses CCXT fetch_funding_rate_history via fetch_funding_history.
+        Returns None if no entry within tolerance.
+        """
+        history = self.fetch_funding_history(symbol, exchange_name, limit=10)
+        if not history or not history.timestamps or not history.rates:
+            return None
+
+        target_ms = int(target_ts * 1000)
+        tolerance_ms = tolerance_secs * 1000
+        best_rate = None
+        best_diff = None
+        for r, ts in zip(history.rates, history.timestamps):
+            diff = abs(int(ts) - target_ms)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_rate = r
+
+        if best_diff is None or best_diff > tolerance_ms:
+            return None
+        return float(best_rate)
+
     def _build_history(self, symbol: str, exchange: str,
                        rates: list, timestamps: list) -> FundingHistory:
         """Build FundingHistory with stats from raw rates."""
