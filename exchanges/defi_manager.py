@@ -445,3 +445,46 @@ class DefiExchangeManager:
     def fetch_spot_availability(self, symbol: str, exchange: str) -> bool:
         """DeFi exchanges are perp-only, no spot."""
         return False
+
+    def is_defi_exchange(self, exchange: str) -> bool:
+        """Check if an exchange name belongs to a DeFi adapter."""
+        return exchange in {"Hyperliquid", "GMX", "Aster", "Lighter", "Extended"}
+
+    def fetch_settlement_rate(self, symbol: str, exchange: str,
+                              target_ts: float,
+                              tolerance_secs: int = 120) -> float | None:
+        """Return the snapshot rate whose funding_ts matches target_ts.
+
+        Queries funding_rate_snapshots; returns None if no entry within tolerance.
+        target_ts is in seconds (UTC); funding_ts in DB is milliseconds.
+        """
+        try:
+            from core.db_models import db, FundingRateSnapshot
+        except Exception:
+            return None
+
+        target_ms = int(target_ts * 1000)
+        tolerance_ms = tolerance_secs * 1000
+        try:
+            rows = (
+                db.session.query(
+                    FundingRateSnapshot.rate,
+                    FundingRateSnapshot.funding_ts,
+                )
+                .filter(
+                    FundingRateSnapshot.symbol == symbol,
+                    FundingRateSnapshot.exchange == exchange,
+                    FundingRateSnapshot.funding_ts >= target_ms - tolerance_ms,
+                    FundingRateSnapshot.funding_ts <= target_ms + tolerance_ms,
+                )
+                .all()
+            )
+        except Exception as e:
+            log.debug(f"DeFi settlement rate query failed {symbol}@{exchange}: {e}")
+            return None
+
+        if not rows:
+            return None
+
+        best = min(rows, key=lambda r: abs(int(r.funding_ts) - target_ms))
+        return float(best.rate)
