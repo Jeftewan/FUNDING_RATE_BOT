@@ -1,6 +1,6 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-04-23**, rama activa `claude/optimize-ram-usage-9qlvb`.
+Estado del proyecto al **2026-04-27**, rama activa `claude/fix-payment-timing-bJuRj`.
 
 ---
 
@@ -91,12 +91,24 @@ El scanner **no usa un intervalo configurable**. Funciona por eventos de pago de
 
 1. `ScannerWorker._monitor_loop()` corre cada 30s — zero llamadas API
 2. Compara `next_funding_ts` de posiciones activas contra el tiempo actual
-3. Triggers definidos en `scanner/worker.py:22-25`:
-   - **Pre-pago** (`PRE_PAYMENT_SCAN_MINS = 10`): verifica que la tasa siga favorable
-   - **Post-pago** (`POST_PAYMENT_SCAN_MINS = 1`): refresh de `next_funding_ts`
+3. Triggers definidos en `scanner/worker.py:22-30` (2 triggers, consolidados de 3):
+   - **Pre-pago** (`PRE_PAYMENT_SCAN_MINS = 10`): verifica que la tasa siga favorable, genera alertas
+   - **Post-settlement** (`POST_SETTLEMENT_DELAY_SECS = 180`): se dispara cuando el settlement ocurrió hace ≥3 min. En ese momento el exchange ya expone la tasa exacta en `fetch_funding_rate_history` y `nextFundingTime` ya apunta al siguiente período. Un solo scan captura la tasa real del pago y refresca `next_funding_ts` (reemplaza el antiguo POST de 1 min + REFRESH de 5 min).
    - **Force scan**: botón "Escanear" en UI o `POST /api/force`
+4. Para **cross_exchange**, cada pierna (long y short) se evalúa independientemente para PRE y POST según su propio `next_funding_ts` e intervalo.
 
 Esto significa que en periodos sin posiciones abiertas el bot puede estar inactivo.
+
+### Captura exacta de la tasa al pago
+
+Antes del cambio, `_record_earnings` grababa `cfr` (la tasa "vigente" al scan) y `time.time()` (el momento del scan) con un desfase de 5-15 s respecto al settlement real. Ahora:
+
+- `_resolve_settlement_rate(exchange, symbol, settlement_ts, fallback)` en `scanner/worker.py` obtiene la tasa histórica del exchange para el timestamp exacto del settlement:
+  - **CEX**: `ExchangeManager.fetch_settlement_rate()` → CCXT `fetch_funding_rate_history`, busca la entrada más cercana dentro de `SETTLEMENT_RATE_TOLERANCE_SECS = 120s`.
+  - **DeFi**: `DefiExchangeManager.fetch_settlement_rate()` → query sobre `funding_rate_snapshots` filtrando por `funding_ts` dentro de tolerancia.
+  - Si no hay match, usa `fallback=cfr` con un `log.warning`.
+- `_record_earnings` acepta `payment_ts` (float, segundos) y lo usa como `ts` del payment record en `payments_json`. `last_earn_update` sigue siendo `now` (es la cota para `_count_payments_since`).
+- El log `Settled <sym>@<ex> ts=...: cfr=X% historic=Y%` permite observar la divergencia corregida en producción.
 
 ---
 
@@ -298,6 +310,7 @@ curl -X POST http://localhost:5000/api/force
 
 | Hash | Cambio |
 |------|--------|
+| `85b4f6a` | Fix timing captura tasa al pago: fetch_settlement_rate CEX/DeFi, triggers 3→2 |
 | `f410ecb` | RAM: acotar caches in-memory; fix switch_analyzer cross-exchange (opp_rate, current_score, market_rate) |
 | `f6ae4a7` | Fix min_volume por pierna en DeFi/CEX+DeFi, indicadores cross, current_fr en posiciones |
 | `a344317` | Quitar campo `scan_interval` (muerto) del frontend y API |
