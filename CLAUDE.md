@@ -1,6 +1,6 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-04-27**, rama activa `claude/fix-payment-timing-bJuRj`.
+Estado del proyecto al **2026-04-28**, rama activa `claude/integrate-landing-auth-QfCwW`.
 
 ---
 
@@ -17,9 +17,10 @@ Estado del proyecto al **2026-04-27**, rama activa `claude/fix-payment-timing-bJ
 | IA / LLM | Groq Llama 3.3 70B (3 API keys rotadas para evitar rate limits) |
 | Notificaciones | Telegram Bot API (POST JSON, sin dependencias externas) |
 | Cifrado | Fernet simétrico (`core/encryption.py`) para tokens y API keys |
-| Frontend | Vanilla JS + CSS3, sin frameworks |
+| Frontend (dashboard) | Vanilla JS + CSS3, sin frameworks (`static/app.js`, `static/style.css`) |
+| Frontend (landing) | React + Vite + TypeScript + Tailwind — repo separado [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) (Lovable) |
 
-**No hay React, no hay ORM de migraciones, no hay Celery.** Todo el threading es stdlib.
+**El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing se buildea con Vite y se dropea como HTML estático en Flask.
 
 ---
 
@@ -59,11 +60,13 @@ portfolio/
 notifications/
   email.py              # EmailNotifier (nombre legacy) → Telegram Bot API
 static/
-  app.js                # SPA frontend (~1300 líneas)
+  app.js                # SPA frontend (~1500 líneas)
   style.css             # Responsive mobile-first
+  landing/              # Assets Vite de la landing (dist/assets/) — generados, no editar a mano
 templates/
-  index.html            # Tabs: Oportunidades, Posiciones, Config, Cuenta
-  login.html            # Login / registro
+  index.html            # Tabs: Oportunidades, Posiciones, Config, Cuenta (ruta /app)
+  landing.html          # Landing pública (ruta /) — actualmente placeholder, se reemplaza con dist/index.html del repo basyo
+  login.html            # DEPRECADO — sin uso, pendiente de borrar
 ```
 
 ---
@@ -261,6 +264,41 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 
 ---
 
+## Arquitectura de rutas
+
+| URL | Auth | Template / handler |
+|-----|------|--------------------|
+| `GET /` | Pública | `templates/landing.html` (landing + modal login/registro) |
+| `GET /app` | `@auth_required` | `templates/index.html` (dashboard SPA) |
+| `POST /auth/login` | Pública | JSON `{ok, msg}` — Flask-Login cookie |
+| `POST /auth/register` | Pública | JSON `{ok, msg}` — crea user + login |
+| `POST /auth/logout` | Autenticado | JSON — redirigir a `/` tras logout |
+| `GET /auth/me` | Autenticado | JSON `{ok, user}` — devuelve 401 JSON si no auth |
+| `GET /auth/page` | Pública | `301 → /?login=1` (compat deep-links) |
+| `GET /health` | Pública | JSON (healthcheck Railway) |
+| `GET /api/*` | `@auth_required` | JSON — 401 JSON si no auth |
+
+**Flujo unauthenticated:** `GET /app` → `unauthorized_handler` → `302 /?login=1` → landing abre modal login.  
+**Flujo logout:** `POST /auth/logout` → `window.location = '/'` (en `static/app.js:doLogout`).  
+**Flujo delete-account:** `DELETE /api/account` → éxito → `window.location = '/'`.
+
+### Integración landing (pendiente — repo `Jeftewan/basyo`)
+
+El `templates/landing.html` actual es un placeholder con el diseño anterior. Para activar la landing React real:
+
+1. En `Jeftewan/basyo`: ajustar `vite.config.ts` → `base: "/static/landing/"`.
+2. Añadir `src/components/AuthModal.tsx`: tabs Login/Registro, fetch same-origin a `/auth/login` o `/auth/register`, redirect a `/app` en éxito.
+3. Añadir `src/hooks/useSession.ts`: `GET /auth/me` al montar → expone `loggedIn`.
+4. Cablear CTAs: "Empezar" → modal registro; "Iniciar sesión" → modal login; si `loggedIn` → botón "Ir al dashboard" → `/app`. Si `?login=1` en URL → abrir modal automáticamente.
+5. `npm run build` → copiar:
+   - `dist/index.html` → `FUNDING_RATE_BOT/templates/landing.html` (sobreescribe placeholder)
+   - `dist/assets/*` → `FUNDING_RATE_BOT/static/landing/`
+6. Commit + push → Railway redeploy.
+
+Si el repo `basyo` se clona localmente en `/home/user/basyo`, Claude Code puede hacer los pasos 1–4 directamente.
+
+---
+
 ## Pendiente / Lo que falta
 
 ### Funcionalidad incompleta (infraestructura lista, falta conectar)
@@ -310,6 +348,7 @@ curl -X POST http://localhost:5000/api/force
 
 | Hash | Cambio |
 |------|--------|
+| `ec872cd` | feat(routing): landing pública en `/`, dashboard SPA en `/app`, login modal en landing |
 | `85b4f6a` | Fix timing captura tasa al pago: fetch_settlement_rate CEX/DeFi, triggers 3→2 |
 | `f410ecb` | RAM: acotar caches in-memory; fix switch_analyzer cross-exchange (opp_rate, current_score, market_rate) |
 | `f6ae4a7` | Fix min_volume por pierna en DeFi/CEX+DeFi, indicadores cross, current_fr en posiciones |
