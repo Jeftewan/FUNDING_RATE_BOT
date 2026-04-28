@@ -87,7 +87,7 @@ if Config.USE_DB and Config.DATABASE_URL:
 
             login_manager = LoginManager()
             login_manager.init_app(app)
-            login_manager.login_view = "auth.login_page"
+            login_manager.login_view = "landing"
 
             @login_manager.user_loader
             def load_user(user_id):
@@ -96,16 +96,20 @@ if Config.USE_DB and Config.DATABASE_URL:
             @login_manager.unauthorized_handler
             def unauthorized():
                 from flask import request as req, jsonify as jfy, redirect as rdr
-                if req.path.startswith("/api/"):
+                # JSON for AJAX / API / auth fetches; redirect HTML page loads to landing with login modal open
+                if req.path.startswith("/api/") or req.path.startswith("/auth/"):
                     return jfy({"ok": False, "msg": "No autenticado"}), 401
-                return rdr("/auth/page")
+                accept = req.headers.get("Accept", "")
+                if "application/json" in accept and "text/html" not in accept:
+                    return jfy({"ok": False, "msg": "No autenticado"}), 401
+                return rdr("/?login=1")
 
             from auth.routes import init_auth, auth_bp
 
             @auth_bp.route("/page")
             def login_page():
-                from flask import render_template
-                return render_template("login.html", error=None)
+                from flask import redirect as rdr
+                return rdr("/?login=1", code=301)
 
             init_auth(app, Config)
             log.info("SaaS mode enabled: PostgreSQL + email/password auth")
