@@ -18,9 +18,9 @@ Estado del proyecto al **2026-04-28**, rama activa `claude/integrate-landing-aut
 | Notificaciones | Telegram Bot API (POST JSON, sin dependencias externas) |
 | Cifrado | Fernet simétrico (`core/encryption.py`) para tokens y API keys |
 | Frontend (dashboard) | Vanilla JS + CSS3, sin frameworks (`static/app.js`, `static/style.css`) |
-| Frontend (landing) | React + Vite + TypeScript + Tailwind — repo separado [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) (Lovable) |
+| Frontend (landing) | React + Vite — compilado en `static/landing/assets/`. Source original en [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) (Lovable, **deprecado**). Editar via recompilación en este repo. |
 
-**El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing se buildea con Vite y se dropea como HTML estático en Flask.
+**El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing es un bundle Vite estático servido por Flask — el contenido visible vive en `static/landing/assets/index-*.js`, no en `templates/landing.html`.
 
 ---
 
@@ -282,20 +282,24 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 **Flujo logout:** `POST /auth/logout` → `window.location = '/'` (en `static/app.js:doLogout`).  
 **Flujo delete-account:** `DELETE /api/account` → éxito → `window.location = '/'`.
 
-### Integración landing (pendiente — repo `Jeftewan/basyo`)
+### Cómo editar la landing
 
-El `templates/landing.html` actual es un placeholder con el diseño anterior. Para activar la landing React real:
+El `templates/landing.html` es un shell de 28 líneas — solo meta tags y el `<div id="root">`. El contenido visible está en el bundle JS (`static/landing/assets/index-*.js`).
 
-1. En `Jeftewan/basyo`: ajustar `vite.config.ts` → `base: "/static/landing/"`.
-2. Añadir `src/components/AuthModal.tsx`: tabs Login/Registro, fetch same-origin a `/auth/login` o `/auth/register`, redirect a `/app` en éxito.
-3. Añadir `src/hooks/useSession.ts`: `GET /auth/me` al montar → expone `loggedIn`.
-4. Cablear CTAs: "Empezar" → modal registro; "Iniciar sesión" → modal login; si `loggedIn` → botón "Ir al dashboard" → `/app`. Si `?login=1` en URL → abrir modal automáticamente.
-5. `npm run build` → copiar:
-   - `dist/index.html` → `FUNDING_RATE_BOT/templates/landing.html` (sobreescribe placeholder)
-   - `dist/assets/*` → `FUNDING_RATE_BOT/static/landing/`
-6. Commit + push → Railway redeploy.
+**Cambios editables directamente:**
+- Meta tags SEO (título, description, og:image) → `templates/landing.html`
+- Favicon → reemplazar `static/landing/favicon.png`
 
-Si el repo `basyo` se clona localmente en `/home/user/basyo`, Claude Code puede hacer los pasos 1–4 directamente.
+**Cambios de contenido (textos, secciones, colores, CTAs)** requieren recompilar el source React:
+1. El source está en `/home/user/basyo` (clonado en el sandbox, rama `claude/integrate-landing-auth`).
+2. Editar los `.tsx` correspondientes.
+3. `cd /home/user/basyo && npm run build`
+4. Copiar output:
+   - `dist/index.html` → `templates/landing.html`
+   - `dist/assets/*` → `static/landing/assets/`
+5. Commit + push en `funding_rate_bot` → Railway redeploy.
+
+El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **deprecado** — ya no se usa para deploy. El source de referencia vive en el sandbox.
 
 ---
 
