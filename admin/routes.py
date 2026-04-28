@@ -62,7 +62,7 @@ def admin_users():
 def admin_user_detail(user_id):
     from core.db_models import User
     from billing.plans import user_has_active_plan, trial_days_remaining
-    from billing.lemonsqueezy_client import get_customer_invoices
+    from billing.polar_client import get_customer_invoices
 
     u = User.query.get_or_404(user_id)
 
