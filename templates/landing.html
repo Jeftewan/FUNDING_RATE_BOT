@@ -1,255 +1,28 @@
-<!DOCTYPE html>
-<html lang="es"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BASYO — Ingresos Pasivos con Funding Rate</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:'Inter',-apple-system,sans-serif;background:#0a0b0d;color:#c8ccd0;min-height:100vh;
-       display:flex;align-items:center;justify-content:center;padding:20px}
-  .page{max-width:920px;width:100%;display:flex;gap:48px;align-items:center}
+<!doctype html>
+<html lang="es" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BASYO — Gana con cada pago de funding sin riesgo de precio</title>
+    <meta name="description" content="BASYO escanea múltiples exchanges en tiempo real, detecta las mejores oportunidades de funding rates y te guía paso a paso.">
+    
+    
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    
+    
+    <meta property="og:title" content="BASYO — Gana con cada pago de funding sin riesgo de precio">
+  <meta name="twitter:title" content="BASYO — Gana con cada pago de funding sin riesgo de precio">
+  <meta property="og:description" content="BASYO escanea múltiples exchanges en tiempo real, detecta las mejores oportunidades de funding rates y te guía paso a paso.">
+  <meta name="twitter:description" content="BASYO escanea múltiples exchanges en tiempo real, detecta las mejores oportunidades de funding rates y te guía paso a paso.">
+  <link rel="icon" type="image/png" href="/static/landing/favicon.png">
+  <meta property="og:image" content="https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/7489d05e-c252-44d1-b8e1-3f927f6a154d/id-preview-0f864075--4f21c8e5-51d8-4913-9782-777e5f45ea91.lovable.app-1774894103912.png">
+  <meta name="twitter:image" content="https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/7489d05e-c252-44d1-b8e1-3f927f6a154d/id-preview-0f864075--4f21c8e5-51d8-4913-9782-777e5f45ea91.lovable.app-1774894103912.png">
+  <script type="module" crossorigin src="/static/landing/assets/index-3xj-OwkE.js"></script>
+  <link rel="stylesheet" crossorigin href="/static/landing/assets/index-DxtJEiCJ.css">
+</head>
 
-  /* Left: branding */
-  .brand{flex:1;min-width:0}
-  .logo{display:flex;align-items:center;gap:12px;margin-bottom:24px}
-  .logo svg{width:44px;height:44px;flex-shrink:0}
-  .logo-text{font-size:28px;font-weight:800;letter-spacing:-0.5px;
-             background:linear-gradient(135deg,#22c55e 0%,#06b6d4 100%);
-             -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-  .tagline{font-size:15px;color:#22c55e;margin-bottom:18px;font-weight:600}
-  .desc{font-size:14px;color:#888;line-height:1.8;margin-bottom:28px}
-  .features{list-style:none;display:flex;flex-direction:column;gap:14px}
-  .features li{display:flex;align-items:flex-start;gap:12px;font-size:13px;color:#aaa;line-height:1.6}
-  .features li svg{width:20px;height:20px;flex-shrink:0;margin-top:2px}
-  .features li .check-circle{fill:none;stroke:#22c55e;stroke-width:2}
-  .features li strong{color:#fff;font-weight:600}
-  .stats-row{display:flex;gap:12px;margin-top:32px}
-  .stat-card{background:#111318;border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:14px 16px;flex:1;text-align:center}
-  .stat-card .num{font-size:20px;font-weight:800;
-                  background:linear-gradient(135deg,#22c55e,#06b6d4);
-                  -webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-  .stat-card .lbl{font-size:10px;color:#555;margin-top:4px;text-transform:uppercase;letter-spacing:0.5px;font-weight:500}
-
-  /* Right: auth form */
-  .auth-box{width:380px;flex-shrink:0;background:#111318;border:1px solid rgba(255,255,255,0.06);
-            border-radius:16px;padding:36px;box-shadow:0 4px 32px rgba(0,0,0,0.3)}
-  .auth-box h2{font-size:20px;color:#fff;font-weight:700;margin-bottom:6px;text-align:center}
-  .auth-box .sub{font-size:13px;color:#555;margin-bottom:24px;text-align:center}
-  .tabs-auth{display:flex;gap:0;margin-bottom:24px;border-radius:10px;overflow:hidden;border:1px solid rgba(255,255,255,0.06)}
-  .tab-auth{flex:1;padding:10px;text-align:center;font-size:13px;cursor:pointer;background:#0a0b0d;color:#666;
-            border:none;font-family:inherit;font-weight:600;transition:all .2s}
-  .tab-auth.active{background:rgba(34,197,94,0.08);color:#22c55e}
-  .field{margin-bottom:16px}
-  .field label{display:block;font-size:11px;color:#555;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600}
-  .field input{width:100%;padding:12px 14px;background:#0a0b0d;border:1px solid rgba(255,255,255,0.06);border-radius:10px;
-               color:#fff;font-family:inherit;font-size:14px;outline:none;transition:border-color .2s,box-shadow .2s}
-  .field input:focus{border-color:rgba(34,197,94,0.4);box-shadow:0 0 0 3px rgba(34,197,94,0.08)}
-  .field input::placeholder{color:#444}
-  .btn-go{width:100%;padding:14px;font-size:14px;font-weight:700;border:none;border-radius:12px;cursor:pointer;
-          font-family:inherit;background:#22c55e;color:#000;transition:all .2s;
-          box-shadow:0 0 24px rgba(34,197,94,0.2)}
-  .btn-go:hover{background:#16a34a;box-shadow:0 0 32px rgba(34,197,94,0.3);transform:translateY(-1px)}
-  .btn-go:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
-  .msg{font-size:12px;margin-top:16px;padding:12px;border-radius:10px;text-align:center;display:none}
-  .msg.success{background:rgba(34,197,94,0.08);color:#22c55e;border:1px solid rgba(34,197,94,0.2);display:block}
-  .msg.error{background:rgba(239,68,68,0.08);color:#ef4444;border:1px solid rgba(239,68,68,0.2);display:block}
-  .auth-footer{font-size:10px;color:#444;text-align:center;margin-top:20px;line-height:1.6}
-  .go-app{display:none;text-align:center;margin-bottom:14px}
-  .go-app a{color:#22c55e;font-size:13px;font-weight:600;text-decoration:none;border-bottom:1px solid rgba(34,197,94,0.3);padding-bottom:2px}
-
-  /* Responsive */
-  @media(max-width:768px){
-    .page{flex-direction:column;gap:28px}
-    .brand{text-align:center}
-    .features{align-items:flex-start;max-width:400px;margin:0 auto}
-    .auth-box{width:100%;max-width:420px}
-    .stats-row{gap:8px}
-    .stat-card .num{font-size:16px}
-    .stat-card{padding:10px 8px}
-    .logo{justify-content:center}
-  }
-</style>
-</head><body>
-<div class="page">
-
-  <!-- Left: branding -->
-  <div class="brand">
-    <div class="logo">
-      <svg viewBox="0 0 44 44" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <rect width="44" height="44" rx="10" fill="#22c55e" fill-opacity="0.12"/>
-        <path d="M12 28L17 20L22 24L27 15L32 18" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-        <circle cx="32" cy="18" r="2.5" fill="#22c55e"/>
-        <path d="M12 32H32" stroke="#22c55e33" stroke-width="1.5"/>
-        <path d="M14 11V13" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
-        <path d="M19 9V13" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
-        <path d="M24 11V13" stroke="#22c55e" stroke-width="1.5" stroke-linecap="round"/>
-      </svg>
-      <div class="logo-text">BASYO</div>
-    </div>
-
-    <div class="tagline">Genera ingresos pasivos con funding rates de criptomonedas</div>
-
-    <div class="desc">
-      BASYO escanea automaticamente las tasas de financiacion en los principales exchanges,
-      detecta oportunidades de arbitraje y te alerta cuando encontrar rentabilidades optimas.
-      Sin operar manualmente — deja que los datos trabajen por ti.
-    </div>
-
-    <ul class="features">
-      <li>
-        <svg viewBox="0 0 24 24" class="check-circle"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
-        <span><strong>9 exchanges en tiempo real</strong> — Binance, Bybit, OKX, Bitget + Hyperliquid, GMX y mas DeFi</span>
-      </li>
-      <li>
-        <svg viewBox="0 0 24 24" class="check-circle"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
-        <span><strong>Scoring inteligente v10</strong> — Momentum, z-score, regimen de volatilidad y deteccion de spikes</span>
-      </li>
-      <li>
-        <svg viewBox="0 0 24 24" class="check-circle"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
-        <span><strong>Arbitraje spot-perp y cross-exchange</strong> — Detecta diferenciales rentables entre exchanges</span>
-      </li>
-      <li>
-        <svg viewBox="0 0 24 24" class="check-circle"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
-        <span><strong>Portfolio tracker</strong> — Monitorea tus posiciones, ganancias y pagos en tiempo real</span>
-      </li>
-    </ul>
-
-    <div class="stats-row">
-      <div class="stat-card">
-        <div class="num">9</div>
-        <div class="lbl">Exchanges</div>
-      </div>
-      <div class="stat-card">
-        <div class="num">500+</div>
-        <div class="lbl">Pares</div>
-      </div>
-      <div class="stat-card">
-        <div class="num">24/7</div>
-        <div class="lbl">Monitoreo</div>
-      </div>
-      <div class="stat-card">
-        <div class="num">v10</div>
-        <div class="lbl">Scoring IA</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Right: auth form -->
-  <div class="auth-box">
-    <div class="go-app" id="go-app"><a href="/app">Ya tienes sesion abierta — ir al dashboard &rarr;</a></div>
-    <h2>Comienza gratis</h2>
-    <div class="sub">Crea tu cuenta o inicia sesion</div>
-
-    <div class="tabs-auth">
-      <button class="tab-auth active" onclick="switchTab('login')">Iniciar sesion</button>
-      <button class="tab-auth" onclick="switchTab('register')">Crear cuenta</button>
-    </div>
-
-    <form id="auth-form" onsubmit="doAuth(event)">
-      <div class="field">
-        <label>Email</label>
-        <input type="email" id="auth-email" placeholder="tu@email.com" required autofocus>
-      </div>
-      <div class="field">
-        <label>Contrasena</label>
-        <input type="password" id="auth-pass" placeholder="Min. 6 caracteres" required minlength="6">
-      </div>
-      <div class="field" id="confirm-field" style="display:none">
-        <label>Confirmar contrasena</label>
-        <input type="password" id="auth-pass2" placeholder="Repite la contrasena">
-      </div>
-      <button type="submit" class="btn-go" id="auth-btn">Iniciar sesion</button>
-    </form>
-
-    <div id="auth-msg" class="msg"></div>
-
-    <div class="auth-footer">
-      Tus datos estan seguros. Las API keys se encriptan con Fernet.<br>
-      No compartimos tu informacion con terceros.
-    </div>
-  </div>
-
-</div>
-
-<script>
-let authMode = 'login';
-
-function switchTab(mode) {
-  authMode = mode;
-  document.querySelectorAll('.tab-auth').forEach((t, i) => {
-    t.classList.toggle('active', (mode === 'login' && i === 0) || (mode === 'register' && i === 1));
-  });
-  document.getElementById('confirm-field').style.display = mode === 'register' ? '' : 'none';
-  document.getElementById('auth-btn').textContent = mode === 'login' ? 'Iniciar sesion' : 'Crear cuenta';
-  document.getElementById('auth-msg').style.display = 'none';
-}
-
-async function doAuth(e) {
-  e.preventDefault();
-  const email = document.getElementById('auth-email').value.trim();
-  const pass = document.getElementById('auth-pass').value;
-  const btn = document.getElementById('auth-btn');
-  const msg = document.getElementById('auth-msg');
-
-  if (authMode === 'register') {
-    const pass2 = document.getElementById('auth-pass2').value;
-    if (pass !== pass2) {
-      msg.textContent = 'Las contrasenas no coinciden';
-      msg.className = 'msg error';
-      return;
-    }
-  }
-
-  btn.disabled = true;
-  btn.textContent = authMode === 'login' ? 'Ingresando...' : 'Creando cuenta...';
-  msg.style.display = 'none';
-
-  try {
-    const endpoint = authMode === 'login' ? '/auth/login' : '/auth/register';
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password: pass }),
-      credentials: 'same-origin',
-    });
-    const data = await res.json();
-
-    if (data.ok) {
-      msg.textContent = authMode === 'login' ? 'Redirigiendo...' : 'Cuenta creada. Redirigiendo...';
-      msg.className = 'msg success';
-      setTimeout(() => window.location.href = '/app', 500);
-    } else {
-      msg.textContent = data.msg;
-      msg.className = 'msg error';
-      btn.disabled = false;
-      btn.textContent = authMode === 'login' ? 'Iniciar sesion' : 'Crear cuenta';
-    }
-  } catch (err) {
-    msg.textContent = 'Error de conexion';
-    msg.className = 'msg error';
-    btn.disabled = false;
-    btn.textContent = authMode === 'login' ? 'Iniciar sesion' : 'Crear cuenta';
-  }
-}
-
-// Honor ?signup=1 / ?login=1 query params for default tab
-(function () {
-  const params = new URLSearchParams(window.location.search);
-  if (params.has('signup')) switchTab('register');
-  else if (params.has('login')) switchTab('login');
-})();
-
-// If session is already active, surface a "go to dashboard" link.
-fetch('/auth/me', { credentials: 'same-origin' })
-  .then((r) => (r.ok ? r.json() : null))
-  .then((data) => {
-    if (data && data.ok) {
-      const el = document.getElementById('go-app');
-      if (el) el.style.display = 'block';
-    }
-  })
-  .catch(() => {});
-</script>
-</body></html>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
