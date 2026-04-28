@@ -1,6 +1,6 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-04-23**, rama activa `claude/optimize-ram-usage-9qlvb`.
+Estado del proyecto al **2026-04-28**, rama activa `claude/plan-billing-system-6vZZv`.
 
 ---
 
@@ -18,6 +18,7 @@ Estado del proyecto al **2026-04-23**, rama activa `claude/optimize-ram-usage-9q
 | Notificaciones | Telegram Bot API (POST JSON, sin dependencias externas) |
 | Cifrado | Fernet simétrico (`core/encryption.py`) para tokens y API keys |
 | Frontend | Vanilla JS + CSS3, sin frameworks |
+| Facturación | Lemon Squeezy (Merchant of Record) — suscripciones recurrentes + webhooks |
 
 **No hay React, no hay ORM de migraciones, no hay Celery.** Todo el threading es stdlib.
 
@@ -53,6 +54,12 @@ api/
   routes.py             # Todas las rutas Flask (/api/*)
 auth/
   routes.py             # Register, login, logout
+billing/
+  plans.py              # PLAN_LIMITS, user_has_active_plan(), trial_days_remaining()
+  lemonsqueezy_client.py # Checkout session, customer portal, invoices, webhook verify
+  routes.py             # Blueprint: /api/billing/checkout|portal|status|invoices|webhook
+admin/
+  routes.py             # Blueprint protegido: /admin y /admin/api/users|billing/summary
 portfolio/
   manager.py            # Capital summary, abrir/cerrar posiciones, PnL
   actions.py            # Detalles de acción para UI
@@ -64,6 +71,7 @@ static/
 templates/
   index.html            # Tabs: Oportunidades, Posiciones, Config, Cuenta
   login.html            # Login / registro
+  admin.html            # Panel admin: tabla de usuarios + resumen MRR
 ```
 
 ---
@@ -72,7 +80,7 @@ templates/
 
 | Tabla | Propósito |
 |-------|-----------|
-| `users` | Cuentas de usuario (email, password_hash) |
+| `users` | Cuentas de usuario (email, password_hash, plan, trial, billing fields) |
 | `user_configs` | Config por usuario (capital, thresholds, Telegram encrypted) |
 | `user_positions` | Posiciones abiertas con earnings y historial de pagos |
 | `user_history` | Posiciones cerradas para PnL histórico |
@@ -82,6 +90,20 @@ templates/
 | `score_snapshots` | Evolución del score por oportunidad (ventana rolling 30 entradas) |
 
 Las migraciones se aplican automáticamente al arrancar vía `_run_migrations()`. Para agregar columnas a tablas existentes, añadir `ALTER TABLE ADD COLUMN IF NOT EXISTS` al array `migrations` en `core/database.py`.
+
+### Campos de billing en `users`
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `plan` | VARCHAR(20) | `none` / `basic` / `standard` / `pro` |
+| `plan_billing_period` | VARCHAR(10) | `monthly` / `annual` |
+| `plan_expires_at` | TIMESTAMP | Fecha de vencimiento del plan activo |
+| `trial_ends_at` | TIMESTAMP | Vence 7 días después del registro |
+| `provider_customer_id` | VARCHAR(100) | Customer ID en Lemon Squeezy |
+| `provider_subscription_id` | VARCHAR(100) | Subscription ID en Lemon Squeezy |
+| `customer_portal_url` | VARCHAR(500) | URL del portal de gestión del cliente |
+| `plan_override` | BOOLEAN | Licencia perpetua concedida por admin (ignora Lemon Squeezy) |
+| `plan_override_note` | VARCHAR(255) | Nota del admin (ej. "Socio fundador") |
 
 ---
 
@@ -207,6 +229,17 @@ GROQ_API_KEY_1        # Llama 3.3 70B (gratuito en groq.com)
 GROQ_API_KEY_2        # (opcional, rotación)
 GROQ_API_KEY_3        # (opcional, rotación)
 
+# Lemon Squeezy (Facturación — requerido para SaaS)
+LEMONSQUEEZY_API_KEY              # Token API (Settings → API Tokens en LS)
+LEMONSQUEEZY_WEBHOOK_SECRET       # Secret del webhook (Settings → Webhooks en LS)
+LEMONSQUEEZY_STORE_ID             # ID de tu tienda (Settings → Store Details en LS)
+LEMONSQUEEZY_VARIANT_BASIC_MONTHLY      # Variant ID del plan Basic mensual
+LEMONSQUEEZY_VARIANT_BASIC_ANNUAL       # Variant ID del plan Basic anual
+LEMONSQUEEZY_VARIANT_STANDARD_MONTHLY   # Variant ID del plan Standard mensual
+LEMONSQUEEZY_VARIANT_STANDARD_ANNUAL    # Variant ID del plan Standard anual
+LEMONSQUEEZY_VARIANT_PRO_MONTHLY        # Variant ID del plan Pro mensual
+LEMONSQUEEZY_VARIANT_PRO_ANNUAL         # Variant ID del plan Pro anual
+
 # CEX API keys (opcional — sin ellas funciona con datos públicos)
 BINANCE_API_KEY / BINANCE_API_SECRET
 BYBIT_API_KEY / BYBIT_API_SECRET
@@ -249,13 +282,72 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 
 ---
 
+## Sistema de Planes y Facturación
+
+### Planes
+
+| Plan | Precio/mes | Precio/año | Max posiciones | Alertas Telegram | Auto-trading |
+|------|-----------|-----------|:--------------:|:----------------:|:------------:|
+| `basic` | $10 | $100 | 1 | ❌ | ❌ |
+| `standard` | $20 | $200 | 5 | ✅ | ❌ |
+| `pro` | $40 | $400 | Ilimitadas | ✅ | ✅ (futuro) |
+
+Usuarios nuevos: **7 días de trial en Basic** (`trial_ends_at = now + 7d` al registrarse).
+
+### Pasarela: Lemon Squeezy
+
+Lemon Squeezy actúa como **Merchant of Record** — no requiere empresa ni número fiscal. Soporta pagos internacionales desde Colombia. Payouts vía SWIFT a Littio (USD).
+
+Flujo de pago:
+1. `POST /api/billing/checkout {plan, period}` → `billing/lemonsqueezy_client.py:create_checkout_session()` → URL Checkout hosted
+2. Pago exitoso → webhook `order_created` → DB actualiza `plan`, `plan_expires_at`, `provider_customer_id`
+3. Renovación → webhook `subscription_payment_success` → actualiza `plan_expires_at`
+4. Cancelación → webhook `subscription_cancelled` → `plan='none'` (si no hay override)
+5. Portal gestión → `GET /api/billing/portal` → URL Customer Portal Lemon Squeezy
+
+### Lógica de acceso (`billing/plans.py:user_has_active_plan`)
+
+```
+plan_override=True  → acceso garantizado (ignora todo lo demás)
+plan != 'none' AND plan_expires_at > now → acceso activo
+trial_ends_at > now → acceso en trial
+cualquier otro caso → bloqueo 403
+```
+
+El bloqueo retorna `{"error": "plan_required", "message": "Tu suscripción venció..."}` y el frontend muestra el modal de planes.
+
+### Panel Admin (`/admin`)
+
+Acceso exclusivo a usuarios con `is_admin=True` en DB. Para crear admin:
+```sql
+UPDATE users SET is_admin=true WHERE email='tu@email.com';
+```
+
+Rutas disponibles:
+- `GET /admin` — Dashboard HTML
+- `GET /admin/api/users` — Lista usuarios con estado de billing
+- `GET /admin/api/users/<id>` — Detalle + últimas 10 facturas
+- `PATCH /admin/api/users/<id>/plan` — Override manual de plan/expiración
+- `GET /admin/api/billing/summary` — MRR estimado + conteos por plan
+
+### `billing/lemonsqueezy_client.py` — funciones principales
+
+- `create_checkout_session(user, variant_id, plan, period)` → URL checkout
+- `create_customer_portal_session(provider_customer_id)` → URL portal
+- `get_customer_invoices(provider_customer_id, limit)` → lista de facturas
+- `verify_webhook_signature(payload, sig_header, secret)` → bool HMAC-SHA256
+- `handle_webhook_event(payload, sig_header)` → procesa evento y actualiza DB
+
+---
+
 ## Pendiente / Lo que falta
 
 ### Funcionalidad incompleta (infraestructura lista, falta conectar)
 
-- **Auto-trading**: `user_exchange_keys` almacena API keys cifradas por usuario, la UI tiene skeleton, pero la ejecución automática de órdenes no está implementada. Todo el flujo de abrir/cerrar es manual.
+- **Auto-trading**: `user_exchange_keys` almacena API keys cifradas por usuario, la UI tiene skeleton, el gate de plan Pro está implementado, pero la ejecución automática de órdenes no está implementada. Todo el flujo de abrir/cerrar es manual.
 - **Gráfica de earnings**: DOM preparado en templates, Chart.js disponible, la vinculación de datos al canvas no está terminada.
 - **Coinglass**: cliente existe en `coinglass/client.py`, no integrado en el flujo principal.
+- **Alertas Telegram gate**: el campo `plans.alerts` ya existe en `PLAN_LIMITS` y `user_has_active_plan` funciona, pero el bloqueo de envío en `notifications/email.py` para usuarios Basic aún no está conectado al chequeo del plan.
 
 ### Mejoras identificadas
 
@@ -298,6 +390,8 @@ curl -X POST http://localhost:5000/api/force
 
 | Hash | Cambio |
 |------|--------|
+| `0d88d67` | Migrar billing de Stripe a Lemon Squeezy (MoR, Colombia-friendly) |
+| `9007b20` | feat(billing): planes de suscripción + panel admin + gate de posiciones |
 | `f410ecb` | RAM: acotar caches in-memory; fix switch_analyzer cross-exchange (opp_rate, current_score, market_rate) |
 | `f6ae4a7` | Fix min_volume por pierna en DeFi/CEX+DeFi, indicadores cross, current_fr en posiciones |
 | `a344317` | Quitar campo `scan_interval` (muerto) del frontend y API |
@@ -305,8 +399,6 @@ curl -X POST http://localhost:5000/api/force
 | `7d853dd` | Scoring v10.5: normalizar a 100, mode-aware, historial DeFi desde snapshots |
 | `0f5229a` | Fix hora del último scan (epoch → HH:MM:SS local) + auditoría prompt IA |
 | `b6a69cc` | Scoring v10.4 + rebalanceo prompt IA (evitar sesgo hacia EVITAR) |
-| `d760348` | Estimación de fees realista + edición de fees reales por posición |
-| `7ecf2dd` | Fix observabilidad rate snapshots + guards timestamps stale |
 
 ---
 
