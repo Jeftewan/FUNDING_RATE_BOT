@@ -1,6 +1,6 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-04-27**, rama activa `claude/fix-payment-timing-bJuRj`.
+Estado del proyecto al **2026-04-28**, rama activa `claude/integrate-landing-auth-QfCwW`.
 
 ---
 
@@ -17,9 +17,10 @@ Estado del proyecto al **2026-04-27**, rama activa `claude/fix-payment-timing-bJ
 | IA / LLM | Groq Llama 3.3 70B (3 API keys rotadas para evitar rate limits) |
 | Notificaciones | Telegram Bot API (POST JSON, sin dependencias externas) |
 | Cifrado | Fernet simétrico (`core/encryption.py`) para tokens y API keys |
-| Frontend | Vanilla JS + CSS3, sin frameworks |
+| Frontend (dashboard) | Vanilla JS + CSS3, sin frameworks (`static/app.js`, `static/style.css`) |
+| Frontend (landing) | React + Vite — compilado en `static/landing/assets/`. Source original en [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) (Lovable, **deprecado**). Editar via recompilación en este repo. |
 
-**No hay React, no hay ORM de migraciones, no hay Celery.** Todo el threading es stdlib.
+**El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing es un bundle Vite estático servido por Flask — el contenido visible vive en `static/landing/assets/index-*.js`, no en `templates/landing.html`.
 
 ---
 
@@ -59,11 +60,13 @@ portfolio/
 notifications/
   email.py              # EmailNotifier (nombre legacy) → Telegram Bot API
 static/
-  app.js                # SPA frontend (~1300 líneas)
+  app.js                # SPA frontend (~1500 líneas)
   style.css             # Responsive mobile-first
+  landing/              # Assets Vite de la landing (dist/assets/) — generados, no editar a mano
 templates/
-  index.html            # Tabs: Oportunidades, Posiciones, Config, Cuenta
-  login.html            # Login / registro
+  index.html            # Tabs: Oportunidades, Posiciones, Config, Cuenta (ruta /app)
+  landing.html          # Landing pública (ruta /) — actualmente placeholder, se reemplaza con dist/index.html del repo basyo
+  login.html            # DEPRECADO — sin uso, pendiente de borrar
 ```
 
 ---
@@ -261,6 +264,45 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 
 ---
 
+## Arquitectura de rutas
+
+| URL | Auth | Template / handler |
+|-----|------|--------------------|
+| `GET /` | Pública | `templates/landing.html` (landing + modal login/registro) |
+| `GET /app` | `@auth_required` | `templates/index.html` (dashboard SPA) |
+| `POST /auth/login` | Pública | JSON `{ok, msg}` — Flask-Login cookie |
+| `POST /auth/register` | Pública | JSON `{ok, msg}` — crea user + login |
+| `POST /auth/logout` | Autenticado | JSON — redirigir a `/` tras logout |
+| `GET /auth/me` | Autenticado | JSON `{ok, user}` — devuelve 401 JSON si no auth |
+| `GET /auth/page` | Pública | `301 → /?login=1` (compat deep-links) |
+| `GET /health` | Pública | JSON (healthcheck Railway) |
+| `GET /api/*` | `@auth_required` | JSON — 401 JSON si no auth |
+
+**Flujo unauthenticated:** `GET /app` → `unauthorized_handler` → `302 /?login=1` → landing abre modal login.  
+**Flujo logout:** `POST /auth/logout` → `window.location = '/'` (en `static/app.js:doLogout`).  
+**Flujo delete-account:** `DELETE /api/account` → éxito → `window.location = '/'`.
+
+### Cómo editar la landing
+
+El `templates/landing.html` es un shell de 28 líneas — solo meta tags y el `<div id="root">`. El contenido visible está en el bundle JS (`static/landing/assets/index-*.js`).
+
+**Cambios editables directamente:**
+- Meta tags SEO (título, description, og:image) → `templates/landing.html`
+- Favicon → reemplazar `static/landing/favicon.png`
+
+**Cambios de contenido (textos, secciones, colores, CTAs)** requieren recompilar el source React:
+1. El source está en `/home/user/basyo` (clonado en el sandbox, rama `claude/integrate-landing-auth`).
+2. Editar los `.tsx` correspondientes.
+3. `cd /home/user/basyo && npm run build`
+4. Copiar output:
+   - `dist/index.html` → `templates/landing.html`
+   - `dist/assets/*` → `static/landing/assets/`
+5. Commit + push en `funding_rate_bot` → Railway redeploy.
+
+El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **deprecado** — ya no se usa para deploy. El source de referencia vive en el sandbox.
+
+---
+
 ## Pendiente / Lo que falta
 
 ### Funcionalidad incompleta (infraestructura lista, falta conectar)
@@ -310,6 +352,7 @@ curl -X POST http://localhost:5000/api/force
 
 | Hash | Cambio |
 |------|--------|
+| `ec872cd` | feat(routing): landing pública en `/`, dashboard SPA en `/app`, login modal en landing |
 | `85b4f6a` | Fix timing captura tasa al pago: fetch_settlement_rate CEX/DeFi, triggers 3→2 |
 | `f410ecb` | RAM: acotar caches in-memory; fix switch_analyzer cross-exchange (opp_rate, current_score, market_rate) |
 | `f6ae4a7` | Fix min_volume por pierna en DeFi/CEX+DeFi, indicadores cross, current_fr en posiciones |

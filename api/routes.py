@@ -953,10 +953,15 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             logout_user()
             return jsonify({"ok": True, "msg": "Cuenta eliminada"})
 
-    # ── Index ──────────────────────────────────────────────────
+    # ── Public landing ─────────────────────────────────────────
     @app.route("/")
+    def landing():
+        return render_template("landing.html")
+
+    # ── Authenticated dashboard ────────────────────────────────
+    @app.route("/app")
     @auth_required
-    def index():
+    def app_dashboard():
         user_email = ""
         if db_enabled:
             from flask_login import current_user
