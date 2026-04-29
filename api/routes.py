@@ -967,3 +967,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             from flask_login import current_user
             user_email = current_user.email if current_user.is_authenticated else ""
         return render_template("index.html", db_enabled=db_enabled, user_email=user_email)
+
+    # ── SPA catch-all: serve landing.html for client-side routes ──
+    # React-router handles /terms, /privacy and any future public route.
+    # /api/, /auth/, /app, /static/, /health and / take priority by specificity.
+    @app.route("/<path:_spa_path>")
+    def landing_catchall(_spa_path):
+        return render_template("landing.html")

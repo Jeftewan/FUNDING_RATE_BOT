@@ -14,6 +14,7 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     is_admin = db.Column(db.Boolean, default=False)
     is_active = db.Column(db.Boolean, default=True)
+    terms_accepted_at = db.Column(db.DateTime, nullable=True)
 
     # Relationships
     config = db.relationship("UserConfig", uselist=False, back_populates="user",
