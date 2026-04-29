@@ -1,6 +1,7 @@
 """Authentication routes: email + password login/register."""
 import logging
 import re
+from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify, redirect, render_template
 from flask_login import login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -25,12 +26,16 @@ def register():
     data = request.get_json() or {}
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
+    terms_accepted = bool(data.get("terms_accepted"))
 
     if not email or not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
         return jsonify({"ok": False, "msg": "Email invalido"}), 400
 
     if len(password) < 6:
         return jsonify({"ok": False, "msg": "La contrasena debe tener al menos 6 caracteres"}), 400
+
+    if not terms_accepted:
+        return jsonify({"ok": False, "msg": "Debes aceptar los Terminos y la Politica de Privacidad"}), 400
 
     from core.database import db
     from core.db_models import User, UserConfig
@@ -42,6 +47,7 @@ def register():
     user = User(
         email=email,
         password_hash=generate_password_hash(password),
+        terms_accepted_at=datetime.now(timezone.utc),
     )
     db.session.add(user)
     db.session.flush()

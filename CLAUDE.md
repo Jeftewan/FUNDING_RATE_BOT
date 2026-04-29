@@ -75,7 +75,7 @@ templates/
 
 | Tabla | Propósito |
 |-------|-----------|
-| `users` | Cuentas de usuario (email, password_hash) |
+| `users` | Cuentas de usuario (email, password_hash, terms_accepted_at) |
 | `user_configs` | Config por usuario (capital, thresholds, Telegram encrypted) |
 | `user_positions` | Posiciones abiertas con earnings y historial de pagos |
 | `user_history` | Posiciones cerradas para PnL histórico |
@@ -270,8 +270,10 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 |-----|------|--------------------|
 | `GET /` | Pública | `templates/landing.html` (landing + modal login/registro) |
 | `GET /app` | `@auth_required` | `templates/index.html` (dashboard SPA) |
+| `GET /terms`, `/privacy` | Pública | `templates/landing.html` — react-router monta `<TermsOfService />` o `<PrivacyPolicy />` en cliente |
+| `GET /<otra-ruta-SPA>` | Pública | catch-all en `api/routes.py:landing_catchall` → `landing.html` (futuras rutas SPA) |
 | `POST /auth/login` | Pública | JSON `{ok, msg}` — Flask-Login cookie |
-| `POST /auth/register` | Pública | JSON `{ok, msg}` — crea user + login |
+| `POST /auth/register` | Pública | JSON — requiere `terms_accepted: true` en body; setea `users.terms_accepted_at` |
 | `POST /auth/logout` | Autenticado | JSON — redirigir a `/` tras logout |
 | `GET /auth/me` | Autenticado | JSON `{ok, user}` — devuelve 401 JSON si no auth |
 | `GET /auth/page` | Pública | `301 → /?login=1` (compat deep-links) |
@@ -281,6 +283,14 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 **Flujo unauthenticated:** `GET /app` → `unauthorized_handler` → `302 /?login=1` → landing abre modal login.  
 **Flujo logout:** `POST /auth/logout` → `window.location = '/'` (en `static/app.js:doLogout`).  
 **Flujo delete-account:** `DELETE /api/account` → éxito → `window.location = '/'`.
+
+### Páginas legales (Términos y Privacidad)
+
+`/terms` y `/privacy` son rutas del SPA React (no de Flask). Flask las atrapa con `@app.route("/<path:_spa_path>")` en `api/routes.py` y sirve `landing.html`; react-router monta `<TermsOfService />` o `<PrivacyPolicy />` desde `src/pages/`. El layout legal compartido vive en `src/components/legal/LegalLayout.tsx`.
+
+El registro en `/auth/register` exige `terms_accepted: true` en el body o devuelve 400. Persistimos la marca de tiempo en `users.terms_accepted_at` para auditoría legal. El frontend muestra un checkbox en `AuthModal.tsx` (tab Registro) con links a `/terms` y `/privacy` en `target="_blank"`.
+
+Para editar los textos legales: modificar `src/pages/TermsOfService.tsx` y `src/pages/PrivacyPolicy.tsx` en basyo, recompilar.
 
 ### Cómo editar la landing
 

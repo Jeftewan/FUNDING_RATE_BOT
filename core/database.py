@@ -67,6 +67,8 @@ def _run_migrations(db):
         # Telegram notification columns (replaces CallMeBot WhatsApp)
         "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS tg_chat_id VARCHAR(64) DEFAULT ''",
         "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS tg_bot_token_encrypted VARCHAR(512) DEFAULT ''",
+        # Terms of Service acceptance timestamp (legal audit)
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS terms_accepted_at TIMESTAMP",
         # One-shot backfill: legacy rows stored round-trip fees under
         # entry_fees.  Split them 50/50 so the new PnL helper (which adds
         # entry + exit) stays consistent with historical numbers.
