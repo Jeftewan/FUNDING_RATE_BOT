@@ -3,7 +3,7 @@ import time
 import threading
 import logging
 from functools import wraps
-from flask import Blueprint, jsonify, request as flask_req, render_template, redirect
+from flask import Blueprint, jsonify, request as flask_req, render_template, redirect, send_from_directory
 from portfolio.manager import get_capital_summary, open_position, close_position
 from portfolio.actions import calculate_position_estimate
 
@@ -967,6 +967,15 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             from flask_login import current_user
             user_email = current_user.email if current_user.is_authenticated else ""
         return render_template("index.html", db_enabled=db_enabled, user_email=user_email)
+
+    # ── Favicon at root — required for Google Search crawler ─────────
+    @app.route("/favicon.ico")
+    def favicon_root():
+        return send_from_directory(
+            app.root_path + "/static/landing",
+            "favicon.ico",
+            mimetype="image/vnd.microsoft.icon",
+        )
 
     # ── SPA catch-all: serve landing.html for client-side routes ──
     # React-router handles /terms, /privacy and any future public route.
