@@ -92,8 +92,8 @@ def open_position(state: dict, opportunity: dict, capital: float,
         "status": "active",
     }
 
-    # Mode-specific fields
-    if mode == "cross_exchange":
+    # Mode-specific fields — defi uses the same two-leg structure as cross_exchange
+    if mode in ("cross_exchange", "defi"):
         pos["long_exchange"] = opportunity.get("long_exchange", "")
         pos["short_exchange"] = opportunity.get("short_exchange", "")
         pos["exchange"] = opportunity.get("short_exchange", "")  # Primary for lookups

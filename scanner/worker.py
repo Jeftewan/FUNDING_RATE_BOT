@@ -134,25 +134,6 @@ class ScannerWorker:
             "payments": pos.payments_json or [],
         }
 
-    def _save_position_earnings_to_db(self, pos: dict):
-        """Write updated earnings for a position back to DB."""
-        if not self._flask_app or "db_id" not in pos:
-            return
-        try:
-            with self._flask_app.app_context():
-                db_persist = self._get_db_persist()
-                if db_persist:
-                    db_persist.update_position_earnings(
-                        pos["db_id"],
-                        earned=pos.get("earned_real", 0),
-                        payment_count=pos.get("payment_count", 0),
-                        avg_rate=pos.get("avg_rate", 0),
-                        last_fr=pos.get("last_fr_used", 0),
-                        payments=pos.get("payments", []),
-                    )
-        except Exception as e:
-            log.error(f"Failed to save earnings for position {pos.get('db_id')}: {e}")
-
     def _monitor_tick(self):
         """Single monitor tick — check positions, trigger scans if needed.
 
@@ -187,7 +168,10 @@ class ScannerWorker:
             for pos in positions:
                 sym = pos["symbol"]
                 ex = pos["exchange"]
-                pair_key = f"{sym}_{ex}"
+                if pos.get("mode") == "cross_exchange":
+                    pair_key = f"{sym}_{pos.get('long_exchange', '')}_{pos.get('short_exchange', ex)}"
+                else:
+                    pair_key = f"{sym}_{ex}"
                 if pair_key in seen_pairs:
                     continue
                 seen_pairs.add(pair_key)
@@ -567,7 +551,12 @@ class ScannerWorker:
 
     def _run_scan(self):
         with self._scan_lock:
-            self._run_scan_inner()
+            try:
+                self._run_scan_inner()
+            except Exception:
+                with self.state_manager.lock:
+                    self.state_manager.set("scanning", False)
+                raise
 
     def _run_scan_inner(self):
         log.info("Scan starting...")
@@ -1016,17 +1005,6 @@ class ScannerWorker:
                 updated.append(pos)
         return updated
 
-    def _update_earnings(self, state: dict, all_data: list) -> None:
-        """Accumulate real earnings based on funding payment timestamps."""
-        now = time.time()
-        for pos in state.get("positions", []):
-            mode = pos.get("mode", "spot_perp")
-
-            if mode == "spot_perp":
-                self._update_spot_perp_earnings(pos, all_data, now)
-            else:
-                self._update_cross_exchange_earnings(pos, all_data, now)
-
     def _update_spot_perp_earnings(self, pos: dict, all_data: list, now: float):
         """Spot-perp earnings: detect funding payments using next_funding_ts."""
         cur = self._find_data(pos, all_data)
@@ -1038,7 +1016,7 @@ class ScannerWorker:
         if ih != pos.get("ih", 8):
             log.info(f"  {pos['symbol']}: interval changed {pos.get('ih')}h -> {ih}h, updating")
             pos["ih"] = ih
-        interval_secs = ih * 3600
+        interval_secs = max(1, ih * 3600)
         cfr = cur["fr"]
         nts = cur.get("next_funding_ts", 0)
 
@@ -1094,8 +1072,8 @@ class ScannerWorker:
         exposure = pos.get("exposure", pos["capital_used"] / 2)
         long_ih = long_data.get("ih", 8)
         short_ih = short_data.get("ih", 8)
-        long_interval = long_ih * 3600
-        short_interval = short_ih * 3600
+        long_interval = max(1, long_ih * 3600)
+        short_interval = max(1, short_ih * 3600)
 
         long_nts = long_data.get("next_funding_ts", 0)
         short_nts = short_data.get("next_funding_ts", 0)
@@ -1325,9 +1303,10 @@ class ScannerWorker:
                 display_ex = pos["exchange"]
 
             sym = pos["symbol"]
+            uid = pos.get("user_id", "")
 
             if (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
-                key = f"RATE_REVERSAL_{sym}_{display_ex}"
+                key = f"RATE_REVERSAL_{sym}_{display_ex}_{uid}"
                 active_keys.add(key)
                 if key not in self._notified_alerts:
                     alerts.append({
@@ -1337,7 +1316,7 @@ class ScannerWorker:
                         "message": f"Funding rate cambio de signo: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
                     })
             elif abs(cfr) < abs(pos["entry_fr"]) * 0.25:
-                key = f"RATE_DROP_{sym}_{display_ex}"
+                key = f"RATE_DROP_{sym}_{display_ex}_{uid}"
                 active_keys.add(key)
                 if key not in self._notified_alerts:
                     alerts.append({
@@ -1349,7 +1328,7 @@ class ScannerWorker:
 
             if 0 < mins_next <= alert_mins:
                 if cfr <= 0 and pos["entry_fr"] > 0:
-                    key = f"PRE_PAYMENT_UNFAVORABLE_{sym}_{display_ex}"
+                    key = f"PRE_PAYMENT_UNFAVORABLE_{sym}_{display_ex}_{uid}"
                     active_keys.add(key)
                     if key not in self._notified_alerts:
                         alerts.append({
@@ -1414,98 +1393,5 @@ class ScannerWorker:
 
         return alerts
 
-    def _check_alerts(self, state: dict, all_data: list) -> list:
-        """Check positions for alerts: rate reversal, rate drop, pre-payment.
-
-        Uses _notified_alerts to ensure each alert is only generated ONCE.
-        When the condition clears (no longer triggers), its key is removed
-        so it can fire again if the condition reappears.
-        """
-        alerts = []
-        alert_mins = state.get("alert_minutes_before", 5)
-        # Track which alert keys are active THIS tick — used to clear stale ones
-        active_keys = set()
-
-        for i, pos in enumerate(state.get("positions", [])):
-            is_cross = pos.get("mode") == "cross_exchange"
-
-            if is_cross:
-                long_ex = pos.get("long_exchange", "")
-                short_ex = pos.get("short_exchange", pos.get("exchange", ""))
-                long_d = next(
-                    (d for d in all_data
-                     if d["symbol"] == pos["symbol"] and d["exchange"] == long_ex),
-                    None,
-                )
-                short_d = next(
-                    (d for d in all_data
-                     if d["symbol"] == pos["symbol"] and d["exchange"] == short_ex),
-                    None,
-                )
-                if not long_d or not short_d:
-                    continue
-                cfr = short_d["fr"] - long_d["fr"]
-                mins_candidates = [d for d in (long_d, short_d) if d.get("mins_next", -1) >= 0]
-                mins_next = min((d["mins_next"] for d in mins_candidates), default=-1)
-                display_ex = f"{short_ex}/{long_ex}"
-            else:
-                cur = self._find_data(pos, all_data)
-                if not cur:
-                    continue
-                cfr = cur["fr"]
-                mins_next = cur.get("mins_next", -1)
-                display_ex = pos["exchange"]
-
-            sym = pos["symbol"]
-
-            # Rate reversal (critical)
-            if (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
-                key = f"RATE_REVERSAL_{sym}_{display_ex}"
-                active_keys.add(key)
-                if key not in self._notified_alerts:
-                    alerts.append({
-                        "type": "RATE_REVERSAL",
-                        "severity": "CRITICAL",
-                        "position_idx": i,
-                        "symbol": sym,
-                        "exchange": display_ex,
-                        "message": f"Funding rate cambio de signo: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
-                    })
-
-            # Rate dropped >75% (warning)
-            elif abs(cfr) < abs(pos["entry_fr"]) * 0.25:
-                key = f"RATE_DROP_{sym}_{display_ex}"
-                active_keys.add(key)
-                if key not in self._notified_alerts:
-                    alerts.append({
-                        "type": "RATE_DROP",
-                        "severity": "WARNING",
-                        "position_idx": i,
-                        "symbol": sym,
-                        "exchange": display_ex,
-                        "message": f"Rate cayo >75%: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
-                    })
-
-            # Pre-payment alert (N min before next funding)
-            if 0 < mins_next <= alert_mins:
-                if cfr <= 0 and pos["entry_fr"] > 0:
-                    key = f"PRE_PAYMENT_UNFAVORABLE_{sym}_{display_ex}"
-                    active_keys.add(key)
-                    if key not in self._notified_alerts:
-                        alerts.append({
-                            "type": "PRE_PAYMENT_UNFAVORABLE",
-                            "severity": "WARNING",
-                            "position_idx": i,
-                            "symbol": sym,
-                            "exchange": display_ex,
-                            "message": f"Proximo pago en {mins_next:.0f}min — tasa desfavorable: {cfr*100:.4f}%",
-                        })
-
-        # Clear notified keys whose condition is no longer active
-        # This allows the alert to fire again if the condition reappears
-        stale = self._notified_alerts - active_keys
-        if stale:
-            log.info(f"Alert conditions cleared: {stale}")
-            self._notified_alerts -= stale
 
         return alerts
