@@ -295,9 +295,148 @@ class DBPersistence:
             "payments": pos.payments_json or [],
         }
 
+    def aggregate_daily_earnings(self, user_id: int, days: int = 30) -> dict:
+        """Per-day earnings rollup combining active + closed positions.
+
+        Active positions: sum `earned` from each entry in payments_json bucketed
+        by the day of its `ts` (Unix seconds). Manual-adjust entries are
+        included (their delta is real money the user reconciled).
+
+        Closed positions: if payments_json is populated, use it the same way.
+        Otherwise, attribute the whole `earned` to `closed_at` (best-effort
+        fallback for legacy rows).
+
+        Returns:
+          {
+            today, yesterday, last_7d, last_30d, all_time: {earned, fees, net},
+            today_positions_active: int,
+            realized_apr_7d: float (annualized, %),
+            series: [{date "YYYY-MM-DD", earned, fees, net}, ...]  (length=days)
+          }
+        Fees are not bucketed per-day (no per-day fee data exists); they are
+        included only in `all_time` (active + closed) and as a flat number.
+        """
+        from core.db_models import UserPosition, UserHistory
+
+        if days < 1:
+            days = 1
+        if days > 365:
+            days = 365
+
+        positions = UserPosition.query.filter_by(
+            user_id=user_id, status="active"
+        ).all()
+        closed = UserHistory.query.filter_by(user_id=user_id).all()
+
+        now_dt = datetime.now()
+        today_str = now_dt.strftime("%Y-%m-%d")
+        today_start = datetime(now_dt.year, now_dt.month, now_dt.day).timestamp()
+        day_secs = 86400
+
+        # Build empty series (oldest -> newest)
+        from datetime import timedelta
+        series = []
+        for i in range(days - 1, -1, -1):
+            d = (now_dt - timedelta(days=i)).strftime("%Y-%m-%d")
+            series.append({"date": d, "earned": 0.0, "fees": 0.0, "net": 0.0})
+        by_date = {row["date"]: row for row in series}
+
+        all_time_earned = 0.0
+        all_time_fees = 0.0
+
+        def _bucket(ts_seconds: float, earned: float):
+            nonlocal all_time_earned
+            all_time_earned += earned
+            d = datetime.fromtimestamp(ts_seconds).strftime("%Y-%m-%d")
+            row = by_date.get(d)
+            if row:
+                row["earned"] += earned
+
+        # Active: iterate payments
+        for pos in positions:
+            for pay in (pos.payments_json or []):
+                try:
+                    ts = float(pay.get("ts", 0))
+                    earned = float(pay.get("earned", 0))
+                except (TypeError, ValueError):
+                    continue
+                if ts <= 0:
+                    continue
+                _bucket(ts, earned)
+
+        # Closed: prefer payments_json, fall back to closed_at + earned
+        for h in closed:
+            h_fees = float(h.fees or 0)
+            all_time_fees += h_fees
+            # No payments_json on UserHistory; attribute to closed_at day.
+            if h.closed_at:
+                ts = h.closed_at.timestamp()
+                earned = float(h.earned or 0)
+                _bucket(ts, earned)
+
+        # Active fees (estimates + reals merged elsewhere — use stored values)
+        for pos in positions:
+            entry_real = pos.entry_fees_real
+            exit_real = pos.exit_fees_real
+            entry = entry_real if entry_real is not None else (pos.entry_fees or 0)
+            exit_ = exit_real if exit_real is not None else (pos.exit_fees_est or 0)
+            all_time_fees += float(entry) + float(exit_)
+
+        # Fill nets in series
+        for row in series:
+            row["net"] = row["earned"]  # day-level fees not tracked separately
+
+        # Period sums
+        def _sum_last(n_days: int) -> dict:
+            if n_days <= 0:
+                rows = []
+            else:
+                rows = series[-n_days:]
+            e = sum(r["earned"] for r in rows)
+            return {"earned": e, "fees": 0.0, "net": e}
+
+        today = {
+            "earned": by_date[today_str]["earned"] if today_str in by_date else 0.0,
+            "fees": 0.0,
+            "net": by_date[today_str]["earned"] if today_str in by_date else 0.0,
+        }
+        yest_dt = (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday = {
+            "earned": by_date.get(yest_dt, {}).get("earned", 0.0),
+            "fees": 0.0,
+            "net": by_date.get(yest_dt, {}).get("earned", 0.0),
+        }
+        last_7d = _sum_last(min(7, days))
+        last_30d = _sum_last(min(30, days))
+        all_time = {
+            "earned": all_time_earned,
+            "fees": all_time_fees,
+            "net": all_time_earned - all_time_fees,
+        }
+
+        # Realized APR (last 7d): annualize the 7d earnings against current
+        # capital in use. Approximation — documented limitation.
+        capital_in_use = sum(float(p.capital_used or 0) for p in positions)
+        if capital_in_use > 0 and last_7d["earned"] != 0:
+            realized_apr_7d = (last_7d["earned"] / capital_in_use) * (365.0 / 7.0) * 100.0
+        else:
+            realized_apr_7d = 0.0
+
+        return {
+            "today": today,
+            "yesterday": yesterday,
+            "last_7d": last_7d,
+            "last_30d": last_30d,
+            "all_time": all_time,
+            "today_positions_active": len(positions),
+            "realized_apr_7d": realized_apr_7d,
+            "series": series,
+        }
+
     @staticmethod
     def _hist_to_dict(h) -> dict:
         return {
+            "id": str(h.id),
             "symbol": h.symbol,
             "exchange": h.exchange,
             "mode": h.mode,
@@ -312,6 +451,7 @@ class DBPersistence:
             "avg_rate": h.avg_rate,
             "reason": h.reason,
             "closed_at": h.closed_at.isoformat() if h.closed_at else "",
+            "notes": getattr(h, "notes", None),
         }
 
     def get_score_trend(self, symbol: str, exchange: str, limit: int = 10) -> dict:

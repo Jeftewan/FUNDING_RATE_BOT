@@ -146,22 +146,92 @@ function smoothUpdate(el, newHTML) {
 
 // ── Earnings chart ───────────────────────────────────────────
 let _earningsChart = null;
+let _chartMode = 'cumulative';  // 'cumulative' | 'daily'
+let _lastDailyEarnings = null;
+let _lastPositionsForChart = [];
 const CHART_COLORS = ['#22c55e','#3b82f6','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899'];
 
+function setChartMode(mode) {
+  _chartMode = (mode === 'daily') ? 'daily' : 'cumulative';
+  document.querySelectorAll('.earnings-chart-toggle .chart-tab').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === _chartMode);
+  });
+  _drawEarningsChart();
+}
+
 function renderEarningsChart(positions) {
+  _lastPositionsForChart = positions || [];
+  _drawEarningsChart();
+}
+
+function _drawEarningsChart() {
   const container = document.getElementById('earnings-chart-container');
   const canvas = document.getElementById('earnings-chart');
   if (!container || !canvas || typeof Chart === 'undefined') return;
 
-  const withPayments = (positions || []).filter(p => p.payments?.length >= 2);
+  if (_earningsChart) { _earningsChart.destroy(); _earningsChart = null; }
+
+  if (_chartMode === 'daily') {
+    const series = _lastDailyEarnings?.series || [];
+    const hasData = series.some(s => s.earned !== 0);
+    if (!hasData) { container.style.display = 'none'; return; }
+    container.style.display = '';
+
+    const labels = series.map(s => s.date);
+    const data = series.map(s => s.net);
+    const colors = data.map(v => v >= 0 ? '#22c55e' : '#ef4444');
+
+    _earningsChart = new Chart(canvas, {
+      type: 'bar',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Ganancia neta diaria',
+          data,
+          backgroundColor: colors,
+          borderWidth: 0,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => '$' + ctx.parsed.y.toFixed(4) } },
+        },
+        scales: {
+          x: {
+            ticks: {
+              color: '#555', font: { size: 9 }, maxRotation: 0, autoSkip: true,
+              callback: function(v) {
+                const lbl = this.getLabelForValue(v);
+                const parts = lbl.split('-');
+                return parts.length === 3 ? `${parts[2]}/${parts[1]}` : lbl;
+              },
+            },
+            grid: { color: '#1a1d2344' },
+          },
+          y: {
+            ticks: { color: '#555', font: { size: 9 }, callback: v => '$' + v.toFixed(2) },
+            grid: { color: '#1a1d2344' },
+          },
+        },
+        animation: { duration: 200 },
+      },
+    });
+    return;
+  }
+
+  // Cumulative mode (active positions)
+  const withPayments = _lastPositionsForChart.filter(p => p.payments?.length >= 2);
   if (!withPayments.length) { container.style.display = 'none'; return; }
   container.style.display = '';
 
-  if (_earningsChart) { _earningsChart.destroy(); _earningsChart = null; }
-
   const datasets = withPayments.map((p, i) => ({
     label: `${p.symbol} (${p.exchange || p.long_exchange + '/' + p.short_exchange})`,
-    data: p.payments.map(pay => ({ x: pay.ts * 1000, y: pay.cumulative })),
+    data: p.payments
+      .filter(pay => pay.kind !== 'manual_adjust')
+      .map(pay => ({ x: pay.ts * 1000, y: pay.cumulative })),
     borderColor: CHART_COLORS[i % CHART_COLORS.length],
     backgroundColor: CHART_COLORS[i % CHART_COLORS.length] + '22',
     fill: false,
@@ -194,6 +264,66 @@ function renderEarningsChart(positions) {
       animation: { duration: 300 },
     },
   });
+}
+
+function renderEarningsKpis(daily) {
+  const el = document.getElementById('earnings-kpis');
+  if (!el) return;
+  if (!daily) { el.innerHTML = ''; return; }
+
+  const today = daily.today?.net || 0;
+  const yest = daily.yesterday?.net || 0;
+  const last7 = daily.last_7d?.net || 0;
+  const last30 = daily.last_30d?.net || 0;
+  const total = daily.all_time?.net || 0;
+  const apr = daily.realized_apr_7d || 0;
+
+  let deltaPct = 0;
+  let deltaTxt = '';
+  if (yest !== 0) {
+    deltaPct = ((today - yest) / Math.abs(yest)) * 100;
+    deltaTxt = `${deltaPct >= 0 ? '+' : ''}${deltaPct.toFixed(0)}% vs ayer`;
+  } else if (today !== 0) {
+    deltaTxt = 'sin dato ayer';
+  }
+  const cls = (v) => v > 0 ? 'kpi-positive' : (v < 0 ? 'kpi-negative' : '');
+  const fmt = (v) => `${v >= 0 ? '' : '-'}$${Math.abs(v).toFixed(2)}`;
+
+  el.innerHTML = `
+    <div class="kpi-card ${cls(today)}">
+      <div class="kpi-label">Hoy</div>
+      <div class="kpi-value">${fmt(today)}</div>
+      <div class="kpi-sub">${deltaTxt || '&nbsp;'}</div>
+    </div>
+    <div class="kpi-card ${cls(last7)}">
+      <div class="kpi-label">7 dias</div>
+      <div class="kpi-value">${fmt(last7)}</div>
+      <div class="kpi-sub">APR realizado ${apr.toFixed(1)}%</div>
+    </div>
+    <div class="kpi-card ${cls(last30)}">
+      <div class="kpi-label">30 dias</div>
+      <div class="kpi-value">${fmt(last30)}</div>
+      <div class="kpi-sub">&nbsp;</div>
+    </div>
+    <div class="kpi-card ${cls(total)}">
+      <div class="kpi-label">Total</div>
+      <div class="kpi-value">${fmt(total)}</div>
+      <div class="kpi-sub">activas + cerradas</div>
+    </div>`;
+}
+
+async function loadDailyEarnings() {
+  try {
+    const res = await fetch('/api/earnings/daily?days=30');
+    const data = await res.json();
+    if (data.ok) {
+      _lastDailyEarnings = data;
+      renderEarningsKpis(data);
+      if (_chartMode === 'daily') _drawEarningsChart();
+    }
+  } catch (e) {
+    console.error('loadDailyEarnings error:', e);
+  }
 }
 
 // ── Exchange status ──────────────────────────────────────────
@@ -718,6 +848,7 @@ async function loadPositions() {
       renderHistory(histData);
     }
     updateStatus(posData);
+    loadDailyEarnings();
   } catch (e) {
     console.error('loadPositions error:', e);
   }
@@ -851,7 +982,7 @@ function renderPositions(data) {
         <div class="pos-field"><span class="label">FR actual</span><span class="value" style="color:${frColor}">${(p.current_fr*100).toFixed(4)}%</span></div>
         <div class="pos-field"><span class="label">APR</span><span class="value" style="color:${frColor}">${p.current_apr?.toFixed(1)}%</span></div>
         <div class="pos-field"><span class="label">Prom</span><span class="value">${p.avg_rate ? (p.avg_rate*100).toFixed(4) + '%' : '—'}</span></div>
-        <div class="pos-field"><span class="label">Ganancia</span><span class="value" style="color:var(--green)">$${p.est_earned?.toFixed(2)}</span></div>
+        <div class="pos-field"><span class="label">Ganancia</span><span class="value fees-clickable" onclick="editPosEarnings('${posId}')" title="Editar ganancia acumulada (si tu exchange muestra otro total)" style="color:var(--green); cursor:pointer; text-decoration:underline dotted">$${p.est_earned?.toFixed(2)}</span></div>
         <div class="pos-field pos-field-fees">
           <span class="label">
             Fees
@@ -1171,6 +1302,147 @@ async function editPosFees(posId) {
   document.addEventListener('keydown', onEsc);
 }
 
+async function editPosEarnings(posId) {
+  const pos = (_lastPosData?.positions || []).find(p => String(p.id) === String(posId));
+  if (!pos) { showToast('Posicion no encontrada', 'error'); return; }
+
+  const curEarned = pos.est_earned ?? pos.earned_real ?? 0;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `
+    <div class="confirm-box" style="max-width:460px">
+      <div class="confirm-msg" style="text-align:left">
+        <div style="font-size:15px;font-weight:600;margin-bottom:4px">Ganancia acumulada — ${pos.symbol}</div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px">
+          Si tu exchange muestra un total distinto, ajustalo aqui. Los proximos pagos
+          se sumaran a partir de este valor. Queda registrado en el historial de pagos.
+        </div>
+        <label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">
+          Total ganado (USD) <span style="opacity:.6">— actual $${curEarned.toFixed(4)}</span>
+        </label>
+        <input type="number" step="0.0001" id="earn-total"
+               value="${curEarned.toFixed(4)}"
+               style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px" />
+      </div>
+      <div class="confirm-actions">
+        <button class="btn btn-secondary" data-action="cancel">Cancelar</button>
+        <button class="btn btn-primary" data-action="ok">Guardar</button>
+      </div>
+    </div>`;
+
+  const cleanup = () => overlay.remove();
+  document.body.appendChild(overlay);
+  setTimeout(() => overlay.querySelector('#earn-total').focus(), 50);
+
+  overlay.querySelector('[data-action="ok"]').onclick = async () => {
+    const raw = overlay.querySelector('#earn-total').value;
+    if (raw === '') { showToast('Introduce un valor', 'error'); return; }
+    const v = parseFloat(raw);
+    if (isNaN(v) || !isFinite(v)) { showToast('Valor invalido', 'error'); return; }
+    try {
+      const res = await fetch(`/api/positions/${encodeURIComponent(posId)}/earnings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ earned: v }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast(`Ganancia ajustada (${data.delta >= 0 ? '+' : ''}$${data.delta.toFixed(4)})`, 'success');
+        cleanup();
+        loadPositions();
+      } else {
+        showToast(data.msg || 'Error al ajustar ganancia', 'error');
+      }
+    } catch (e) {
+      showToast('Error de red', 'error');
+    }
+  };
+  overlay.querySelector('[data-action="cancel"]').onclick = cleanup;
+  overlay.onclick = (e) => { if (e.target === overlay) cleanup(); };
+  const onEsc = (e) => { if (e.key === 'Escape') { document.removeEventListener('keydown', onEsc); cleanup(); } };
+  document.addEventListener('keydown', onEsc);
+}
+
+async function editHistEarnings(histId) {
+  const hist = (_lastHistoryData || []).find(h => String(h.id) === String(histId));
+  if (!hist) { showToast('Registro no encontrado', 'error'); return; }
+
+  const curEarned = hist.earned || 0;
+  const curFees = hist.fees || 0;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'confirm-overlay';
+  overlay.innerHTML = `
+    <div class="confirm-box" style="max-width:460px">
+      <div class="confirm-msg" style="text-align:left">
+        <div style="font-size:15px;font-weight:600;margin-bottom:4px">Editar cerrada — ${hist.symbol}</div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:14px">
+          Ajusta ganancia y/o fees si descubriste una divergencia con tu exchange.
+          El neto se recalcula como ganancia - fees.
+        </div>
+        <label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">
+          Ganancia (USD)
+        </label>
+        <input type="number" step="0.0001" id="hist-earned"
+               value="${curEarned.toFixed(4)}"
+               style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;margin-bottom:12px" />
+        <label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">
+          Fees totales (USD)
+        </label>
+        <input type="number" step="0.01" min="0" id="hist-fees"
+               value="${curFees.toFixed(2)}"
+               style="width:100%;padding:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px" />
+      </div>
+      <div class="confirm-actions">
+        <button class="btn btn-secondary" data-action="cancel">Cancelar</button>
+        <button class="btn btn-primary" data-action="ok">Guardar</button>
+      </div>
+    </div>`;
+
+  const cleanup = () => overlay.remove();
+  document.body.appendChild(overlay);
+  setTimeout(() => overlay.querySelector('#hist-earned').focus(), 50);
+
+  overlay.querySelector('[data-action="ok"]').onclick = async () => {
+    const eRaw = overlay.querySelector('#hist-earned').value;
+    const fRaw = overlay.querySelector('#hist-fees').value;
+    const body = {};
+    if (eRaw !== '') {
+      const v = parseFloat(eRaw);
+      if (isNaN(v) || !isFinite(v)) { showToast('Ganancia invalida', 'error'); return; }
+      body.earned = v;
+    }
+    if (fRaw !== '') {
+      const v = parseFloat(fRaw);
+      if (isNaN(v) || !isFinite(v) || v < 0) { showToast('Fees invalidos', 'error'); return; }
+      body.fees = v;
+    }
+    if (Object.keys(body).length === 0) { showToast('Nada para guardar', 'warning'); return; }
+    try {
+      const res = await fetch(`/api/history/${encodeURIComponent(histId)}/earnings`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast('Historial actualizado', 'success');
+        cleanup();
+        loadPositions();
+      } else {
+        showToast(data.msg || 'Error al actualizar', 'error');
+      }
+    } catch (e) {
+      showToast('Error de red', 'error');
+    }
+  };
+  overlay.querySelector('[data-action="cancel"]').onclick = cleanup;
+  overlay.onclick = (e) => { if (e.target === overlay) cleanup(); };
+  const onEsc = (e) => { if (e.key === 'Escape') { document.removeEventListener('keydown', onEsc); cleanup(); } };
+  document.addEventListener('keydown', onEsc);
+}
+
 let _lastHistoryData = [];
 
 function exportCSV() {
@@ -1222,6 +1494,12 @@ function _drawHistoryRows(container, ordered, limit) {
     const pays = h.payment_count || h.intervals || 0;
     const exp = h.exposure ? `$${h.exposure.toFixed(0)}` : '';
     const lev = h.leverage > 1 ? ` ${h.leverage}x` : '';
+    const editBtn = h.id
+      ? `<button class="hist-edit" onclick="editHistEarnings('${h.id}')" title="Editar ganancia/fees manualmente" aria-label="Editar">✎</button>`
+      : '';
+    const editedMark = h.notes
+      ? ' <span title="Editado manualmente" style="opacity:.6;font-size:11px">✎</span>'
+      : '';
     return `
     <div class="hist-item">
       <div class="hist-main">
@@ -1234,7 +1512,7 @@ function _drawHistoryRows(container, ordered, limit) {
         ${exp ? `<span>${exp}${lev}</span>` : ''}
         <span>${date}</span>
       </div>
-      <div class="hist-net" style="color:${netColor}">${sign}$${net.toFixed(2)}</div>
+      <div class="hist-net" style="color:${netColor}">${sign}$${net.toFixed(2)}${editedMark}${editBtn}</div>
     </div>`;
   }).join('');
 

@@ -2,6 +2,7 @@
 import time
 import threading
 import logging
+from datetime import datetime
 from functools import wraps
 from flask import Blueprint, jsonify, request as flask_req, render_template, redirect, send_from_directory
 from portfolio.manager import get_capital_summary, open_position, close_position
@@ -681,6 +682,162 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             "exit_fees_est": pos.exit_fees_est or 0,
         })
 
+    # ── Manual earnings override (active position) ─────────────
+    @app.route("/api/positions/<pos_id>/earnings", methods=["PATCH", "POST"])
+    @auth_required
+    def api_update_position_earnings(pos_id):
+        """Let the user manually set the accumulated earnings for an active
+        position when their exchange shows a different total.
+
+        Body: { "earned": <float> }
+        Semantics: absolute rewriteable — the value becomes the new running
+        total. The scanner keeps adding future settlements on top because
+        _count_payments_since uses `last_earn_update` as the lower bound,
+        which we bump to now. An audit entry is appended to payments_json.
+        """
+        uid = get_current_user_id()
+        if not uid or not get_db_persist():
+            return jsonify({"ok": False, "msg": "DB no disponible"}), 400
+
+        try:
+            db_pos_id = int(pos_id)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "msg": "ID invalido"}), 400
+
+        from core.database import db as _db
+        from core.db_models import UserPosition
+        pos = UserPosition.query.filter_by(
+            id=db_pos_id, user_id=uid, status="active"
+        ).first()
+        if not pos:
+            return jsonify({"ok": False, "msg": "Posicion no encontrada"}), 404
+
+        data = flask_req.json or {}
+        if "earned" not in data or data["earned"] is None or data["earned"] == "":
+            return jsonify({"ok": False, "msg": "Falta campo 'earned'"}), 400
+
+        try:
+            new_earned = float(data["earned"])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "msg": "'earned' invalido"}), 400
+
+        import math
+        if not math.isfinite(new_earned):
+            return jsonify({"ok": False, "msg": "'earned' no finito"}), 400
+
+        prev_earned = float(pos.earned_real or 0)
+        delta = new_earned - prev_earned
+        now_ts = time.time()
+
+        payments = list(pos.payments_json or [])
+        payments.append({
+            "ts": now_ts,
+            "rate": 0,
+            "earned": delta,
+            "cumulative": new_earned,
+            "kind": "manual_adjust",
+            "note": "user override",
+        })
+        pos.earned_real = new_earned
+        pos.last_earn_update = now_ts
+        pos.payments_json = payments
+
+        _db.session.commit()
+        log.info(f"Position {db_pos_id} earnings manually set: "
+                 f"{prev_earned:.4f} -> {new_earned:.4f} (delta {delta:+.4f})")
+
+        return jsonify({
+            "ok": True,
+            "position_id": db_pos_id,
+            "earned": new_earned,
+            "delta": delta,
+            "last_earn_update": now_ts,
+        })
+
+    # ── Manual earnings override (closed position) ─────────────
+    @app.route("/api/history/<hist_id>/earnings", methods=["PATCH", "POST"])
+    @auth_required
+    def api_update_history_earnings(hist_id):
+        """Edit accumulated earnings/fees of a closed position.
+
+        Body: { "earned"?: float, "fees"?: float }
+        Any field omitted is left untouched. `net_earned` is recomputed.
+        """
+        uid = get_current_user_id()
+        if not uid or not get_db_persist():
+            return jsonify({"ok": False, "msg": "DB no disponible"}), 400
+
+        try:
+            db_hist_id = int(hist_id)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "msg": "ID invalido"}), 400
+
+        from core.database import db as _db
+        from core.db_models import UserHistory
+        hist = UserHistory.query.filter_by(id=db_hist_id, user_id=uid).first()
+        if not hist:
+            return jsonify({"ok": False, "msg": "Registro no encontrado"}), 404
+
+        data = flask_req.json or {}
+        import math
+        updated = []
+
+        if "earned" in data and data["earned"] is not None and data["earned"] != "":
+            try:
+                v = float(data["earned"])
+                if not math.isfinite(v):
+                    raise ValueError()
+                hist.earned = v
+                updated.append(f"earned={v}")
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "msg": "'earned' invalido"}), 400
+
+        if "fees" in data and data["fees"] is not None and data["fees"] != "":
+            try:
+                v = float(data["fees"])
+                if not math.isfinite(v):
+                    raise ValueError()
+                hist.fees = max(0.0, v)
+                updated.append(f"fees={hist.fees}")
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "msg": "'fees' invalido"}), 400
+
+        if not updated:
+            return jsonify({"ok": False, "msg": "Nada que actualizar"}), 400
+
+        hist.net_earned = (hist.earned or 0) - (hist.fees or 0)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        note_line = f"[{stamp}] manual edit: {', '.join(updated)}"
+        hist.notes = (hist.notes + "\n" + note_line) if hist.notes else note_line
+
+        _db.session.commit()
+        log.info(f"History {db_hist_id} edited: {', '.join(updated)}")
+
+        return jsonify({
+            "ok": True,
+            "history_id": db_hist_id,
+            "earned": hist.earned,
+            "fees": hist.fees,
+            "net_earned": hist.net_earned,
+            "notes": hist.notes,
+        })
+
+    # ── Daily earnings rollup ──────────────────────────────────
+    @app.route("/api/earnings/daily")
+    @auth_required
+    def api_earnings_daily():
+        """Daily breakdown of earnings combining active + closed positions."""
+        uid = get_current_user_id()
+        if not uid or not get_db_persist():
+            return jsonify({"ok": False, "msg": "DB no disponible"}), 400
+        try:
+            days = int(flask_req.args.get("days", 30))
+        except (TypeError, ValueError):
+            days = 30
+        data = get_db_persist().aggregate_daily_earnings(uid, days=days)
+        data["ok"] = True
+        return jsonify(data)
+
     # ── History ────────────────────────────────────────────────
     @app.route("/api/history")
     @auth_required
@@ -738,16 +895,15 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         if not all([n.tg_chat_id, n.tg_bot_token]):
             return jsonify({"ok": False, "msg": "Configura Bot Token y Chat ID primero"})
 
-        test_keys = [k for k in n._sent_cache if k.startswith("TEST_")]
-        for k in test_keys:
-            del n._sent_cache[k]
-
+        # Unique dedup_key per request avoids racing _sent_cache mutation and
+        # lets the same user re-run the test without being silenced by cooldown.
         test_alert = {
-            "type": "TEST_ALERT",
+            "type": "TEST_TELEGRAM",
             "severity": "CRITICAL",
             "symbol": "TEST",
             "exchange": "Bot",
             "message": "Prueba de alerta automatica — pipeline completo OK",
+            "dedup_key": f"TEST_TELEGRAM:{time.time_ns()}",
         }
 
         sent = n.send_alerts([test_alert])

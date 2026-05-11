@@ -82,8 +82,13 @@
   <!-- ═══ POSITIONS TAB ═══ -->
   <div id="page-positions" class="page">
     <div class="capital-bar" id="capital-bar"></div>
+    <div class="earnings-kpis" id="earnings-kpis"></div>
     <div id="alerts-bar"></div>
     <div class="earnings-chart-container" id="earnings-chart-container" style="display:none">
+      <div class="earnings-chart-toggle" id="earnings-chart-toggle">
+        <button class="chart-tab active" data-mode="cumulative" onclick="setChartMode('cumulative')">Cumulativo activas</button>
+        <button class="chart-tab" data-mode="daily" onclick="setChartMode('daily')">Diario total</button>
+      </div>
       <canvas id="earnings-chart" height="180"></canvas>
     </div>
     <div id="pos-list"></div>

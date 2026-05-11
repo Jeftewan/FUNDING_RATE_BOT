@@ -1012,6 +1012,21 @@ body {
   white-space: nowrap;
   align-self: center;
 }
+.hist-item .hist-edit {
+  margin-left: 8px;
+  background: transparent;
+  border: 1px solid var(--border, #2a2f3a);
+  color: var(--text-secondary, #9ca3af);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1;
+}
+.hist-item .hist-edit:hover {
+  background: rgba(255,255,255,0.06);
+  color: var(--text-primary, #e5e7eb);
+}
 
 /* ── Modal ─────────────────────────────────────────── */
 
@@ -1138,6 +1153,65 @@ body {
   box-shadow: 0 2px 12px rgba(0,0,0,0.15);
 }
 .earnings-chart-container canvas { width: 100% !important; max-height: 180px; }
+.earnings-chart-toggle {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.earnings-chart-toggle .chart-tab {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-secondary, #9ca3af);
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: var(--font-ui);
+}
+.earnings-chart-toggle .chart-tab.active {
+  background: var(--blue, #3b82f6);
+  color: #fff;
+  border-color: var(--blue, #3b82f6);
+}
+
+/* ── Earnings KPIs ─────────────────────────────────── */
+.earnings-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.kpi-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.kpi-card .kpi-label {
+  font-size: 10px;
+  color: var(--text-muted, #6b7280);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  font-family: var(--font-ui);
+}
+.kpi-card .kpi-value {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-primary, #e5e7eb);
+  font-family: var(--font);
+}
+.kpi-card .kpi-sub {
+  font-size: 10px;
+  color: var(--text-secondary, #9ca3af);
+}
+.kpi-card.kpi-positive .kpi-value { color: var(--green, #22c55e); }
+.kpi-card.kpi-negative .kpi-value { color: var(--red, #ef4444); }
+@media (max-width: 720px) {
+  .earnings-kpis { grid-template-columns: repeat(2, 1fr); }
+}
 
 /* ── Confirm Dialog ────────────────────────────────── */
 

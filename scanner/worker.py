@@ -287,92 +287,60 @@ class ScannerWorker:
             if self.email_notifier:
                 try:
                     sent = self._dispatch_alerts_per_user(alerts)
-                    log.info(f"WhatsApp: {sent}/{len(alerts)} alert(s) sent")
+                    log.info(f"Telegram: {sent}/{len(alerts)} alert(s) sent")
                     if sent > 0:
+                        from notifications.email import build_alert_dedup_key
                         now_ts = time.time()
                         for a in alerts:
-                            key = a.get("dedup_key") or (
-                                f"{a['type']}_{a['symbol']}_"
-                                f"{a.get('exchange', '')}_{a.get('user_id','')}_"
-                                f"{a.get('funding_ts','')}"
-                            )
-                            self._notified_alerts[key] = now_ts
+                            self._notified_alerts[build_alert_dedup_key(a)] = now_ts
                         with self.state_manager.lock:
                             self.state_manager.state["alerts"] = []
                 except Exception as e:
-                    log.error(f"WhatsApp error: {e}")
+                    log.error(f"Telegram dispatch error: {e}")
 
         self._cleanup_events()
 
     def _dispatch_alerts_per_user(self, alerts: list) -> int:
         """Send each alert using the Telegram credentials of its owning user.
 
-        Groups alerts by user_id, loads that user's config from DB, syncs the
-        shared notifier's state for the duration of the send, and restores the
-        previous state afterwards.
+        Groups alerts by user_id, loads each user's config from DB, then sends
+        with explicit credentials (no shared-state mutation, no cross-user
+        races). Orphan alerts (no user_id) are dropped with a warning rather
+        than routed to whoever was last in state.
         """
         if not self.email_notifier:
             return 0
 
         by_user: dict = {}
-        orphans: list = []
         for a in alerts:
             uid = a.get("user_id")
             if uid:
                 by_user.setdefault(uid, []).append(a)
             else:
-                orphans.append(a)
+                log.warning(f"Discarding orphan alert (no user_id): "
+                            f"{a.get('type')} {a.get('symbol')}")
+
+        if not by_user:
+            return 0
 
         sent_total = 0
+        for uid, user_alerts in by_user.items():
+            cfg = self._load_user_telegram_config(uid)
+            if not cfg or not cfg.get("email_enabled") or not cfg.get("tg_chat_id") or not cfg.get("tg_bot_token"):
+                log.warning(
+                    f"Telegram: skipping {len(user_alerts)} alert(s) for user {uid} "
+                    f"(config incomplete/disabled)"
+                )
+                continue
 
-        with self.state_manager.lock:
-            s = self.state_manager.state
-            prev_enabled = s.get("email_enabled", False)
-            prev_chat_id = s.get("tg_chat_id", "")
-            prev_token = s.get("tg_bot_token", "")
-
-        try:
-            for uid, user_alerts in by_user.items():
-                cfg = self._load_user_telegram_config(uid)
-                if not cfg or not cfg.get("email_enabled") or not cfg.get("tg_chat_id") or not cfg.get("tg_bot_token"):
-                    log.info(
-                        f"Telegram: skipping {len(user_alerts)} alert(s) for user {uid} "
-                        f"(config incomplete/disabled)"
-                    )
-                    continue
-
-                with self.state_manager.lock:
-                    s = self.state_manager.state
-                    s["email_enabled"] = True
-                    s["tg_chat_id"] = cfg["tg_chat_id"]
-                    s["tg_bot_token"] = cfg["tg_bot_token"]
-
-                try:
-                    sent_total += self.email_notifier.send_alerts(user_alerts)
-                except Exception as e:
-                    log.error(f"Telegram send failed for user {uid}: {e}")
-
-            if orphans:
-                with self.state_manager.lock:
-                    s = self.state_manager.state
-                    s["email_enabled"] = prev_enabled
-                    s["tg_chat_id"] = prev_chat_id
-                    s["tg_bot_token"] = prev_token
-                try:
-                    sent_total += self.email_notifier.send_alerts(orphans)
-                except Exception as e:
-                    log.error(f"Telegram send failed for orphan alerts: {e}")
-        finally:
-            with self.state_manager.lock:
-                s = self.state_manager.state
-                s["email_enabled"] = prev_enabled
-                s["tg_chat_id"] = prev_chat_id
-                s["tg_bot_token"] = prev_token
-            if self.email_notifier:
-                try:
-                    self.email_notifier._sync_from_state()
-                except Exception:
-                    pass
+            try:
+                sent_total += self.email_notifier.send_alerts(
+                    user_alerts,
+                    chat_id=cfg["tg_chat_id"],
+                    token=cfg["tg_bot_token"],
+                )
+            except Exception as e:
+                log.error(f"Telegram send failed for user {uid}: {e}")
 
         return sent_total
 
@@ -418,49 +386,26 @@ class ScannerWorker:
             log.debug("Broadcast: no users with Telegram enabled, skipping")
             return 0
 
-        with self.state_manager.lock:
-            s = self.state_manager.state
-            prev_enabled = s.get("email_enabled", False)
-            prev_chat_id = s.get("tg_chat_id", "")
-            prev_token = s.get("tg_bot_token", "")
-
+        from notifications.email import build_alert_dedup_key
         sent_total = 0
-        try:
-            for cfg in user_configs:
-                uid = cfg["user_id"]
-                with self.state_manager.lock:
-                    s = self.state_manager.state
-                    s["email_enabled"] = True
-                    s["tg_chat_id"] = cfg["tg_chat_id"]
-                    s["tg_bot_token"] = cfg["tg_bot_token"]
-                # Personalize each alert copy with the recipient's user_id and
-                # a dedup_key that includes it.  Without this, the in-memory
-                # cooldown and the DB dedup would both collapse to a single
-                # key across all users and only the first would actually send.
-                per_user_alerts = []
-                for a in alerts:
-                    a2 = dict(a)
-                    a2["user_id"] = uid
-                    bucket = a2.get("funding_ts", a2.get("_exc_bucket", ""))
-                    a2["dedup_key"] = (
-                        f"{a2.get('type','')}_{a2.get('symbol','')}_"
-                        f"{a2.get('exchange','')}_{uid}_{bucket}"
-                    )
-                    per_user_alerts.append(a2)
-                try:
-                    sent_total += self.email_notifier.send_alerts(per_user_alerts)
-                except Exception as e:
-                    log.error(f"Broadcast: send failed for user {uid}: {e}")
-        finally:
-            with self.state_manager.lock:
-                s = self.state_manager.state
-                s["email_enabled"] = prev_enabled
-                s["tg_chat_id"] = prev_chat_id
-                s["tg_bot_token"] = prev_token
+        for cfg in user_configs:
+            uid = cfg["user_id"]
+            # Personalize each alert copy with the recipient's user_id so the
+            # per-user dedup_key (built by build_alert_dedup_key) is distinct.
+            per_user_alerts = []
+            for a in alerts:
+                a2 = dict(a)
+                a2["user_id"] = uid
+                a2["dedup_key"] = build_alert_dedup_key(a2)
+                per_user_alerts.append(a2)
             try:
-                self.email_notifier._sync_from_state()
-            except Exception:
-                pass
+                sent_total += self.email_notifier.send_alerts(
+                    per_user_alerts,
+                    chat_id=cfg["tg_chat_id"],
+                    token=cfg["tg_bot_token"],
+                )
+            except Exception as e:
+                log.error(f"Broadcast: send failed for user {uid}: {e}")
 
         return sent_total
 

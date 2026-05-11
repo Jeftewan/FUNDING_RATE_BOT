@@ -91,6 +91,8 @@ def _run_migrations(db):
         "ON notification_log (sent_at)",
         # Retention: keep 7 days, drop the rest each boot.
         "DELETE FROM notification_log WHERE sent_at < NOW() - INTERVAL '7 days'",
+        # Manual edit audit trail on closed positions.
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS notes TEXT",
     ]
     for sql in migrations:
         try:
