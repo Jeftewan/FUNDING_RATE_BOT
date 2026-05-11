@@ -76,6 +76,21 @@ def _run_migrations(db):
         "entry_fees = entry_fees / 2 "
         "WHERE (exit_fees_est IS NULL OR exit_fees_est = 0) "
         "AND entry_fees > 0 AND entry_fees_real IS NULL",
+        # Dedup log for Telegram notifications.  Survives process restarts so
+        # alerts already sent within the last few hours are not re-sent when
+        # Railway redeploys.
+        "CREATE TABLE IF NOT EXISTS notification_log ("
+        "  id SERIAL PRIMARY KEY,"
+        "  user_id INTEGER NOT NULL,"
+        "  dedup_key VARCHAR(256) NOT NULL,"
+        "  sent_at TIMESTAMP NOT NULL DEFAULT NOW()"
+        ")",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_notification_log_user_key "
+        "ON notification_log (user_id, dedup_key)",
+        "CREATE INDEX IF NOT EXISTS idx_notification_log_sent_at "
+        "ON notification_log (sent_at)",
+        # Retention: keep 7 days, drop the rest each boot.
+        "DELETE FROM notification_log WHERE sent_at < NOW() - INTERVAL '7 days'",
     ]
     for sql in migrations:
         try:

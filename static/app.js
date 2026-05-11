@@ -1194,6 +1194,8 @@ function exportCSV() {
   showToast('CSV exportado', 'success');
 }
 
+const HISTORY_PREVIEW_COUNT = 5;
+
 function renderHistory(data) {
   const history = data.history || [];
   _lastHistoryData = history;
@@ -1206,16 +1208,49 @@ function renderHistory(data) {
     </div>`;
     return;
   }
-  el.innerHTML = history.slice().reverse().slice(0, 20).map(h => {
-    const netColor = (h.net_earned || h.earned) >= 0 ? '#22c55e' : '#ef4444';
+  const ordered = history.slice().reverse();
+  _drawHistoryRows(el, ordered, HISTORY_PREVIEW_COUNT);
+}
+
+function _drawHistoryRows(container, ordered, limit) {
+  const visible = ordered.slice(0, limit);
+  const rowsHtml = visible.map(h => {
+    const net = (h.net_earned ?? h.earned) || 0;
+    const netColor = net >= 0 ? 'var(--green, #22c55e)' : 'var(--red, #ef4444)';
+    const sign = net >= 0 ? '+' : '';
+    const date = h.closed_at ? h.closed_at.split('T')[0] : (h.time?.split('T')[0] || '');
+    const hours = (h.hours != null) ? `${h.hours.toFixed(1)}h` : '';
+    const pays = h.payment_count || h.intervals || 0;
+    const exp = h.exposure ? `$${h.exposure.toFixed(0)}` : '';
+    const lev = h.leverage > 1 ? ` ${h.leverage}x` : '';
     return `
     <div class="hist-item">
-      <span>${h.symbol} (${h.exchange}) — ${h.mode || 'spot_perp'}</span>
-      <span>${h.hours?.toFixed(1)}h | ${h.payment_count || h.intervals} pagos | $${h.exposure?.toFixed(0) || '?'} exp${h.leverage > 1 ? ' ('+h.leverage+'x)' : ''}</span>
-      <span style="color:${netColor}">$${(h.net_earned || h.earned)?.toFixed(2)}</span>
-      <span style="color:#555">${h.closed_at ? h.closed_at.split('T')[0] : h.time?.split('T')[0] || ''}</span>
+      <div class="hist-main">
+        <span class="hist-sym">${h.symbol}</span>
+        <span class="hist-meta">${h.exchange} · ${h.mode || 'spot_perp'}</span>
+      </div>
+      <div class="hist-sub">
+        <span>${hours}</span>
+        <span>${pays} pagos</span>
+        ${exp ? `<span>${exp}${lev}</span>` : ''}
+        <span>${date}</span>
+      </div>
+      <div class="hist-net" style="color:${netColor}">${sign}$${net.toFixed(2)}</div>
     </div>`;
   }).join('');
+
+  const hidden = ordered.length - visible.length;
+  const moreBtn = hidden > 0
+    ? `<button class="btn btn-secondary" id="hist-show-more" style="margin-top:8px;width:100%">Ver más (${hidden})</button>`
+    : '';
+  container.innerHTML = rowsHtml + moreBtn;
+
+  const btn = document.getElementById('hist-show-more');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      _drawHistoryRows(container, ordered, ordered.length);
+    });
+  }
 }
 
 async function clearHistory(resetAll) {

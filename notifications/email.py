@@ -12,10 +12,17 @@ log = logging.getLogger("bot")
 class EmailNotifier:
     """Telegram notifier (keeps class name for compatibility)."""
 
-    def __init__(self, state_manager):
+    def __init__(self, state_manager, dedup_check=None, dedup_record=None):
         self.state_manager = state_manager
+        # In-memory short-window cooldown (per-process). Survives only until
+        # restart; the persistent dedup is delegated to dedup_check/record.
         self._sent_cache = {}
         self._cooldown_seconds = 60
+        # dedup_check(user_id, dedup_key) -> bool: True if already sent recently.
+        # dedup_record(user_id, dedup_key) -> None: persist that it was sent.
+        # Both must run inside a Flask app context (caller's responsibility).
+        self._dedup_check = dedup_check
+        self._dedup_record = dedup_record
         self._sync_from_state()
 
     def _sync_from_state(self):
@@ -38,10 +45,32 @@ class EmailNotifier:
                         f"skipping: {alert.get('type')} {alert.get('symbol')}")
             return False
 
-        alert_key = f"{alert['type']}_{alert['symbol']}_{alert.get('exchange', '')}"
+        # Dedup key MUST include user_id (and ideally a funding-window bucket)
+        # to distinguish the same alert sent to different users in the same
+        # window.  Callers should pass `dedup_key` explicitly; otherwise we
+        # build a best-effort key from the available fields.
+        user_id = alert.get("user_id", "")
+        alert_key = alert.get("dedup_key") or (
+            f"{alert.get('type','')}_{alert.get('symbol','')}_"
+            f"{alert.get('exchange','')}_{user_id}_"
+            f"{alert.get('funding_ts','')}"
+        )
         now = time.time()
-        # Purge expired entries so _sent_cache doesn't grow unbounded across
-        # the lifetime of the process (bot runs for weeks on the same key set).
+
+        # Layer 1: persistent dedup across process restarts (DB).
+        if self._dedup_check and user_id:
+            try:
+                if self._dedup_check(user_id, alert_key):
+                    log.info(
+                        f"Telegram dedup hit (already sent recently) "
+                        f"{alert_key}, skipping"
+                    )
+                    return False
+            except Exception as e:
+                log.debug(f"dedup_check failed (allowing send): {e}")
+
+        # Layer 2: in-memory cooldown (catches rapid back-to-back ticks
+        # before the DB write commits, and works in DB-less mode).
         expiry = self._cooldown_seconds * 10
         expired = [k for k, ts in self._sent_cache.items() if now - ts > expiry]
         for k in expired:
@@ -57,6 +86,11 @@ class EmailNotifier:
             text = self._format_message(alert)
             self._send_telegram(text)
             self._sent_cache[alert_key] = now
+            if self._dedup_record and user_id:
+                try:
+                    self._dedup_record(user_id, alert_key)
+                except Exception as e:
+                    log.debug(f"dedup_record failed: {e}")
             log.info(f"Telegram alert SENT OK: {alert.get('type')} {alert.get('symbol')}")
             return True
         except Exception as e:

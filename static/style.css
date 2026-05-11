@@ -981,13 +981,36 @@ body {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 10px 12px;
-  margin-bottom: 5px;
+  margin-bottom: 6px;
   font-size: 11px;
   font-family: var(--font-ui);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto auto;
+  column-gap: 12px;
+  row-gap: 4px;
+  align-items: center;
+  transition: background 120ms ease;
+}
+.hist-item:hover { background: rgba(255,255,255,0.03); }
+.hist-item .hist-main { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.hist-item .hist-sym { font-size: 13px; font-weight: 600; color: var(--text-primary, #e5e7eb); }
+.hist-item .hist-meta { color: var(--text-secondary, #9ca3af); font-size: 11px; }
+.hist-item .hist-sub {
+  grid-column: 1 / 2;
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
   flex-wrap: wrap;
+  color: var(--text-secondary, #9ca3af);
+  font-size: 11px;
+}
+.hist-item .hist-net {
+  grid-column: 2 / 3;
+  grid-row: 1 / 3;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  align-self: center;
 }
 
 /* ── Modal ─────────────────────────────────────────── */

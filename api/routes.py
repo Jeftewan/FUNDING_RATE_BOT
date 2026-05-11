@@ -560,22 +560,31 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         else:
             return jsonify({"ok": False, "msg": "DB no disponible"})
 
-        # Clear any notified alerts for this symbol
+        # Clear any notified alerts for this symbol so the next position on
+        # the same symbol can re-trigger condition alerts.
         closed_sym = result["symbol"]
-        stale_keys = {k for k in scanner_worker._notified_alerts if closed_sym in k}
-        scanner_worker._notified_alerts -= stale_keys
+        stale_keys = [k for k in scanner_worker._notified_alerts if closed_sym in k]
+        for k in stale_keys:
+            scanner_worker._notified_alerts.pop(k, None)
 
-        # Send WhatsApp notification — route per-user via the dispatcher so
+        # Send Telegram notification — route per-user via the dispatcher so
         # the user's own credentials are loaded from DB even if the in-memory
         # state wasn't previously synced for this session.
         if scanner_worker.email_notifier:
             try:
+                import time as _t
+                # Unique dedup_key per close event (timestamp) so legit
+                # consecutive closes of the same symbol are never suppressed,
+                # but a duplicate POST of the same close is.
+                close_id = int(_t.time())
                 close_alert = {
                     "type": "POSITION_CLOSED",
                     "severity": "INFO",
                     "symbol": closed_sym,
                     "exchange": "",
                     "user_id": uid,
+                    "funding_ts": close_id,
+                    "dedup_key": f"POSITION_CLOSED_{closed_sym}_{uid}_{close_id}",
                     "message": (
                         f"Posicion cerrada ({reason}). "
                         f"Ganancia: ${result['earned']:.2f} | "
@@ -587,7 +596,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 }
                 scanner_worker._dispatch_alerts_per_user([close_alert])
             except Exception as e:
-                log.warning(f"WhatsApp close notification failed: {e}")
+                log.warning(f"Telegram close notification failed: {e}")
 
         return jsonify({"ok": True, "result": result})
 

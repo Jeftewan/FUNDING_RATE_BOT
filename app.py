@@ -125,6 +125,28 @@ if not db_enabled:
 if db_enabled:
     scanner_worker._flask_app = app
 
+    # Wire persistent dedup for Telegram alerts so duplicates don't re-fire
+    # after process restarts.  Callables run inside a Flask app context.
+    from core.db_persistence import DBPersistence as _DBP
+    _dedup_persist = _DBP()
+
+    def _dedup_check(user_id, key):
+        try:
+            with app.app_context():
+                return _dedup_persist.was_alert_sent(user_id, key)
+        except Exception:
+            return False
+
+    def _dedup_record(user_id, key):
+        try:
+            with app.app_context():
+                _dedup_persist.record_alert_sent(user_id, key)
+        except Exception:
+            pass
+
+    email_notifier._dedup_check = _dedup_check
+    email_notifier._dedup_record = _dedup_record
+
 # ── API Routes ────────────────────────────────────────────────
 from api.routes import init_routes
 init_routes(app, state_manager, scanner_worker, Config,
