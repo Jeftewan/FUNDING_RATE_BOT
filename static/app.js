@@ -1240,15 +1240,19 @@ function _drawHistoryRows(container, ordered, limit) {
   }).join('');
 
   const hidden = ordered.length - visible.length;
-  const moreBtn = hidden > 0
-    ? `<button class="btn btn-secondary" id="hist-show-more" style="margin-top:8px;width:100%">Ver más (${hidden})</button>`
+  const isCollapsed = limit <= HISTORY_PREVIEW_COUNT;
+  const actionBtn = ordered.length > HISTORY_PREVIEW_COUNT
+    ? (isCollapsed
+        ? `<button class="btn btn-secondary" id="hist-toggle" style="margin-top:8px;width:100%">Ver más (${hidden})</button>`
+        : `<button class="btn btn-secondary" id="hist-toggle" style="margin-top:8px;width:100%">Ver menos</button>`)
     : '';
-  container.innerHTML = rowsHtml + moreBtn;
+  container.innerHTML = rowsHtml + actionBtn;
 
-  const btn = document.getElementById('hist-show-more');
+  const btn = document.getElementById('hist-toggle');
   if (btn) {
     btn.addEventListener('click', () => {
-      _drawHistoryRows(container, ordered, ordered.length);
+      const nextLimit = isCollapsed ? ordered.length : HISTORY_PREVIEW_COUNT;
+      _drawHistoryRows(container, ordered, nextLimit);
     });
   }
 }
