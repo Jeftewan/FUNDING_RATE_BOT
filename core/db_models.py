@@ -134,6 +134,8 @@ class UserHistory(db.Model):
     avg_rate = db.Column(db.Float, default=0)
     reason = db.Column(db.String(50), default="")
     closed_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    # Free-form audit trail (e.g. "manual earnings edit at <ts>"). NULL = no edits.
+    notes = db.Column(db.Text, nullable=True)
 
     user = db.relationship("User", back_populates="history")
 

@@ -9,6 +9,33 @@ from datetime import datetime
 log = logging.getLogger("bot")
 
 
+def build_alert_dedup_key(alert: dict) -> str:
+    """Single source of truth for alert dedup keys.
+
+    Convention: f"{type}:{user_id}:{symbol}:{exchange}:{bucket}" where bucket
+    is funding_ts (int ms or s) for window-bound alerts, or _exc_bucket
+    (YYYYMMDD) for daily broadcasts, or empty string when neither applies.
+    Always returns a string; never None.
+    """
+    if alert.get("dedup_key"):
+        return str(alert["dedup_key"])
+    bucket = alert.get("funding_ts") or alert.get("_exc_bucket") or ""
+    return (
+        f"{alert.get('type','')}:{alert.get('user_id','')}:"
+        f"{alert.get('symbol','')}:{alert.get('exchange','')}:{bucket}"
+    )
+
+
+def valid_telegram_creds(chat_id: str, token: str) -> bool:
+    """Cheap format check before hitting api.telegram.org."""
+    chat = (chat_id or "").strip()
+    tok = (token or "").strip()
+    return (
+        chat.lstrip("-").isdigit() and len(chat) >= 5
+        and ":" in tok and len(tok) >= 20
+    )
+
+
 class EmailNotifier:
     """Telegram notifier (keeps class name for compatibility)."""
 
@@ -23,10 +50,12 @@ class EmailNotifier:
         # Both must run inside a Flask app context (caller's responsibility).
         self._dedup_check = dedup_check
         self._dedup_record = dedup_record
+        # Per-process log throttle for "invalid creds" warnings, keyed by user_id.
+        self._invalid_creds_warned: set = set()
         self._sync_from_state()
 
     def _sync_from_state(self):
-        """Sync Telegram config from state manager."""
+        """Sync Telegram config from state manager (fallback path)."""
         s = self.state_manager.state
         self.enabled = s.get("email_enabled", False)
         self.tg_chat_id = str(s.get("tg_chat_id", "")).strip()
@@ -35,26 +64,39 @@ class EmailNotifier:
         if self.enabled and not all([self.tg_chat_id, self.tg_bot_token]):
             self.enabled = False
 
-    def send_alert(self, alert: dict) -> bool:
-        """Send a single alert via Telegram. Returns True if sent."""
-        self._sync_from_state()
-        if not self.enabled:
-            log.warning(f"Telegram disabled (enabled={self.enabled}, "
-                        f"chat_id={'set' if self.tg_chat_id else 'empty'}, "
-                        f"token={'set' if self.tg_bot_token else 'empty'}), "
+    def send_alert(self, alert: dict, chat_id: str = None, token: str = None) -> bool:
+        """Send a single alert via Telegram. Returns True if sent.
+
+        If chat_id/token are provided, they override the state-derived
+        credentials for this call only (no state mutation, no races across
+        users). Otherwise falls back to state.
+        """
+        if chat_id is None or token is None:
+            self._sync_from_state()
+            chat_id = self.tg_chat_id
+            token = self.tg_bot_token
+            enabled = self.enabled
+        else:
+            chat_id = str(chat_id).strip()
+            token = str(token).strip()
+            enabled = bool(chat_id and token)
+
+        if not enabled:
+            log.warning(f"Telegram disabled (chat_id={'set' if chat_id else 'empty'}, "
+                        f"token={'set' if token else 'empty'}), "
                         f"skipping: {alert.get('type')} {alert.get('symbol')}")
             return False
 
-        # Dedup key MUST include user_id (and ideally a funding-window bucket)
-        # to distinguish the same alert sent to different users in the same
-        # window.  Callers should pass `dedup_key` explicitly; otherwise we
-        # build a best-effort key from the available fields.
+        if not valid_telegram_creds(chat_id, token):
+            uid = alert.get("user_id", "")
+            if uid not in self._invalid_creds_warned:
+                log.warning(f"Telegram: invalid credentials format for user {uid}, "
+                            f"chat_id/token rejected without hitting API")
+                self._invalid_creds_warned.add(uid)
+            return False
+
         user_id = alert.get("user_id", "")
-        alert_key = alert.get("dedup_key") or (
-            f"{alert.get('type','')}_{alert.get('symbol','')}_"
-            f"{alert.get('exchange','')}_{user_id}_"
-            f"{alert.get('funding_ts','')}"
-        )
+        alert_key = build_alert_dedup_key(alert)
         now = time.time()
 
         # Layer 1: persistent dedup across process restarts (DB).
@@ -84,7 +126,7 @@ class EmailNotifier:
         try:
             log.info(f"Sending Telegram: {alert.get('type')} {alert.get('symbol')}...")
             text = self._format_message(alert)
-            self._send_telegram(text)
+            self._send_telegram(text, chat_id, token)
             self._sent_cache[alert_key] = now
             if self._dedup_record and user_id:
                 try:
@@ -97,12 +139,17 @@ class EmailNotifier:
             log.error(f"Telegram send FAILED: {e}")
             return False
 
-    def send_alerts(self, alerts: list) -> int:
-        """Send multiple alerts, returns count sent."""
-        self._sync_from_state()
-        if not self.enabled:
-            log.warning("Telegram alerts skipped: notifications disabled")
-            return 0
+    def send_alerts(self, alerts: list, chat_id: str = None, token: str = None) -> int:
+        """Send multiple alerts, returns count sent.
+
+        If chat_id/token are provided, all alerts are dispatched using those
+        credentials directly — no state mutation, safe across concurrent users.
+        """
+        if chat_id is None or token is None:
+            self._sync_from_state()
+            if not self.enabled:
+                log.warning("Telegram alerts skipped: notifications disabled")
+                return 0
         if not alerts:
             return 0
 
@@ -113,7 +160,7 @@ class EmailNotifier:
 
         sent = 0
         for alert in actionable:
-            if self.send_alert(alert):
+            if self.send_alert(alert, chat_id=chat_id, token=token):
                 sent += 1
         return sent
 
@@ -155,15 +202,21 @@ class EmailNotifier:
 
         return "\n".join(lines)
 
-    def _send_telegram(self, text: str):
-        """Send message via Telegram Bot API (HTTPS POST)."""
-        url = f"https://api.telegram.org/bot{self.tg_bot_token}/sendMessage"
+    def _send_telegram(self, text: str, chat_id: str = None, token: str = None):
+        """Send message via Telegram Bot API (HTTPS POST).
+
+        Uses provided chat_id/token if given, otherwise falls back to the
+        instance attributes synced from state.
+        """
+        chat_id = chat_id if chat_id is not None else self.tg_chat_id
+        token = token if token is not None else self.tg_bot_token
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = json.dumps({
-            "chat_id": self.tg_chat_id,
+            "chat_id": chat_id,
             "text": text,
             "parse_mode": "Markdown",
         }).encode("utf-8")
-        log.debug(f"Telegram: chat_id={self.tg_chat_id}, token={self.tg_bot_token[:8]}...")
+        log.debug(f"Telegram: chat_id={chat_id}, token={token[:8]}...")
         req = urllib.request.Request(
             url, data=payload,
             headers={"Content-Type": "application/json"},

@@ -78,7 +78,7 @@ templates/
 | `users` | Cuentas de usuario (email, password_hash, terms_accepted_at) |
 | `user_configs` | Config por usuario (capital, thresholds, Telegram encrypted) |
 | `user_positions` | Posiciones abiertas con earnings y historial de pagos |
-| `user_history` | Posiciones cerradas para PnL histórico |
+| `user_history` | Posiciones cerradas para PnL histórico (columna `notes` para auditoría de ediciones manuales) |
 | `user_exchange_keys` | API keys de exchanges cifradas (infraestructura lista, no conectada a trading) |
 | `scan_cache` | Último resultado del scan (opportunities_json, defi_json) |
 | `funding_rate_snapshots` | 90 días de tasas históricas, dedup por (symbol, exchange, funding_ts) |
@@ -154,6 +154,36 @@ El historial DeFi se construye desde `funding_rate_snapshots` (no hay API histó
 
 ---
 
+## Dashboard de earnings (Posiciones tab)
+
+Encima del listado de posiciones, la tab "Posiciones" muestra:
+
+- **Capital bar** (existente): Total, En uso, Disponible, Ganancia, contador de posiciones, botón IA.
+- **KPI widgets** (`#earnings-kpis`): Hoy (con delta vs ayer), 7 días (con APR realizado), 30 días, Total (activas + cerradas all-time). Verde/rojo según signo. `static/app.js:loadDailyEarnings()` y `renderEarningsKpis()`.
+- **Gráfica con toggle** (`#earnings-chart`): 
+  - **Cumulativo activas** (default): líneas multi-color por posición sobre `payments_json[].cumulative`, ignora entries con `kind:"manual_adjust"` para no romper la curva. 
+  - **Diario total**: bar chart sobre `series[]` del endpoint, una barra por día (verde si neto≥0, rojo si <0). Incluye cerradas.
+
+Datos provistos por `GET /api/earnings/daily?days=30` → `DBPersistence.aggregate_daily_earnings()` en `core/db_persistence.py`. Bucketing por día local del servidor. Limitación documentada: `realized_apr_7d` usa `capital_in_use` actual como aproximación (no series histórica de capital).
+
+## Edición manual de earnings
+
+**Semántica: valor absoluto reseteable.** El usuario fija un total; el scanner sigue sumando los próximos settlements encima de ese valor. Sin flag de "freeze".
+
+**Posiciones activas** (`PATCH /api/positions/<id>/earnings`, body `{earned}`):
+- Setea `earned_real = nuevo_total`, `last_earn_update = now()`. 
+- `_count_payments_since` ya usa `last_earn_update` como cota inferior, así que los próximos pagos solo cuentan settlements posteriores al ajuste manual — **cero cambios en `_record_earnings`**.
+- Audita appendeando una entrada a `payments_json` con `kind:"manual_adjust"`, `earned=delta`, `cumulative=nuevo_total`. El renderer del chart cumulativo la filtra; el scoring lo ignora (no es una tasa de funding).
+
+**Posiciones cerradas** (`PATCH /api/history/<id>/earnings`, body `{earned?, fees?}`):
+- Edita `earned`/`fees` directamente en `user_history`, recalcula `net_earned = earned - fees`.
+- Cada edición se appendea a `user_history.notes` con timestamp para auditoría.
+- En el UI, las filas editadas muestran un mark `✎`.
+
+UI: `editPosEarnings(posId)` / `editHistEarnings(histId)` en `static/app.js`, mirror del patrón existente `editPosFees`.
+
+---
+
 ## Notificaciones Telegram
 
 **Cada usuario** gestiona sus propias credenciales (modelo self-service):
@@ -163,9 +193,11 @@ El historial DeFi se construye desde `funding_rate_snapshots` (no hay API histó
 3. Pegar ambos en Config del dashboard → "Prueba Telegram"
 
 **Flujo de envío:**
-- `scanner/worker.py:_dispatch_alerts_per_user()` — carga credenciales del usuario desde DB, envía, restaura estado
-- `scanner/worker.py:_broadcast_alerts_all_users()` — oportunidades excepcionales → todos los usuarios con notificaciones activas
-- `notifications/email.py:_send_telegram()` — POST JSON a `api.telegram.org/bot{TOKEN}/sendMessage`
+- `scanner/worker.py:_dispatch_alerts_per_user()` — agrupa alertas por `user_id`, carga credenciales de cada usuario desde DB y las pasa **explícitamente** a `email_notifier.send_alerts(alerts, chat_id=..., token=...)`. No muta el estado compartido (elimina carrera entre usuarios concurrentes). Alertas huérfanas (sin `user_id`) se descartan con `log.warning` en vez de routearse al último chat en memoria.
+- `scanner/worker.py:_broadcast_alerts_all_users()` — oportunidades excepcionales → todos los usuarios con notificaciones activas (mismo mecanismo de credenciales explícitas).
+- `notifications/email.py:_send_telegram(text, chat_id, token)` — POST JSON a `api.telegram.org/bot{TOKEN}/sendMessage`. Acepta credenciales por parámetro; cae a las del state como fallback (path de test).
+- `notifications/email.py:build_alert_dedup_key(alert)` — única fuente de verdad para la dedup_key: `f"{type}:{user_id}:{symbol}:{exchange}:{bucket}"` donde `bucket` es `funding_ts` (ms o s) para alertas window-bound, o `_exc_bucket` (`YYYYMMDD`) para broadcasts diarios.
+- `notifications/email.py:valid_telegram_creds(chat_id, token)` — validación de formato barata antes de golpear la API (chat_id numérico ≥5 chars, token con `:` y ≥20 chars). Si falla, log único por usuario y skip.
 
 **Tipos de alerta:** `RATE_REVERSAL` (crítica), `RATE_DROP`, `PRE_PAYMENT_UNFAVORABLE`, `SL_TP_REVIEW`, `EXCEPTIONAL_OPPORTUNITY`, `SWITCH_OPPORTUNITY`, `POSITION_CLOSED`.
 
@@ -279,6 +311,9 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 | `GET /auth/page` | Pública | `301 → /?login=1` (compat deep-links) |
 | `GET /health` | Pública | JSON (healthcheck Railway) |
 | `GET /api/*` | `@auth_required` | JSON — 401 JSON si no auth |
+| `GET /api/earnings/daily?days=N` | `@auth_required` | Rollup diario combinando activas + cerradas: `{today, yesterday, last_7d, last_30d, all_time, realized_apr_7d, series:[{date, earned, fees, net}]}` |
+| `PATCH /api/positions/<id>/earnings` | `@auth_required` | Body `{earned: float}` — override absoluto reseteable: setea `earned_real` + `last_earn_update=now`, agrega entry `kind:"manual_adjust"` a `payments_json`. Próximos settlements se acumulan encima. |
+| `PATCH /api/history/<id>/earnings` | `@auth_required` | Body `{earned?, fees?}` — edita posición cerrada, recalcula `net_earned`, registra en `notes`. |
 
 **Flujo unauthenticated:** `GET /app` → `unauthorized_handler` → `302 /?login=1` → landing abre modal login.  
 **Flujo logout:** `POST /auth/logout` → `window.location = '/'` (en `static/app.js:doLogout`).  
@@ -318,7 +353,6 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 ### Funcionalidad incompleta (infraestructura lista, falta conectar)
 
 - **Auto-trading**: `user_exchange_keys` almacena API keys cifradas por usuario, la UI tiene skeleton, pero la ejecución automática de órdenes no está implementada. Todo el flujo de abrir/cerrar es manual.
-- **Gráfica de earnings**: DOM preparado en templates, Chart.js disponible, la vinculación de datos al canvas no está terminada.
 - **Coinglass**: cliente existe en `coinglass/client.py`, no integrado en el flujo principal.
 
 ### Mejoras identificadas
@@ -362,6 +396,7 @@ curl -X POST http://localhost:5000/api/force
 
 | Hash | Cambio |
 |------|--------|
+| `pending` | feat(positions): minidashboard de earnings (KPIs hoy/7d/30d/total + chart toggle cumulativo/diario), edición manual de earnings en activas y cerradas, limpieza flujo Telegram (credenciales explícitas sin mutar state, dedup_key consolidada, validación de formato, drop orphan alerts, fix logs legacy WhatsApp) |
 | `ec872cd` | feat(routing): landing pública en `/`, dashboard SPA en `/app`, login modal en landing |
 | `85b4f6a` | Fix timing captura tasa al pago: fetch_settlement_rate CEX/DeFi, triggers 3→2 |
 | `f410ecb` | RAM: acotar caches in-memory; fix switch_analyzer cross-exchange (opp_rate, current_score, market_rate) |
