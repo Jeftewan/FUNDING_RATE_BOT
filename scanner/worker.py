@@ -288,13 +288,16 @@ class ScannerWorker:
                 try:
                     sent = self._dispatch_alerts_per_user(alerts)
                     log.info(f"Telegram: {sent}/{len(alerts)} alert(s) sent")
-                    if sent > 0:
-                        from notifications.email import build_alert_dedup_key
-                        now_ts = time.time()
-                        for a in alerts:
-                            self._notified_alerts[build_alert_dedup_key(a)] = now_ts
-                        with self.state_manager.lock:
-                            self.state_manager.state["alerts"] = []
+                    # Register ALL dispatched alerts in _notified_alerts regardless
+                    # of whether they were actually sent or dedup-skipped at the
+                    # Telegram layer.  Without this, dedup-skipped alerts would
+                    # keep being re-generated on every tick, flooding the logs.
+                    from notifications.email import build_alert_dedup_key
+                    now_ts = time.time()
+                    for a in alerts:
+                        self._notified_alerts[build_alert_dedup_key(a)] = now_ts
+                    with self.state_manager.lock:
+                        self.state_manager.state["alerts"] = []
                 except Exception as e:
                     log.error(f"Telegram dispatch error: {e}")
 
