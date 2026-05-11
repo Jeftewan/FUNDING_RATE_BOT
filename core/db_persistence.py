@@ -16,6 +16,53 @@ _global_score_cache = {"ts": 0, "p95": None, "count": 0}
 class DBPersistence:
     """Reads/writes user state from PostgreSQL via SQLAlchemy models."""
 
+    # ── Telegram notification dedup ───────────────────────────────
+
+    def was_alert_sent(self, user_id, dedup_key: str,
+                       window_seconds: int = 24 * 3600) -> bool:
+        """Return True if (user_id, dedup_key) was logged within the window."""
+        if not user_id or not dedup_key:
+            return False
+        try:
+            from core.database import db
+            cutoff = datetime.now(timezone.utc).timestamp() - window_seconds
+            row = db.session.execute(
+                db.text(
+                    "SELECT 1 FROM notification_log "
+                    "WHERE user_id = :uid AND dedup_key = :k "
+                    "AND EXTRACT(EPOCH FROM sent_at) > :cutoff LIMIT 1"
+                ),
+                {"uid": int(user_id), "k": dedup_key[:256], "cutoff": cutoff},
+            ).first()
+            return row is not None
+        except Exception as e:
+            log.debug(f"was_alert_sent failed (allowing send): {e}")
+            return False
+
+    def record_alert_sent(self, user_id, dedup_key: str) -> None:
+        """Persist that (user_id, dedup_key) was just sent. Idempotent."""
+        if not user_id or not dedup_key:
+            return
+        try:
+            from core.database import db
+            db.session.execute(
+                db.text(
+                    "INSERT INTO notification_log (user_id, dedup_key, sent_at) "
+                    "VALUES (:uid, :k, NOW()) "
+                    "ON CONFLICT (user_id, dedup_key) "
+                    "DO UPDATE SET sent_at = EXCLUDED.sent_at"
+                ),
+                {"uid": int(user_id), "k": dedup_key[:256]},
+            )
+            db.session.commit()
+        except Exception as e:
+            log.warning(f"record_alert_sent failed: {e}")
+            try:
+                from core.database import db
+                db.session.rollback()
+            except Exception:
+                pass
+
     def load_user_state(self, user_id: int) -> dict:
         """Load per-user state as a dict (matching StateManager format)."""
         from core.database import db
@@ -25,7 +72,7 @@ class DBPersistence:
         config = UserConfig.query.filter_by(user_id=user_id).first()
         positions = UserPosition.query.filter_by(user_id=user_id, status="active").all()
         history = UserHistory.query.filter_by(user_id=user_id).order_by(
-            UserHistory.closed_at.desc()).limit(100).all()
+            UserHistory.closed_at.desc()).limit(500).all()
 
         state = {
             "total_capital": config.total_capital if config else 1000,

@@ -46,8 +46,12 @@ class ScannerWorker:
         self._started = False
         self._last_scan_ts = 0
         self._scan_lock = threading.Lock()
-        self._scanned_events = set()
-        self._notified_alerts = set()
+        # {event_key: timestamp} — purged by age in _cleanup_events.
+        self._scanned_events: dict = {}
+        # {alert_dedup_key: timestamp} — purged by age in _cleanup_events.
+        # Keys are the same dedup_key carried on each alert dict so we never
+        # re-emit a key for the same funding window.
+        self._notified_alerts: dict = {}
         self._sl_tp_review_sent = {}  # {position_id: last_sent_timestamp}
         self._db_persist = None  # Lazy-init DBPersistence
         self._last_switch_analysis = 0  # Timestamp of last switch analysis
@@ -231,8 +235,9 @@ class ScannerWorker:
 
             if triggered_keys:
                 scan_reason = " + ".join(triggered_labels)
+                now_ts = time.time()
                 for ek in triggered_keys:
-                    self._scanned_events.add(ek)
+                    self._scanned_events[ek] = now_ts
 
         # Trigger scan if needed (outside lock)
         if scan_reason:
@@ -284,9 +289,14 @@ class ScannerWorker:
                     sent = self._dispatch_alerts_per_user(alerts)
                     log.info(f"WhatsApp: {sent}/{len(alerts)} alert(s) sent")
                     if sent > 0:
+                        now_ts = time.time()
                         for a in alerts:
-                            key = f"{a['type']}_{a['symbol']}_{a.get('exchange', '')}"
-                            self._notified_alerts.add(key)
+                            key = a.get("dedup_key") or (
+                                f"{a['type']}_{a['symbol']}_"
+                                f"{a.get('exchange', '')}_{a.get('user_id','')}_"
+                                f"{a.get('funding_ts','')}"
+                            )
+                            self._notified_alerts[key] = now_ts
                         with self.state_manager.lock:
                             self.state_manager.state["alerts"] = []
                 except Exception as e:
@@ -417,15 +427,30 @@ class ScannerWorker:
         sent_total = 0
         try:
             for cfg in user_configs:
+                uid = cfg["user_id"]
                 with self.state_manager.lock:
                     s = self.state_manager.state
                     s["email_enabled"] = True
                     s["tg_chat_id"] = cfg["tg_chat_id"]
                     s["tg_bot_token"] = cfg["tg_bot_token"]
+                # Personalize each alert copy with the recipient's user_id and
+                # a dedup_key that includes it.  Without this, the in-memory
+                # cooldown and the DB dedup would both collapse to a single
+                # key across all users and only the first would actually send.
+                per_user_alerts = []
+                for a in alerts:
+                    a2 = dict(a)
+                    a2["user_id"] = uid
+                    bucket = a2.get("funding_ts", a2.get("_exc_bucket", ""))
+                    a2["dedup_key"] = (
+                        f"{a2.get('type','')}_{a2.get('symbol','')}_"
+                        f"{a2.get('exchange','')}_{uid}_{bucket}"
+                    )
+                    per_user_alerts.append(a2)
                 try:
-                    sent_total += self.email_notifier.send_alerts(alerts)
+                    sent_total += self.email_notifier.send_alerts(per_user_alerts)
                 except Exception as e:
-                    log.error(f"Broadcast: send failed for user {cfg['user_id']}: {e}")
+                    log.error(f"Broadcast: send failed for user {uid}: {e}")
         finally:
             with self.state_manager.lock:
                 s = self.state_manager.state
@@ -507,7 +532,14 @@ class ScannerWorker:
                     if alerts is not None and result["recommendation"] == "SWITCH":
                         best = result.get("best_switch")
                         if best:
-                            alert_key = f"SWITCH_{pos.get('symbol')}_{pos_id}"
+                            # Daily bucket — at most one SWITCH alert per
+                            # position per day per target.
+                            day = datetime.now().strftime("%Y%m%d")
+                            alert_key = (
+                                f"SWITCH_OPPORTUNITY_{pos.get('symbol','')}_"
+                                f"{pos_id}_{pos.get('user_id','')}_"
+                                f"{best.get('symbol','')}_{best.get('exchange','')}_{day}"
+                            )
                             if alert_key not in self._notified_alerts:
                                 alerts.append({
                                     "type": "SWITCH_OPPORTUNITY",
@@ -515,6 +547,8 @@ class ScannerWorker:
                                     "symbol": pos.get("symbol", ""),
                                     "exchange": pos.get("exchange", ""),
                                     "user_id": pos.get("user_id"),
+                                    "funding_ts": day,
+                                    "dedup_key": alert_key,
                                     "message": (
                                         f"Alternativa superior: {best['symbol']} en {best['exchange']} "
                                         f"APR {best['apr']:.1f}%. "
@@ -522,7 +556,7 @@ class ScannerWorker:
                                         f"Break-even: {best['break_even_h']:.0f}h"
                                     ),
                                 })
-                                self._notified_alerts.add(alert_key)
+                                self._notified_alerts[alert_key] = time.time()
 
                 # Drop switch results of closed positions to bound memory.
                 active_ids = {str(p.get("id", "")) for p in positions}
@@ -534,15 +568,39 @@ class ScannerWorker:
                 log.info(f"Switch analysis: {len(self._switch_results)} positions analyzed")
 
     def _cleanup_events(self):
-        """Remove old tracking entries to avoid memory growth."""
-        if len(self._scanned_events) > 200:
-            self._scanned_events.clear()
-        # Alert keys are formed as TIPO_SYMBOL_EXCHANGE with no timestamp,
-        # so we cap and reset when the set grows beyond typical volume.
-        if len(self._notified_alerts) > 500:
-            self._notified_alerts.clear()
+        """Remove old tracking entries to avoid memory growth.
+
+        Age-based purge — the dedup keys carry their own funding-window
+        bucket so distinct buckets produce distinct keys; we only need to
+        forget keys that are safely past their window.  No wholesale clear()
+        that would let an in-flight alert re-fire.
+        """
+        now = time.time()
+
+        # Scanned events: 12h is more than any single funding interval.
+        cutoff_events = now - 12 * 3600
+        self._scanned_events = {
+            k: ts for k, ts in self._scanned_events.items() if ts > cutoff_events
+        }
+        if len(self._scanned_events) > 2000:
+            # Defensive cap: drop oldest half.
+            keep = sorted(self._scanned_events.items(), key=lambda kv: kv[1])
+            self._scanned_events = dict(keep[len(keep) // 2:])
+
+        # Notified alerts: 24h covers all funding windows + daily buckets
+        # (EXCEPTIONAL/SWITCH).  Persistent dedup in the DB (notification_log)
+        # is the source of truth across restarts; this is just the in-process
+        # short-cut.
+        cutoff_alerts = now - 24 * 3600
+        self._notified_alerts = {
+            k: ts for k, ts in self._notified_alerts.items() if ts > cutoff_alerts
+        }
+        if len(self._notified_alerts) > 2000:
+            keep = sorted(self._notified_alerts.items(), key=lambda kv: kv[1])
+            self._notified_alerts = dict(keep[len(keep) // 2:])
+
         # _sl_tp_review_sent stores timestamps, purge entries older than 24h.
-        cutoff = time.time() - 86400
+        cutoff = now - 86400
         self._sl_tp_review_sent = {
             k: v for k, v in self._sl_tp_review_sent.items() if v > cutoff
         }
@@ -695,12 +753,18 @@ class ScannerWorker:
                                 ekey = f"{sym}_{ex}"
                                 current_exceptional_keys.add(ekey)
                                 if ekey not in self._prev_exceptional_keys:
+                                    day = datetime.now().strftime("%Y%m%d")
                                     exceptional_alerts.append({
                                         "type": "EXCEPTIONAL_OPPORTUNITY",
                                         "severity": "INFO",
                                         "symbol": sym,
                                         "exchange": ex,
                                         "_score": score,
+                                        "funding_ts": day,
+                                        # user_id/dedup_key are injected per
+                                        # recipient in _broadcast_alerts_all_users
+                                        # so each user has their own dedup row.
+                                        "_exc_bucket": day,
                                         "message": (
                                             f"Oportunidad excepcional: {sym} en {ex}. "
                                             f"Score {score}, APR {opp.get('apr', 0):.1f}%. "
@@ -1293,6 +1357,10 @@ class ScannerWorker:
                 cfr = short_d["fr"] - long_d["fr"]
                 mins_candidates = [d for d in (long_d, short_d) if d.get("mins_next", -1) >= 0]
                 mins_next = min((d["mins_next"] for d in mins_candidates), default=-1)
+                # Use the soonest funding_ts of the two legs as the window bucket
+                nts_candidates = [d.get("next_funding_ts", 0) for d in (long_d, short_d)
+                                  if d.get("next_funding_ts", 0)]
+                funding_ts = min(nts_candidates) if nts_candidates else 0
                 display_ex = f"{short_ex}/{long_ex}"
             else:
                 cur = self._find_data(pos, all_data)
@@ -1300,48 +1368,68 @@ class ScannerWorker:
                     continue
                 cfr = cur["fr"]
                 mins_next = cur.get("mins_next", -1)
+                funding_ts = cur.get("next_funding_ts", 0) or 0
                 display_ex = pos["exchange"]
 
             sym = pos["symbol"]
             uid = pos.get("user_id", "")
+            # Funding window bucket: distinct alerts per funding period.  For
+            # PRE_PAYMENT_UNFAVORABLE this is the upcoming settlement; for
+            # RATE_REVERSAL/RATE_DROP we still tie to the current window so
+            # the same condition mid-window doesn't re-fire on every tick.
+            bucket = int(funding_ts) if funding_ts else 0
 
             if (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
-                key = f"RATE_REVERSAL_{sym}_{display_ex}_{uid}"
+                key = f"RATE_REVERSAL_{sym}_{display_ex}_{uid}_{bucket}"
                 active_keys.add(key)
                 if key not in self._notified_alerts:
                     alerts.append({
                         "type": "RATE_REVERSAL", "severity": "CRITICAL",
                         "position_idx": i, "symbol": sym, "exchange": display_ex,
                         "user_id": pos.get("user_id"),
+                        "funding_ts": bucket,
+                        "dedup_key": key,
                         "message": f"Funding rate cambio de signo: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
                     })
             elif abs(cfr) < abs(pos["entry_fr"]) * 0.25:
-                key = f"RATE_DROP_{sym}_{display_ex}_{uid}"
+                key = f"RATE_DROP_{sym}_{display_ex}_{uid}_{bucket}"
                 active_keys.add(key)
                 if key not in self._notified_alerts:
                     alerts.append({
                         "type": "RATE_DROP", "severity": "WARNING",
                         "position_idx": i, "symbol": sym, "exchange": display_ex,
                         "user_id": pos.get("user_id"),
+                        "funding_ts": bucket,
+                        "dedup_key": key,
                         "message": f"Rate cayo >75%: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
                     })
 
             if 0 < mins_next <= alert_mins:
                 if cfr <= 0 and pos["entry_fr"] > 0:
-                    key = f"PRE_PAYMENT_UNFAVORABLE_{sym}_{display_ex}_{uid}"
+                    key = f"PRE_PAYMENT_UNFAVORABLE_{sym}_{display_ex}_{uid}_{bucket}"
                     active_keys.add(key)
                     if key not in self._notified_alerts:
                         alerts.append({
                             "type": "PRE_PAYMENT_UNFAVORABLE", "severity": "WARNING",
                             "position_idx": i, "symbol": sym, "exchange": display_ex,
                             "user_id": pos.get("user_id"),
+                            "funding_ts": bucket,
+                            "dedup_key": key,
                             "message": f"Proximo pago en {mins_next:.0f}min — tasa desfavorable: {cfr*100:.4f}%",
                         })
 
-        stale = self._notified_alerts - active_keys
+        # Allow alerts to re-fire when the condition has cleared on the
+        # current scan (e.g. funding flipped back to favorable).  Only
+        # touches keys for the currently-active alert types/funding windows
+        # — leaves daily-bucket keys (EXCEPTIONAL/SWITCH) untouched.
+        stale = [k for k in self._notified_alerts if (
+            k.startswith(("RATE_REVERSAL_", "RATE_DROP_", "PRE_PAYMENT_UNFAVORABLE_"))
+            and k not in active_keys
+        )]
         if stale:
             log.info(f"Alert conditions cleared: {stale}")
-            self._notified_alerts -= stale
+            for k in stale:
+                self._notified_alerts.pop(k, None)
 
         return alerts
 
@@ -1372,12 +1460,19 @@ class ScannerWorker:
                 ex = f"{pos.get('short_exchange', '')}/{pos.get('long_exchange', '')}"
             earned = pos.get("earned_real", 0) or 0
 
+            # 144h review buckets so each SL/TP cycle is a distinct dedup key.
+            review_bucket = int(now // SL_TP_REVIEW_INTERVAL)
             alerts.append({
                 "type": "SL_TP_REVIEW",
                 "severity": "WARNING",
                 "symbol": sym,
                 "exchange": ex,
                 "user_id": pos.get("user_id"),
+                "funding_ts": review_bucket,
+                "dedup_key": (
+                    f"SL_TP_REVIEW_{sym}_{ex}_{pos.get('user_id','')}_"
+                    f"{pos_id}_{review_bucket}"
+                ),
                 "message": (
                     f"Posicion abierta {elapsed_h:.0f}h ({elapsed_h/24:.0f} dias) "
                     f"— revisar SL/TP. Ganancia acum: ${earned:.2f}"
