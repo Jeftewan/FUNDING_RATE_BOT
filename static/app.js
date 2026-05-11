@@ -1208,8 +1208,7 @@ function renderHistory(data) {
     </div>`;
     return;
   }
-  const ordered = history.slice().reverse();
-  _drawHistoryRows(el, ordered, HISTORY_PREVIEW_COUNT);
+  _drawHistoryRows(el, history, HISTORY_PREVIEW_COUNT);
 }
 
 function _drawHistoryRows(container, ordered, limit) {
