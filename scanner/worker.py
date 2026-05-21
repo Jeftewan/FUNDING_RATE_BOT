@@ -1004,7 +1004,7 @@ class ScannerWorker:
         now = time.time()
         updated = []
         for pos in positions:
-            old_earned = pos.get("earned_real", 0)
+            pos.pop("_earnings_updated", None)
             mode = pos.get("mode", "spot_perp")
 
             if mode == "spot_perp":
@@ -1012,8 +1012,7 @@ class ScannerWorker:
             else:
                 self._update_cross_exchange_earnings(pos, all_data, now)
 
-            if pos.get("earned_real", 0) != old_earned:
-                pos["_earnings_updated"] = True
+            if pos.get("_earnings_updated"):
                 updated.append(pos)
         return updated
 
@@ -1270,6 +1269,7 @@ class ScannerWorker:
         pos["last_fr_used"] = rate
         pos["payment_count"] = len(pos["payments"])
         pos["avg_rate"] = sum(p["rate"] for p in pos["payments"]) / len(pos["payments"])
+        pos["_earnings_updated"] = True
 
         if earned_now > 0:
             log.info(f"  +${earned_now:.4f} {pos['symbol']} ({full_ivs}ivs @ {rate*100:.4f}%)")
