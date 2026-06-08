@@ -136,6 +136,25 @@ class DBPersistence:
                 })
         return result
 
+    def load_user_exchange_keys(self, user_id: int, exchange_name: str) -> dict:
+        """Return decrypted API creds for one exchange, or None if absent.
+
+        Shape: {"api_key", "api_secret", "passphrase"}. Used by the order
+        executor to build an authenticated per-user CCXT client.
+        """
+        from core.db_models import UserExchangeKey
+        from core.encryption import decrypt_value
+
+        row = UserExchangeKey.query.filter_by(
+            user_id=user_id, exchange_name=exchange_name).first()
+        if not row or not row.api_key_encrypted:
+            return None
+        return {
+            "api_key": decrypt_value(row.api_key_encrypted),
+            "api_secret": decrypt_value(row.api_secret_encrypted),
+            "passphrase": decrypt_value(row.passphrase_encrypted),
+        }
+
     def save_position(self, user_id: int, pos_dict: dict) -> int:
         """Create a new position in DB. Returns position ID."""
         from core.database import db
@@ -175,7 +194,8 @@ class DBPersistence:
             exit_fees_est=pos_dict.get("exit_fees_est", 0),
             entry_fees_real=pos_dict.get("entry_fees_real"),
             exit_fees_real=pos_dict.get("exit_fees_real"),
-            payments_json=[],
+            auto_executed=bool(pos_dict.get("auto_executed", False)),
+            payments_json=pos_dict.get("payments_json") or [],
         )
         db.session.add(pos)
         db.session.commit()
@@ -292,6 +312,7 @@ class DBPersistence:
             "exit_fees_est": pos.exit_fees_est or 0,
             "entry_fees_real": pos.entry_fees_real,
             "exit_fees_real": pos.exit_fees_real,
+            "auto_executed": bool(getattr(pos, "auto_executed", False)),
             "payments": pos.payments_json or [],
         }
 

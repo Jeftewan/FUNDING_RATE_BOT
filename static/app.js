@@ -3,6 +3,25 @@ let currentSubTab = 'cex';
 let refreshTimer = null;
 const calcCache = {};  // oppId -> { html, capVal, levVal }
 
+// ── Auto-execution state ──────────────────────────────────────
+const CEX_EXCHANGES = ['binance', 'bybit', 'okx', 'bitget'];
+let _oppMeta = {};            // oppId -> {symbol, mode, exchange, long_exchange, short_exchange, has_spot}
+let _cexKeys = new Set();     // lowercased exchange names the user has keys for
+let _cexKeysLoaded = false;
+let _execContinue = null;     // continuation set by a dry-run result modal
+
+async function loadUserKeys() {
+  try {
+    const res = await fetch('/api/account');
+    if (res.status === 401) return;
+    const data = await res.json();
+    if (!data.ok) return;
+    _cexKeys = new Set((data.exchange_keys || [])
+      .filter(k => k.has_key).map(k => (k.exchange || '').toLowerCase()));
+    _cexKeysLoaded = true;
+  } catch (e) { /* non-fatal */ }
+}
+
 // ── Toast notification system ────────────────────────────────
 function showToast(msg, type = 'info', duration = 4000) {
   const container = document.getElementById('toast-container');
@@ -500,6 +519,7 @@ function renderOpps(data) {
         <label class="inp-label">Apal.<input type="number" id="lev-${i}" placeholder="1x" value="1" min="1" max="50" class="inp-sm" style="width:40px"></label>
         <button class="btn btn-calc" onclick="calcEst('${o._id}',${i})">Calc</button>
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${i})">Entrar</button>
+        ${execButton(o, i)}
       </div>
       <div class="opp-est" id="est-${i}"></div>
       ${o.ai_analysis ? `
@@ -515,6 +535,15 @@ function renderOpps(data) {
       </div>` : ''}
     </div>`;
   }).join('');
+
+  // Cache opp metadata for the auto-execution confirm modal.
+  opps.forEach(o => {
+    _oppMeta[o._id] = {
+      symbol: o.symbol, mode: o.mode, exchange: o.exchange,
+      long_exchange: o.long_exchange, short_exchange: o.short_exchange,
+      has_spot: o.has_spot,
+    };
+  });
 
   // Restore cached calculation results and input values
   opps.forEach((o, i) => {
@@ -830,6 +859,187 @@ function closeModal() {
   document.getElementById('modal').classList.remove('open');
 }
 
+// ── Auto-execution (real orders via API keys) ─────────────────
+function posIsCex(p) {
+  const legs = p.mode === 'cross_exchange'
+    ? [p.long_exchange, p.short_exchange] : [p.exchange];
+  return legs.every(e => CEX_EXCHANGES.includes((e || '').toLowerCase()));
+}
+
+function execEligibility(meta) {
+  // meta: {mode, exchange, long_exchange, short_exchange, has_spot}
+  const isCross = meta.mode === 'cross_exchange';
+  const legs = isCross ? [meta.long_exchange, meta.short_exchange] : [meta.exchange];
+  if (meta.mode === 'defi' || !legs.every(e => CEX_EXCHANGES.includes((e || '').toLowerCase()))) {
+    return { ok: false, tip: 'Solo CEX (DeFi / on-chain → flujo manual)' };
+  }
+  if (!isCross && meta.has_spot === false) {
+    return { ok: false, tip: 'Spot no operable por API (Alpha/Onchain/Web3) → manual' };
+  }
+  if (_cexKeysLoaded) {
+    const missing = legs.filter(e => !_cexKeys.has((e || '').toLowerCase()));
+    if (missing.length) {
+      return { ok: false, tip: `Configura las API keys de ${missing.join(', ')} en la pestaña Cuenta` };
+    }
+  }
+  return { ok: true, tip: 'Coloca las órdenes reales por API' };
+}
+
+function execButton(o, i) {
+  const el = execEligibility({
+    mode: o.mode, exchange: o.exchange,
+    long_exchange: o.long_exchange, short_exchange: o.short_exchange,
+    has_spot: o.has_spot,
+  });
+  const dis = el.ok ? '' : 'disabled';
+  return `<button class="btn btn-exec" ${dis} title="${el.tip}" onclick="autoExecuteOpen('${o._id}',${i})" data-oid="${o._id}">Ejecutar</button>`;
+}
+
+async function autoExecuteOpen(oppId, idx) {
+  // idx may be -1 (button built without index): resolve the input by data attr.
+  const capEl = idx >= 0 ? document.getElementById('cap-' + idx)
+    : document.querySelector(`[data-oid="${oppId}"]`)?.closest('.opp-actions')?.querySelector('input[id^="cap-"]');
+  const levEl = idx >= 0 ? document.getElementById('lev-' + idx)
+    : document.querySelector(`[data-oid="${oppId}"]`)?.closest('.opp-actions')?.querySelector('input[id^="lev-"]');
+  const cap = parseFloat(capEl?.value);
+  const lev = parseInt(levEl?.value) || 1;
+  if (!cap || cap <= 0) { showToast('Ingresa capital primero', 'warning'); return; }
+
+  const meta = { ..._oppMeta[oppId], capital: cap, leverage: lev };
+  const choice = await showExecConfirm('open', meta);
+  if (choice === 'cancel') return;
+  await runExec('/api/execute_open',
+    { opportunity_id: oppId, capital: cap, leverage: lev, dry_run: choice === 'dry' },
+    choice === 'dry', 'open', `Apertura ${meta.symbol}`);
+}
+
+async function autoExecuteClose(posId, symbol) {
+  const p = (_lastPosData?.positions || []).find(x => String(x.id) === String(posId)) || {};
+  const meta = {
+    symbol, mode: p.mode, exchange: p.exchange,
+    long_exchange: p.long_exchange, short_exchange: p.short_exchange, _close: true,
+  };
+  const choice = await showExecConfirm('close', meta);
+  if (choice === 'cancel') return;
+  await runExec('/api/execute_close',
+    { position_id: posId, dry_run: choice === 'dry' },
+    choice === 'dry', 'close', `Cierre ${symbol}`);
+}
+
+function showExecConfirm(kind, meta) {
+  const isCross = meta.mode === 'cross_exchange';
+  const sym = meta.symbol;
+  let legsHtml;
+  if (kind === 'open') {
+    legsHtml = isCross
+      ? `<li><strong>Long PERP</strong> ${sym} en <strong>${meta.long_exchange}</strong> · límite</li>
+         <li><strong>Short PERP</strong> ${sym} en <strong>${meta.short_exchange}</strong> · límite (90s, aborta si solo 1 llena)</li>`
+      : `<li><strong>Long SPOT</strong> ${sym} en <strong>${meta.exchange}</strong> · límite al mid (60s)</li>
+         <li><strong>Short PERP</strong> ${sym} en <strong>${meta.exchange}</strong> · market al llenarse el spot</li>`;
+  } else {
+    legsHtml = isCross
+      ? `<li>Cerrar <strong>Long</strong> en ${meta.long_exchange} y <strong>Short</strong> en ${meta.short_exchange} · market</li>`
+      : `<li>Vender <strong>SPOT</strong> y cerrar <strong>SHORT perp</strong> en ${meta.exchange} · market</li>`;
+  }
+  const head = kind === 'open'
+    ? `Vas a abrir una posición real x${meta.leverage} con $${meta.capital} de capital.`
+    : `Vas a cerrar la posición real de ${sym}.`;
+
+  return new Promise(resolve => {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirm-overlay';
+    overlay.innerHTML = `
+      <div class="confirm-box exec-box">
+        <div class="exec-title">${kind === 'open' ? 'Ejecutar órdenes' : 'Cerrar posición'} — ${sym}</div>
+        <div class="exec-sub">${head}</div>
+        <ul class="exec-legs">${legsHtml}</ul>
+        ${kind === 'open' ? `<div class="exec-note">Asegúrate de tener fondos en la wallet correcta (spot y futures). El bot no transfiere entre wallets.</div>` : ''}
+        <div class="exec-warn">⚠ Esto coloca órdenes con dinero real en tu cuenta.</div>
+        <div class="confirm-actions exec-actions">
+          <button class="btn btn-secondary" data-action="cancel">Cancelar</button>
+          <button class="btn btn-calc" data-action="dry" title="Validar sin enviar órdenes">Simular</button>
+          <button class="btn btn-danger" data-action="real">${kind === 'open' ? 'Ejecutar órdenes reales' : 'Cerrar de verdad'}</button>
+        </div>
+      </div>`;
+    const close = (val) => { overlay.remove(); document.removeEventListener('keydown', onEsc); resolve(val); };
+    overlay.querySelector('[data-action="cancel"]').onclick = () => close('cancel');
+    overlay.querySelector('[data-action="dry"]').onclick = () => close('dry');
+    overlay.querySelector('[data-action="real"]').onclick = () => close('real');
+    overlay.onclick = (e) => { if (e.target === overlay) close('cancel'); };
+    const onEsc = (e) => { if (e.key === 'Escape') close('cancel'); };
+    document.addEventListener('keydown', onEsc);
+    document.body.appendChild(overlay);
+    overlay.querySelector('[data-action="cancel"]').focus();
+  });
+}
+
+async function runExec(url, body, isDry, kind, title) {
+  const ov = document.createElement('div');
+  ov.className = 'exec-loading';
+  ov.innerHTML = `<div class="exec-spinner"></div><div class="exec-loading-txt">${isDry ? 'Simulando…' : 'Ejecutando órdenes…'}</div>`;
+  document.body.appendChild(ov);
+  try {
+    const res = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      // A dry run can be promoted to a real run from the result modal.
+      _execContinue = isDry ? () => runExec(url, { ...body, dry_run: false }, false, kind, title) : null;
+      showExecResult(title, data, isDry);
+      if (!isDry) {
+        if (kind === 'open') loadCurrentOpps();
+        if (kind === 'close') loadPositions();
+      }
+    } else {
+      showToast(data.msg || 'Ejecución fallida', 'error', 7000);
+    }
+  } catch (e) {
+    showToast('Error de red al ejecutar', 'error');
+  } finally {
+    ov.remove();
+  }
+}
+
+function showExecResult(title, data, isDry) {
+  const ex = data.exec || {};
+  const legs = ex.legs || [];
+  const rows = legs.map(l => `
+    <tr>
+      <td>${l.side === 'buy' ? 'Compra' : 'Venta'} ${l.kind || ''}</td>
+      <td>${l.exchange || ''} ${l.symbol || ''}</td>
+      <td>${l.amount != null ? (+l.amount).toPrecision(4) : '—'}</td>
+      <td>${l.price != null ? '$' + (+l.price).toPrecision(6) : (l.type || '—')}</td>
+      <td>${l.fee_usd != null ? '$' + (+l.fee_usd).toFixed(4) : '—'}</td>
+    </tr>`).join('');
+  const fees = ex.entry_fees_usd != null ? ex.entry_fees_usd
+    : (ex.exit_fees_usd != null ? ex.exit_fees_usd : null);
+  const ids = (ex.order_ids || []).filter(Boolean).join(', ');
+
+  document.getElementById('modal-title').textContent =
+    `${title} ${isDry ? '· SIMULACIÓN' : '· Ejecutado'}`;
+  document.getElementById('modal-body').innerHTML = `
+    ${isDry ? '<div class="exec-warn" style="margin-bottom:8px">Simulación — no se enviaron órdenes.</div>'
+            : '<div class="exec-ok">✓ Órdenes colocadas correctamente.</div>'}
+    <table class="exec-table">
+      <thead><tr><th>Lado</th><th>Mercado</th><th>Cant.</th><th>Precio</th><th>Fee</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5">Sin detalle de piernas</td></tr>'}</tbody>
+    </table>
+    <div class="est-summary">
+      ${fees != null ? `<div class="est-row"><span>Fees ${data.exec.exit_fees_usd != null ? 'de salida' : 'de entrada'}</span><span class="est-val">$${(+fees).toFixed(4)}</span></div>` : ''}
+      ${ids ? `<div class="est-row"><span>Órdenes</span><span style="font-size:10px">${ids}</span></div>` : ''}
+    </div>
+    ${isDry && _execContinue ? `<button class="btn btn-danger" style="width:100%;margin-top:10px" onclick="(window._runExecContinue&&window._runExecContinue())">Ejecutar órdenes reales</button>` : ''}`;
+  document.getElementById('modal').classList.add('open');
+}
+
+// Bridge for the dry-run result modal's "execute for real" button.
+window._runExecContinue = function () {
+  closeModal();
+  if (_execContinue) { const fn = _execContinue; _execContinue = null; fn(); }
+};
+
 // ── Positions ─────────────────────────────────────────────────
 async function loadPositions() {
   const posEl = document.getElementById('pos-list');
@@ -969,8 +1179,12 @@ function renderPositions(data) {
           <span class="pos-symbol">${p.symbol}</span>
           <span class="opp-mode">${mode}</span>
           <span class="opp-exchange">${exchange}</span>
+          ${p.auto_executed ? '<span class="ind-badge badge-auto" title="Posición abierta automáticamente por API">AUTO</span>' : ''}
         </div>
-        <button class="btn btn-danger" onclick="closePos('${posId}','${p.symbol}')">Cerrar</button>
+        <div class="pos-header-actions">
+          ${posIsCex(p) ? `<button class="btn btn-exec" onclick="autoExecuteClose('${posId}','${p.symbol}')" title="Cerrar colocando órdenes reales">Cerrar (auto)</button>` : ''}
+          <button class="btn btn-danger" onclick="closePos('${posId}','${p.symbol}')">Cerrar</button>
+        </div>
       </div>
 
       <div class="pos-grid">
@@ -1714,12 +1928,18 @@ async function loadAccount() {
             <label>API Secret<input type="password" id="ek-secret-${ex}" class="inp" placeholder="${hasKey ? '••••••••' : 'API Secret'}"></label>
             ${ex === 'OKX' || ex === 'Bitget' ? `<label>Passphrase<input type="password" id="ek-pass-${ex}" class="inp" placeholder="${hasKey ? '••••••••' : 'Passphrase'}"></label>` : ''}
           </div>
-          <div style="margin-top:8px;display:flex;gap:8px">
+          <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
             <button class="btn btn-primary" onclick="saveExchangeKey('${ex}')" style="font-size:11px;padding:4px 12px">Guardar</button>
+            ${hasKey ? `<button class="btn btn-calc" onclick="testExchangeKey('${ex}')" style="font-size:11px;padding:4px 12px">Probar conexión</button>` : ''}
             ${hasKey ? `<button class="btn btn-danger" onclick="deleteExchangeKey('${ex}')" style="font-size:11px;padding:4px 12px">Eliminar</button>` : ''}
+            <span id="ek-status-${ex}" style="font-size:11px;align-self:center"></span>
           </div>
         </div>`;
     }).join('');
+    // Keep the auto-execution key set in sync with what's configured.
+    _cexKeys = new Set((data.exchange_keys || [])
+      .filter(k => k.has_key).map(k => (k.exchange || '').toLowerCase()));
+    _cexKeysLoaded = true;
   } catch (e) {
     console.error('loadAccount error:', e);
   }
@@ -1741,6 +1961,28 @@ async function saveExchangeKey(exchange) {
     if (data.ok) loadAccount();
   } catch (e) {
     showToast('Error al guardar keys', 'error');
+  }
+}
+
+async function testExchangeKey(exchange) {
+  const statusEl = document.getElementById('ek-status-' + exchange);
+  if (statusEl) { statusEl.textContent = 'Probando…'; statusEl.style.color = '#888'; }
+  try {
+    const res = await fetch('/api/account/exchange_keys/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exchange }),
+    });
+    const data = await res.json();
+    if (statusEl) {
+      statusEl.style.color = data.ok ? '#22c55e' : '#ef4444';
+      const bal = data.usdt_balance != null ? ` · USDT: ${(+data.usdt_balance).toFixed(2)}` : '';
+      statusEl.textContent = (data.ok ? '✓ ' : '✗ ') + (data.msg || '') + (data.ok ? bal : '');
+    }
+    showToast(data.msg || (data.ok ? 'Conexión OK' : 'Conexión fallida'),
+      data.ok ? 'success' : 'error', 6000);
+  } catch (e) {
+    if (statusEl) { statusEl.style.color = '#ef4444'; statusEl.textContent = '✗ Error de red'; }
+    showToast('Error al probar conexión', 'error');
   }
 }
 
@@ -1786,6 +2028,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Mark first render done after initial load completes
   setTimeout(() => { _isFirstRender = false; }, 2000);
   startRefresh();
+  loadUserKeys();
   loadExchangeStatus();
   setInterval(loadExchangeStatus, 300000);
   document.addEventListener('keydown', (e) => {
