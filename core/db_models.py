@@ -107,6 +107,9 @@ class UserPosition(db.Model):
     entry_fees_real = db.Column(db.Float, nullable=True)
     exit_fees_real = db.Column(db.Float, nullable=True)
     payments_json = db.Column(db.JSON, default=list)  # [{ts, rate, earned, cumulative}]
+    # True when the position was opened by placing REAL orders via the user's
+    # API keys (trade_executor), vs manual bookkeeping. Drives the AUTO badge.
+    auto_executed = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at = db.Column(db.DateTime, nullable=True)
     close_reason = db.Column(db.String(50), default="")

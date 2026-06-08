@@ -37,6 +37,26 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             pass
         return None
 
+    def _exec_alert(uid, symbol, message, severity="CRITICAL"):
+        """Push a critical auto-execution alert to the user's Telegram."""
+        if not scanner_worker.email_notifier:
+            return
+        try:
+            import time as _t
+            aid = int(_t.time())
+            scanner_worker._dispatch_alerts_per_user([{
+                "type": "EXEC_FAILURE",
+                "severity": severity,
+                "symbol": symbol,
+                "exchange": "",
+                "user_id": uid,
+                "funding_ts": aid,
+                "dedup_key": f"EXEC_FAILURE_{symbol}_{uid}_{aid}",
+                "message": message,
+            }])
+        except Exception as e:
+            log.warning(f"exec alert dispatch failed: {e}")
+
     # Auth decorator: only enforced if DB/auth is enabled
     def auth_required(f):
         @wraps(f)
@@ -601,6 +621,210 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
 
         return jsonify({"ok": True, "result": result})
 
+    # ── Auto-execution: place REAL orders via the user's API keys ──
+    @app.route("/api/execute_open", methods=["POST"])
+    @auth_required
+    def api_execute_open():
+        """Open a position by placing real orders (CEX only).
+
+        Body: {opportunity_id, capital, leverage?, dry_run?}.
+        Mirrors /api/open_position's lookup + capital validation, then routes
+        the real orders through exchanges/trade_executor.
+        """
+        from exchanges import trade_executor as texec
+        data = flask_req.json or {}
+        opp_id = data.get("opportunity_id", "")
+        capital = float(data.get("capital", 0))
+        leverage = max(1, int(data.get("leverage", 1)))
+        dry_run = bool(data.get("dry_run", False))
+
+        uid = get_current_user_id()
+        if not uid or not get_db_persist():
+            return jsonify({"ok": False, "msg": "DB no disponible"}), 400
+        dbp = get_db_persist()
+
+        with state_manager.lock:
+            s = state_manager.state
+            opp = next((o for o in s.get("opportunities", []) if o.get("_id") == opp_id), None)
+            if not opp:
+                opp = next((o for o in s.get("defi_opportunities", []) if o.get("_id") == opp_id), None)
+            if not opp:
+                return jsonify({"ok": False, "msg": "Oportunidad no encontrada"})
+            opp = dict(opp)  # detach from shared state before releasing the lock
+
+        mode = opp.get("mode", "spot_perp")
+
+        # Guard 1 — CEX-only. Identify the exchange(s) each leg needs.
+        if mode == "spot_perp":
+            needed = [opp.get("exchange", "")]
+        elif mode == "cross_exchange":
+            needed = [opp.get("long_exchange", ""), opp.get("short_exchange", "")]
+        else:
+            return jsonify({"ok": False, "msg": "DeFi no soportado en auto — usa el flujo manual"})
+        for ex in needed:
+            if not texec.is_cex(ex):
+                return jsonify({"ok": False, "msg": f"{ex} no es un CEX soportado para auto-ejecución"})
+
+        # Load + decrypt the user's keys for every needed exchange.
+        creds_by_exchange = {}
+        for ex in needed:
+            c = dbp.load_user_exchange_keys(uid, ex)
+            if not c or not c.get("api_key"):
+                return jsonify({"ok": False, "msg": f"Configura las API keys de {ex} en la pestaña Cuenta"})
+            creds_by_exchange[ex.lower()] = c
+
+        # Guard 2 — spot_perp needs a CCXT-tradeable centralized spot market
+        # (excludes Binance Alpha / Bitget Onchain / Web3-only pairs).
+        if mode == "spot_perp":
+            ex = opp.get("exchange", "")
+            if not texec.spot_tradeable(ex, creds_by_exchange[ex.lower()], opp.get("symbol", "")):
+                return jsonify({"ok": False, "msg": "El spot de este par no es operable por API (Alpha/Onchain/Web3). Usa el flujo manual."})
+
+        # Capital + max_positions validation, reusing the bookkeeping path.
+        user_state = dbp.load_user_state(uid)
+        merged = {
+            "total_capital": user_state.get("total_capital", 1000),
+            "max_positions": user_state.get("max_positions", 5),
+            "positions": user_state.get("positions", []),
+            "history": user_state.get("history", []),
+            "total_earned": user_state.get("total_earned", 0),
+        }
+        ok, result = open_position(merged, opp, capital, leverage)
+        if not ok:
+            return jsonify({"ok": False, "msg": result})
+
+        # Place the real orders.
+        exec_res = texec.execute_open(creds_by_exchange, opp, capital, leverage, dry_run=dry_run)
+        if not exec_res.get("ok"):
+            # If a leg filled during a failed open, that's a critical event.
+            if "unwound" in exec_res:
+                _exec_alert(uid, opp.get("symbol", ""),
+                            f"Fallo al abrir {opp.get('symbol','')} (auto): {exec_res.get('msg','')}")
+            return jsonify({"ok": False, "msg": exec_res.get("msg", "Ejecución fallida"), "exec": exec_res})
+
+        if dry_run:
+            return jsonify({"ok": True, "dry_run": True, "exec": exec_res,
+                            "estimated_daily": result["estimated_daily"],
+                            "fees_total": result["fees_total"]})
+
+        # Overwrite the bookkeeping record with the REAL fills, mark it auto,
+        # and audit the order ids in payments_json.
+        import time as _t
+        pos = result["position"]
+        pos["entry_price"] = exec_res.get("entry_price") or pos.get("entry_price")
+        pos["entry_fees_real"] = exec_res.get("entry_fees_usd")
+        pos["auto_executed"] = True
+        pos["payments_json"] = [{
+            "ts": _t.time(),
+            "kind": "auto_open",
+            "order_ids": exec_res.get("order_ids", []),
+            "legs": exec_res.get("legs", []),
+            "note": "Auto-ejecutado",
+        }]
+        db_id = dbp.save_position(uid, pos)
+        pos["db_id"] = db_id
+        log.info(f"Auto-open saved: id={db_id} user={uid} {pos['symbol']} fees=${exec_res.get('entry_fees_usd')}")
+        return jsonify({
+            "ok": True, "exec": exec_res, "position": pos,
+            "estimated_daily": result["estimated_daily"],
+            "fees_total": exec_res.get("entry_fees_usd"),
+        })
+
+    @app.route("/api/execute_close", methods=["POST"])
+    @auth_required
+    def api_execute_close():
+        """Close a position by placing the reverse orders (CEX only).
+
+        Body: {position_id, dry_run?}.
+        """
+        from exchanges import trade_executor as texec
+        data = flask_req.json or {}
+        pos_id = data.get("position_id", "")
+        dry_run = bool(data.get("dry_run", False))
+
+        uid = get_current_user_id()
+        if not uid or not get_db_persist():
+            return jsonify({"ok": False, "msg": "DB no disponible"}), 400
+        dbp = get_db_persist()
+
+        try:
+            db_pos_id = int(pos_id)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "msg": "Posicion no encontrada"})
+
+        from core.db_models import UserPosition
+        from core.database import db as _db
+        pos_row = UserPosition.query.filter_by(id=db_pos_id, user_id=uid, status="active").first()
+        if not pos_row:
+            return jsonify({"ok": False, "msg": "Posicion no encontrada"})
+        pos = dbp._pos_to_dict(pos_row)
+
+        mode = pos.get("mode", "spot_perp")
+        needed = ([pos.get("exchange", "")] if mode == "spot_perp"
+                  else [pos.get("long_exchange", ""), pos.get("short_exchange", "")])
+        creds_by_exchange = {}
+        for ex in needed:
+            if not texec.is_cex(ex):
+                return jsonify({"ok": False, "msg": f"{ex} no soportado para auto-cierre"})
+            c = dbp.load_user_exchange_keys(uid, ex)
+            if not c or not c.get("api_key"):
+                return jsonify({"ok": False, "msg": f"Sin API keys para {ex}"})
+            creds_by_exchange[ex.lower()] = c
+
+        exec_res = texec.execute_close(creds_by_exchange, pos, dry_run=dry_run)
+        if not exec_res.get("ok"):
+            _exec_alert(uid, pos.get("symbol", ""),
+                        f"Fallo al cerrar {pos.get('symbol','')} (auto): {exec_res.get('msg','')}")
+            return jsonify({"ok": False, "msg": exec_res.get("msg", "Cierre fallido"), "exec": exec_res})
+        if dry_run:
+            return jsonify({"ok": True, "dry_run": True, "exec": exec_res})
+
+        # Record the real exit fees, then close via the bookkeeping path.
+        exit_fees = exec_res.get("exit_fees_usd")
+        if exit_fees is not None:
+            try:
+                pos_row.exit_fees_real = float(exit_fees)
+                _db.session.commit()
+            except (TypeError, ValueError):
+                pass
+
+        el_h = (time.time() - pos_row.entry_time / 1000) / 3600
+        earned = pos_row.earned_real or 0
+        from portfolio.manager import position_fees as _pf
+        _e, _x, fees, _ = _pf({
+            "entry_fees": pos_row.entry_fees or 0,
+            "exit_fees_est": pos_row.exit_fees_est or 0,
+            "entry_fees_real": pos_row.entry_fees_real,
+            "exit_fees_real": pos_row.exit_fees_real,
+        })
+        net_earned = earned - fees
+        dbp.close_position(db_pos_id, {
+            "reason": "auto", "hours": el_h, "fees": fees, "net_earned": net_earned,
+        })
+
+        # Audit the close order ids on the freshly-created history row.
+        try:
+            from core.db_models import UserHistory
+            hist = (UserHistory.query.filter_by(user_id=uid, symbol=pos_row.symbol)
+                    .order_by(UserHistory.id.desc()).first())
+            if hist:
+                ids = ", ".join(str(i) for i in exec_res.get("order_ids", []))
+                hist.notes = (hist.notes or "") + f"Auto-cierre orders=[{ids}] @ {datetime.now().isoformat()}\n"
+                _db.session.commit()
+        except Exception as e:
+            log.debug(f"close audit note skipped: {e}")
+
+        # Clear notified-alert keys for this symbol (parity with manual close).
+        for k in [k for k in scanner_worker._notified_alerts if pos_row.symbol in k]:
+            scanner_worker._notified_alerts.pop(k, None)
+
+        result = {
+            "symbol": pos_row.symbol, "earned": earned, "fees": fees,
+            "net_earned": net_earned, "hours": el_h, "payments": pos_row.payment_count or 0,
+        }
+        log.info(f"Auto-close done: id={db_pos_id} user={uid} {pos_row.symbol} net=${net_earned:.4f}")
+        return jsonify({"ok": True, "exec": exec_res, "result": result})
+
     # ── Update real fees on an open position ───────────────────
     @app.route("/api/positions/<pos_id>/fees", methods=["PATCH", "POST"])
     @auth_required
@@ -1107,6 +1331,23 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             _db.session.commit()
 
             return jsonify({"ok": True, "msg": f"Keys de {exchange} guardadas"})
+
+        @app.route("/api/account/exchange_keys/test", methods=["POST"])
+        @auth_required
+        def api_test_exchange_keys():
+            """Validate stored API keys for an exchange by hitting the balance API."""
+            from exchanges import trade_executor as texec
+            uid = get_current_user_id()
+            if not uid or not get_db_persist():
+                return jsonify({"ok": False, "msg": "DB no disponible"}), 400
+            data = flask_req.get_json() or {}
+            exchange = (data.get("exchange", "") or "").strip()
+            if not texec.is_cex(exchange):
+                return jsonify({"ok": False, "msg": f"{exchange} no soportado para auto-trading"})
+            creds = get_db_persist().load_user_exchange_keys(uid, exchange)
+            if not creds or not creds.get("api_key"):
+                return jsonify({"ok": False, "msg": f"No hay keys guardadas para {exchange}"})
+            return jsonify(texec.test_connection(exchange, creds))
 
         @app.route("/api/account", methods=["DELETE"])
         @auth_required

@@ -93,6 +93,9 @@ def _run_migrations(db):
         "DELETE FROM notification_log WHERE sent_at < NOW() - INTERVAL '7 days'",
         # Manual edit audit trail on closed positions.
         "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS notes TEXT",
+        # Auto-execution flag: position opened via real API orders (vs manual
+        # bookkeeping). Drives the AUTO badge in the UI.
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS auto_executed BOOLEAN DEFAULT FALSE",
     ]
     for sql in migrations:
         try:

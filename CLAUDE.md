@@ -184,6 +184,43 @@ UI: `editPosEarnings(posId)` / `editHistEarnings(histId)` en `static/app.js`, mi
 
 ---
 
+## Auto-ejecución de órdenes (CEX)
+
+Coloca y ejecuta las órdenes reales de ambas piernas usando las API keys del usuario. **Trigger por botón** (semi-automático), no autónomo: el scanner sigue siendo event-driven.
+
+**Alcance: solo CEX** (binance/bybit/okx/bitget). DeFi y spot on-chain (Binance Alpha, Bitget Onchain, Web3 wallets) **no** son operables por CCXT → siguen en flujo manual.
+
+### Módulo `exchanges/trade_executor.py`
+Única capa que coloca órdenes reales, **aislada** del `ExchangeManager` global de solo-lectura. Cada llamada construye un cliente CCXT autenticado fresco desde las keys *del usuario* (`build_user_client`, importación perezosa de ccxt).
+- `test_connection(ex, creds)` → `fetch_balance` (botón "Probar conexión").
+- `spot_tradeable(ex, creds, symbol)` → gate: el símbolo debe ser mercado **spot centralizado** operable (`spot=True, active`). Excluye Alpha/Onchain/Web3.
+- `execute_open(creds_by_exchange, opp, capital, leverage, dry_run)` — metodología de `build_entry_strategy`:
+  - `spot_perp`: **Limit BUY spot (mid, 60s) → Market SHORT perp** al llenar. Si el perp falla, **unwind** del spot a market.
+  - `cross_exchange`: **Limit en ambas piernas (90s)**; si solo una llena, cancela la otra + **unwind** a market.
+- `execute_close(...)` — revierte ambas piernas a market (`reduceOnly` en perps).
+- `dry_run=True` → simula sin enviar (alimenta el modo "Simular" de la UI). Sizing/precisión vía `amount_to_precision` + `contractSize` (OKX/Bitget usan contratos).
+- Env `TRADE_SANDBOX=1` → `set_sandbox_mode(True)` en todos los clientes (testnet).
+
+### Rutas (`api/routes.py`)
+`/api/account/exchange_keys/test`, `/api/execute_open`, `/api/execute_close`. `execute_open` reusa el lookup de oportunidad y la validación de capital de `open_position` (bookkeeping), luego **sobreescribe con fills reales** (`entry_price`, `entry_fees_real`), marca `auto_executed=True` y audita `order_ids` en `payments_json` (`kind:"auto_open"`). Fallo con pierna llena → alerta crítica `EXEC_FAILURE` vía `_dispatch_alerts_per_user` (`_exec_alert`).
+
+### Persistencia
+- `DBPersistence.load_user_exchange_keys(user_id, exchange)` descifra las keys (Fernet) para el executor.
+- Columna nueva `user_positions.auto_executed BOOLEAN` (migración en `core/database.py`, modelo en `db_models.py`, expuesta en `_pos_to_dict`).
+
+### Frontend (`static/app.js`, `style.css`, `templates/index.html`)
+- Opp card: botón **"Ejecutar"** (`.btn-exec`) junto a "Entrar". Deshabilitado con tooltip si: DeFi/no-CEX, `has_spot=false`, o faltan keys (`_cexKeys` cargado vía `loadUserKeys`).
+- Positions: botón **"Cerrar (auto)"** (solo si `posIsCex`) + badge **AUTO**.
+- Modal de confirmación de riesgo (`showExecConfirm`) con 3 acciones: Cancelar / **Simular** (dry-run) / **Ejecutar órdenes reales**. Modal de resultado (`showExecResult`) con tabla de fills; desde una simulación se puede promover a ejecución real.
+- Cuenta: botón **"Probar conexión"** por exchange (`testExchangeKey`).
+
+### Precondiciones / límites v1
+- Fondos ya en la wallet correcta (spot wallet para la pierna spot, futures para márgenes). **Sin auto-transferencia entre wallets.**
+- `set_leverage` best-effort (no-fatal). Margin mode se deja en el default de la cuenta.
+- Slippage real asumido (ya estimado por el sistema).
+
+---
+
 ## Notificaciones Telegram
 
 **Cada usuario** gestiona sus propias credenciales (modelo self-service):
@@ -264,7 +301,10 @@ BITGET_API_KEY / BITGET_API_SECRET
 COINGLASS_API_KEY     # Datos adicionales de mercado
 ENABLED_EXCHANGES     # Default: binance,bybit,okx,bitget
 ARBITRAGE_MODES       # Default: spot_perp,cross_exchange
+TRADE_SANDBOX         # =1 → auto-ejecución usa testnet CCXT (set_sandbox_mode)
 ```
+
+> Nota: las API keys globales de CEX (arriba) son para datos públicos del scanner. La **auto-ejecución** usa las keys *por usuario* guardadas en `user_exchange_keys` (tab Cuenta), no estas.
 
 ---
 
@@ -314,6 +354,9 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 | `GET /api/earnings/daily?days=N` | `@auth_required` | Rollup diario combinando activas + cerradas: `{today, yesterday, last_7d, last_30d, all_time, realized_apr_7d, series:[{date, earned, fees, net}]}` |
 | `PATCH /api/positions/<id>/earnings` | `@auth_required` | Body `{earned: float}` — override absoluto reseteable: setea `earned_real` + `last_earn_update=now`, agrega entry `kind:"manual_adjust"` a `payments_json`. Próximos settlements se acumulan encima. |
 | `PATCH /api/history/<id>/earnings` | `@auth_required` | Body `{earned?, fees?}` — edita posición cerrada, recalcula `net_earned`, registra en `notes`. |
+| `POST /api/account/exchange_keys/test` | `@auth_required` | Body `{exchange}` — valida las API keys guardadas vía `fetch_balance`. Devuelve `{ok, msg, usdt_balance?}`. |
+| `POST /api/execute_open` | `@auth_required` | Body `{opportunity_id, capital, leverage?, dry_run?}` — coloca las órdenes reales (CEX only) vía `trade_executor`, guarda la posición con `auto_executed=True` y fills reales. `dry_run:true` simula sin enviar. |
+| `POST /api/execute_close` | `@auth_required` | Body `{position_id, dry_run?}` — coloca las órdenes inversas a market y cierra con `exit_fees_real` reales. |
 
 **Flujo unauthenticated:** `GET /app` → `unauthorized_handler` → `302 /?login=1` → landing abre modal login.  
 **Flujo logout:** `POST /auth/logout` → `window.location = '/'` (en `static/app.js:doLogout`).  
@@ -352,7 +395,7 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 
 ### Funcionalidad incompleta (infraestructura lista, falta conectar)
 
-- **Auto-trading**: `user_exchange_keys` almacena API keys cifradas por usuario, la UI tiene skeleton, pero la ejecución automática de órdenes no está implementada. Todo el flujo de abrir/cerrar es manual.
+- **Auto-trading CEX**: ✅ implementado (ver sección "Auto-ejecución de órdenes" abajo). Botón "Ejecutar" por oportunidad + "Cerrar (auto)" por posición colocan órdenes reales vía las API keys del usuario. **Pendiente**: auto-trading DeFi (Hyperliquid/GMX/Aster/Lighter/Extended) y spot on-chain (Binance Alpha, Bitget Onchain) — esos no exponen API de órdenes usable por CCXT y siguen en flujo manual.
 - **Coinglass**: cliente existe en `coinglass/client.py`, no integrado en el flujo principal.
 
 ### Mejoras identificadas
