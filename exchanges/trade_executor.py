@@ -116,13 +116,24 @@ def _norm_amount(client, ccxt_symbol: str, base_amount: float) -> float:
     market = client.market(ccxt_symbol)
     cs = market.get("contractSize") or 1
     amount = base_amount / cs if cs else base_amount
-    return float(client.amount_to_precision(ccxt_symbol, amount))
+    try:
+        return float(client.amount_to_precision(ccxt_symbol, amount))
+    except Exception as e:
+        # CCXT lanza InvalidOrder cuando el tamaño trunca por debajo del paso
+        # mínimo del exchange. No reventamos: devolvemos 0.0 y dejamos que
+        # _check_min_notional emita el error limpio y accionable.
+        log.warning(f"amount_to_precision {ccxt_symbol} ({amount}) falló: {e}")
+        return 0.0
 
 
 def _check_min_notional(client, ccxt_symbol: str, amount: float, price: float):
     """Return an error string if the order is below exchange minimums, else None."""
     try:
         market = client.market(ccxt_symbol)
+        if amount <= 0:
+            step = (market.get("precision") or {}).get("amount")
+            return (f"tamaño calculado bajo el mínimo operable de {ccxt_symbol} "
+                    f"(paso={step}); sube el capital o el leverage")
         limits = market.get("limits", {})
         min_amt = (limits.get("amount") or {}).get("min")
         min_cost = (limits.get("cost") or {}).get("min")
