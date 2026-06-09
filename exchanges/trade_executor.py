@@ -157,6 +157,35 @@ def _set_leverage(client, ccxt_symbol: str, leverage: int):
         log.warning(f"set_leverage({leverage},{ccxt_symbol}) failed: {e}")
 
 
+def _set_one_way_mode(client, ccxt_symbol: str):
+    """Best-effort: forzar modo one-way (unilateral). Non-fatal.
+
+    Sin esto, en cuentas Bitget configuradas en one-way, CCXT manda la orden con
+    parámetros de modo hedge y el exchange la rechaza (code 40774).
+    """
+    try:
+        client.set_position_mode(False, ccxt_symbol)
+    except Exception as e:
+        log.warning(f"set_position_mode(one-way,{ccxt_symbol}) failed: {e}")
+
+
+def _spot_sellable(client, ccxt_symbol: str, desired: float) -> float:
+    """Cantidad de base realmente vendible = min(desired, free balance), a precisión.
+
+    En una compra spot el fee se descuenta del activo recibido, así que el balance
+    libre es menor que 'filled'. Vender 'filled' completo provoca insufficient
+    balance (code 43012).
+    """
+    try:
+        base = client.market(ccxt_symbol)["base"]
+        free = (client.fetch_balance().get("free") or {}).get(base) or 0
+        sellable = min(desired, float(free))
+        return float(client.amount_to_precision(ccxt_symbol, sellable))
+    except Exception as e:
+        log.warning(f"spot_sellable {ccxt_symbol} failed: {e}")
+        return desired
+
+
 def _poll_fill(client, order_id: str, ccxt_symbol: str, timeout: float):
     """Poll until the order is fully filled ('closed') or timeout.
 
@@ -291,6 +320,7 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
         }
 
     _set_leverage(perp_cli, perp_sym, leverage)
+    _set_one_way_mode(perp_cli, perp_sym)
 
     # Leg 1 — maker: limit BUY spot at mid, wait up to 60s.
     try:
@@ -305,7 +335,8 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
         part = (spot_order or {}).get("filled") or 0
         if part > 0:
             try:
-                spot_cli.create_order(spot_sym, "market", "sell", part)
+                spot_cli.create_order(spot_sym, "market", "sell",
+                                      _spot_sellable(spot_cli, spot_sym, part))
             except Exception as e:
                 return {"ok": False, "msg": f"Límite spot parcial NO deshecho — REVISA MANUALMENTE: {e}"}
         return {"ok": False, "msg": f"La orden límite spot no se llenó en {SPOT_LIMIT_TIMEOUT}s, abortado"}
@@ -319,7 +350,8 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
     except Exception as e:
         unwound = True
         try:
-            spot_cli.create_order(spot_sym, "market", "sell", spot_fill_amt)
+            spot_cli.create_order(spot_sym, "market", "sell",
+                                  _spot_sellable(spot_cli, spot_sym, spot_fill_amt))
         except Exception as ue:
             unwound = False
             log.error(f"UNWIND FAILED spot {spot_sym}: {ue}")
@@ -400,6 +432,8 @@ def _open_cross(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
 
     _set_leverage(long_cli, sym, leverage)
     _set_leverage(short_cli, sym, leverage)
+    _set_one_way_mode(long_cli, sym)
+    _set_one_way_mode(short_cli, sym)
 
     # Both legs as limit, placed back-to-back, then polled within the window.
     try:
@@ -505,7 +539,8 @@ def execute_close(creds_by_exchange: dict, position: dict, dry_run: bool = False
         legs, fees, ids = [], 0.0, []
         # Sell spot (close long).
         try:
-            o = spot_cli.create_order(spot_sym, "market", "sell", spot_amt)
+            o = spot_cli.create_order(spot_sym, "market", "sell",
+                                      _spot_sellable(spot_cli, spot_sym, spot_amt))
             fees += _order_fee_usd(o); ids.append(o.get("id"))
             legs.append({"side": "sell", "kind": "spot", "symbol": spot_sym, "order_id": o.get("id")})
         except Exception as e:
