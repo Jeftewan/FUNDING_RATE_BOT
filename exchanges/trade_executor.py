@@ -169,6 +169,18 @@ def _set_one_way_mode(client, ccxt_symbol: str):
         log.warning(f"set_position_mode(one-way,{ccxt_symbol}) failed: {e}")
 
 
+def _set_isolated_margin(client, ccxt_symbol: str):
+    """Best-effort: usar margen aislado (isolated) en vez de cruzado. Non-fatal.
+
+    Cada posicion perp queda con su propio margen, sin compartir colateral con
+    el resto de la cuenta.
+    """
+    try:
+        client.set_margin_mode("isolated", ccxt_symbol)
+    except Exception as e:
+        log.warning(f"set_margin_mode(isolated,{ccxt_symbol}) failed: {e}")
+
+
 def _spot_sellable(client, ccxt_symbol: str, desired: float) -> float:
     """Cantidad de base realmente vendible = min(desired, free balance), a precisión.
 
@@ -319,6 +331,7 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
             ],
         }
 
+    _set_isolated_margin(perp_cli, perp_sym)
     _set_leverage(perp_cli, perp_sym, leverage)
     _set_one_way_mode(perp_cli, perp_sym)
 
@@ -430,6 +443,8 @@ def _open_cross(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
             ],
         }
 
+    _set_isolated_margin(long_cli, sym)
+    _set_isolated_margin(short_cli, sym)
     _set_leverage(long_cli, sym, leverage)
     _set_leverage(short_cli, sym, leverage)
     _set_one_way_mode(long_cli, sym)
