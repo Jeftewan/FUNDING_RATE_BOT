@@ -286,6 +286,40 @@ def _spot_sellable(client, ccxt_symbol: str, desired: float) -> float:
         return desired
 
 
+def _open_perp_size(client, ccxt_symbol: str, side: str) -> float:
+    """Contratos realmente abiertos en el perp para `side` ('long'/'short').
+
+    Lee la posición real del exchange (fetch_positions) en vez de recalcular la
+    cantidad desde el notional. Cerrar contra el estado real garantiza un cierre
+    completo, sin el contrato residual que deja recalcular `exposure / precio`
+    (deriva de precio entre apertura y cierre + truncado de precisión). Es el
+    análogo perp de `_spot_sellable`.
+
+    `contracts` ya viene en unidades de contrato (la misma que usa create_order),
+    así que NO se divide por contractSize ni se re-trunca a precisión (eso podría
+    re-introducir el residual). Devuelve 0.0 si no se puede leer → el caller cae
+    al cálculo por notional como fallback.
+    """
+    try:
+        positions = client.fetch_positions([ccxt_symbol])
+    except Exception as e:
+        log.warning(f"fetch_positions {ccxt_symbol} falló: {e}")
+        return 0.0
+    for p in positions:
+        contracts = p.get("contracts")
+        if not contracts:
+            continue
+        # one-way: una sola entrada. hedge: long y short separadas → filtramos por lado.
+        pside = p.get("side")
+        if pside and side and pside != side:
+            continue
+        try:
+            return abs(float(contracts))
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
 def _poll_fill(client, order_id: str, ccxt_symbol: str, timeout: float):
     """Poll until the order is fully filled ('closed') or timeout.
 
@@ -637,7 +671,9 @@ def execute_close(creds_by_exchange: dict, position: dict, dry_run: bool = False
         spot_px = _mid_price(spot_cli, spot_sym, position.get("entry_price", 0))
         perp_px = _mid_price(perp_cli, perp_sym, position.get("entry_price", 0))
         spot_amt = _norm_amount(spot_cli, spot_sym, exposure / spot_px) if spot_px else 0
-        perp_amt = _norm_amount(perp_cli, perp_sym, exposure / perp_px) if perp_px else 0
+        # Cerrar la cantidad REAL del short (lectura del exchange); fallback al notional.
+        perp_amt = _open_perp_size(perp_cli, perp_sym, "short") \
+            or (_norm_amount(perp_cli, perp_sym, exposure / perp_px) if perp_px else 0)
 
         if dry_run:
             return {"ok": True, "dry_run": True,
@@ -685,8 +721,11 @@ def execute_close(creds_by_exchange: dict, position: dict, dry_run: bool = False
 
         long_px = _mid_price(long_cli, sym, position.get("entry_price", 0))
         short_px = _mid_price(short_cli, sym, position.get("entry_price", 0))
-        long_amt = _norm_amount(long_cli, sym, exposure / long_px) if long_px else 0
-        short_amt = _norm_amount(short_cli, sym, exposure / short_px) if short_px else 0
+        # Cerrar la cantidad REAL de cada pierna (lectura del exchange); fallback al notional.
+        long_amt = _open_perp_size(long_cli, sym, "long") \
+            or (_norm_amount(long_cli, sym, exposure / long_px) if long_px else 0)
+        short_amt = _open_perp_size(short_cli, sym, "short") \
+            or (_norm_amount(short_cli, sym, exposure / short_px) if short_px else 0)
 
         if dry_run:
             return {"ok": True, "dry_run": True,
