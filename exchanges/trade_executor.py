@@ -168,16 +168,80 @@ def _set_leverage(client, ccxt_symbol: str, leverage: int):
         log.warning(f"set_leverage({leverage},{ccxt_symbol}) failed: {e}")
 
 
-def _set_one_way_mode(client, ccxt_symbol: str):
-    """Best-effort: forzar modo one-way (unilateral). Non-fatal.
+def _is_hedged(client, ccxt_symbol: str):
+    """Modo de posición real de la cuenta: True=hedge, False=one-way, None=desconocido.
 
-    Sin esto, en cuentas Bitget configuradas en one-way, CCXT manda la orden con
-    parámetros de modo hedge y el exchange la rechaza (code 40774).
+    Cacheado por cliente para no repetir la llamada en cada pierna. Si el exchange
+    no soporta la consulta o falla, devolvemos None y el caller decide el fallback.
     """
+    cache = getattr(client, "_pos_mode_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            client._pos_mode_cache = cache
+        except Exception:
+            pass
+    if ccxt_symbol in cache:
+        return cache[ccxt_symbol]
+    hedged = None
+    try:
+        res = client.fetch_position_mode(ccxt_symbol)
+        hedged = bool(res.get("hedged")) if isinstance(res, dict) else None
+    except Exception as e:
+        log.warning(f"fetch_position_mode({ccxt_symbol}) failed: {e}")
+    cache[ccxt_symbol] = hedged
+    return hedged
+
+
+def _perp_open_params(client, ccxt_symbol: str) -> dict:
+    """Params para ABRIR una pierna perp según el modo de posición de la cuenta.
+
+    En hedge mode Bitget exige indicar que la orden abre posición (``tradeSide``);
+    CCXT deriva el holdSide del side. En one-way (o desconocido) no se añade nada.
+    """
+    if _is_hedged(client, ccxt_symbol) is True:
+        return {"tradeSide": "open"}
+    return {}
+
+
+def _perp_close_params(client, ccxt_symbol: str) -> dict:
+    """Params para CERRAR / reducir una pierna perp según el modo de posición.
+
+    one-way / desconocido: ``reduceOnly``. hedge: además ``tradeSide=close``.
+    """
+    if _is_hedged(client, ccxt_symbol) is True:
+        return {"reduceOnly": True, "tradeSide": "close"}
+    return {"reduceOnly": True}
+
+
+def _ensure_one_way_or_abort(client, ccxt_symbol: str):
+    """Pre-flight de seguridad antes de colocar la primera orden.
+
+    Devuelve un mensaje de error si NO podemos garantizar que el perp se colocará
+    correctamente, en cuyo caso el caller debe abortar ANTES de tocar el spot.
+    Devuelve None si se puede proceder (one-way detectado, hedge soportado vía
+    params, o pudimos forzar one-way).
+
+    - hedge mode → None: las órdenes se adaptan con _perp_open/close_params.
+    - one-way    → None: flujo normal.
+    - desconocido → intentamos forzar one-way; si Bitget responde 40920
+      ("cannot be switched", hay posición/orden previa) no sabemos el modo real
+      y abortamos para no quedar medio-abiertos.
+    """
+    hedged = _is_hedged(client, ccxt_symbol)
+    if hedged is not None:
+        return None
     try:
         client.set_position_mode(False, ccxt_symbol)
+        return None
     except Exception as e:
+        msg = str(e)
+        if "40920" in msg or "cannot be switched" in msg.lower():
+            return (f"No se pudo fijar el modo de posición en {ccxt_symbol}: hay una "
+                    f"posición u orden abierta en futuros y no se pudo detectar el modo. "
+                    f"Cierra/cancela esa posición en Bitget e inténtalo de nuevo.")
         log.warning(f"set_position_mode(one-way,{ccxt_symbol}) failed: {e}")
+        return None
 
 
 def _set_isolated_margin(client, ccxt_symbol: str):
@@ -344,7 +408,9 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
 
     _set_isolated_margin(perp_cli, perp_sym)
     _set_leverage(perp_cli, perp_sym, leverage)
-    _set_one_way_mode(perp_cli, perp_sym)
+    mode_err = _ensure_one_way_or_abort(perp_cli, perp_sym)
+    if mode_err:
+        return {"ok": False, "msg": mode_err}
 
     # Leg 1 — maker: limit BUY spot at mid, wait up to 60s.
     try:
@@ -370,7 +436,8 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
 
     # Leg 2 — taker: market SHORT perp. On failure, unwind the spot leg.
     try:
-        perp_order = perp_cli.create_order(perp_sym, "market", "sell", perp_amt)
+        perp_order = perp_cli.create_order(perp_sym, "market", "sell", perp_amt, None,
+                                           _perp_open_params(perp_cli, perp_sym))
     except Exception as e:
         unwound = True
         try:
@@ -458,16 +525,19 @@ def _open_cross(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
     _set_isolated_margin(short_cli, sym)
     _set_leverage(long_cli, sym, leverage)
     _set_leverage(short_cli, sym, leverage)
-    _set_one_way_mode(long_cli, sym)
-    _set_one_way_mode(short_cli, sym)
+    mode_err = _ensure_one_way_or_abort(long_cli, sym) or _ensure_one_way_or_abort(short_cli, sym)
+    if mode_err:
+        return {"ok": False, "msg": mode_err}
 
     # Both legs as limit, placed back-to-back, then polled within the window.
     try:
-        long_order = long_cli.create_order(sym, "limit", "buy", long_amt, long_px)
+        long_order = long_cli.create_order(sym, "limit", "buy", long_amt, long_px,
+                                           _perp_open_params(long_cli, sym))
     except Exception as e:
         return {"ok": False, "msg": f"No se pudo colocar límite long en {long_ex}: {e}"}
     try:
-        short_order = short_cli.create_order(sym, "limit", "sell", short_amt, short_px)
+        short_order = short_cli.create_order(sym, "limit", "sell", short_amt, short_px,
+                                             _perp_open_params(short_cli, sym))
     except Exception as e:
         _safe_cancel(long_cli, long_order["id"], sym)
         return {"ok": False, "msg": f"No se pudo colocar límite short en {short_ex}: {e}"}
@@ -501,7 +571,8 @@ def _open_cross(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
         amt = long_order.get("filled") or 0
         if amt > 0:
             try:
-                long_cli.create_order(sym, "market", "sell", amt, None, {"reduceOnly": True})
+                long_cli.create_order(sym, "market", "sell", amt, None,
+                                      _perp_close_params(long_cli, sym))
             except Exception as e:
                 unwind_ok = False
                 log.error(f"UNWIND long failed {long_ex}/{sym}: {e}")
@@ -509,7 +580,8 @@ def _open_cross(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
         amt = short_order.get("filled") or 0
         if amt > 0:
             try:
-                short_cli.create_order(sym, "market", "buy", amt, None, {"reduceOnly": True})
+                short_cli.create_order(sym, "market", "buy", amt, None,
+                                       _perp_close_params(short_cli, sym))
             except Exception as e:
                 unwind_ok = False
                 log.error(f"UNWIND short failed {short_ex}/{sym}: {e}")
@@ -573,7 +645,8 @@ def execute_close(creds_by_exchange: dict, position: dict, dry_run: bool = False
             return {"ok": False, "msg": f"No se pudo vender spot: {e}"}
         # Buy-to-close perp (close short).
         try:
-            o = perp_cli.create_order(perp_sym, "market", "buy", perp_amt, None, {"reduceOnly": True})
+            o = perp_cli.create_order(perp_sym, "market", "buy", perp_amt, None,
+                                      _perp_close_params(perp_cli, perp_sym))
             fees += _order_fee_usd(o); ids.append(o.get("id"))
             legs.append({"side": "buy", "kind": "perp", "symbol": perp_sym, "order_id": o.get("id")})
         except Exception as e:
@@ -612,13 +685,15 @@ def execute_close(creds_by_exchange: dict, position: dict, dry_run: bool = False
 
         legs, fees, ids = [], 0.0, []
         try:  # close long → sell reduceOnly
-            o = long_cli.create_order(sym, "market", "sell", long_amt, None, {"reduceOnly": True})
+            o = long_cli.create_order(sym, "market", "sell", long_amt, None,
+                                      _perp_close_params(long_cli, sym))
             fees += _order_fee_usd(o); ids.append(o.get("id"))
             legs.append({"side": "sell", "kind": "perp", "exchange": long_ex, "order_id": o.get("id")})
         except Exception as e:
             return {"ok": False, "msg": f"No se pudo cerrar el long en {long_ex}: {e}"}
         try:  # close short → buy reduceOnly
-            o = short_cli.create_order(sym, "market", "buy", short_amt, None, {"reduceOnly": True})
+            o = short_cli.create_order(sym, "market", "buy", short_amt, None,
+                                       _perp_close_params(short_cli, sym))
             fees += _order_fee_usd(o); ids.append(o.get("id"))
             legs.append({"side": "buy", "kind": "perp", "exchange": short_ex, "order_id": o.get("id")})
         except Exception as e:
