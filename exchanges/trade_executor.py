@@ -184,11 +184,21 @@ def _is_hedged(client, ccxt_symbol: str):
     if ccxt_symbol in cache:
         return cache[ccxt_symbol]
     hedged = None
+    # Bitget no implementa fetch_position_mode; el modo (posMode) viene en el
+    # info crudo de fetch_margin_mode. Otros CEX sí soportan fetch_position_mode.
     try:
-        res = client.fetch_position_mode(ccxt_symbol)
-        hedged = bool(res.get("hedged")) if isinstance(res, dict) else None
+        if getattr(client, "has", {}).get("fetchPositionMode"):
+            res = client.fetch_position_mode(ccxt_symbol)
+            hedged = bool(res.get("hedged")) if isinstance(res, dict) else None
+        else:
+            mm = client.fetch_margin_mode(ccxt_symbol)
+            pos_mode = (mm.get("info") or {}).get("posMode") if isinstance(mm, dict) else None
+            if pos_mode == "hedge_mode":
+                hedged = True
+            elif pos_mode == "one_way_mode":
+                hedged = False
     except Exception as e:
-        log.warning(f"fetch_position_mode({ccxt_symbol}) failed: {e}")
+        log.warning(f"detect position mode {ccxt_symbol} failed: {e}")
     cache[ccxt_symbol] = hedged
     return hedged
 
@@ -196,21 +206,24 @@ def _is_hedged(client, ccxt_symbol: str):
 def _perp_open_params(client, ccxt_symbol: str) -> dict:
     """Params para ABRIR una pierna perp según el modo de posición de la cuenta.
 
-    En hedge mode Bitget exige indicar que la orden abre posición (``tradeSide``);
-    CCXT deriva el holdSide del side. En one-way (o desconocido) no se añade nada.
+    En hedge mode se pasa el booleano unificado ``hedged``; CCXT deriva
+    internamente ``tradeSide=Open`` y el ``posSide`` a partir del side. En one-way
+    (o desconocido) no se añade nada (comportamiento por defecto).
     """
     if _is_hedged(client, ccxt_symbol) is True:
-        return {"tradeSide": "open"}
+        return {"hedged": True}
     return {}
 
 
 def _perp_close_params(client, ccxt_symbol: str) -> dict:
     """Params para CERRAR / reducir una pierna perp según el modo de posición.
 
-    one-way / desconocido: ``reduceOnly``. hedge: además ``tradeSide=close``.
+    one-way / desconocido: ``reduceOnly``. hedge: ``reduceOnly`` + ``hedged``; CCXT
+    convierte esto en ``tradeSide=Close`` e invierte el side a la convención de
+    Bitget (cerrar short = side sell, cerrar long = side buy).
     """
     if _is_hedged(client, ccxt_symbol) is True:
-        return {"reduceOnly": True, "tradeSide": "close"}
+        return {"reduceOnly": True, "hedged": True}
     return {"reduceOnly": True}
 
 
