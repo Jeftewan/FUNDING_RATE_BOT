@@ -1267,8 +1267,9 @@ class ScannerWorker:
         pos["earned_real"] = pos.get("earned_real", 0) + earned_now
         pos["last_earn_update"] = now
         pos["last_fr_used"] = rate
-        pos["payment_count"] = len(pos["payments"])
-        pos["avg_rate"] = sum(p["rate"] for p in pos["payments"]) / len(pos["payments"])
+        funding = [p for p in pos["payments"] if "rate" in p]
+        pos["payment_count"] = len(funding)
+        pos["avg_rate"] = sum(p["rate"] for p in funding) / len(funding) if funding else rate
         pos["_earnings_updated"] = True
 
         if earned_now > 0:

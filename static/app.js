@@ -249,7 +249,7 @@ function _drawEarningsChart() {
   const datasets = withPayments.map((p, i) => ({
     label: `${p.symbol} (${p.exchange || p.long_exchange + '/' + p.short_exchange})`,
     data: p.payments
-      .filter(pay => pay.kind !== 'manual_adjust')
+      .filter(pay => !pay.kind)
       .map(pay => ({ x: pay.ts * 1000, y: pay.cumulative })),
     borderColor: CHART_COLORS[i % CHART_COLORS.length],
     backgroundColor: CHART_COLORS[i % CHART_COLORS.length] + '22',
@@ -1148,7 +1148,7 @@ function renderPositions(data) {
       alertHtml = '<div class="pos-alert">FR CAMBIO DE SIGNO — CERRAR</div>';
     }
 
-    const payments = p.payments || [];
+    const payments = (p.payments || []).filter(pay => !pay.kind);
     const lastPayments = payments.slice(-5).reverse();
     let payTable = '';
     if (lastPayments.length) {
@@ -1164,8 +1164,8 @@ function renderPositions(data) {
                 <td>${payments.length - i}</td>
                 <td>${new Date(pay.ts * 1000).toLocaleTimeString()}</td>
                 <td>${(pay.rate * 100).toFixed(4)}%</td>
-                <td style="color:${pay.earned >= 0 ? 'var(--green)' : 'var(--red)'}">$${pay.earned.toFixed(4)}</td>
-                <td style="color:${pay.cumulative >= 0 ? 'var(--green)' : 'var(--red)'}">$${pay.cumulative.toFixed(2)}</td>
+                <td style="color:${pay.earned >= 0 ? 'var(--green)' : 'var(--red)'}">$${(pay.earned ?? 0).toFixed(4)}</td>
+                <td style="color:${pay.cumulative >= 0 ? 'var(--green)' : 'var(--red)'}">$${(pay.cumulative ?? 0).toFixed(2)}</td>
               </tr>`).join('')}
           </table>
         </div>`;
