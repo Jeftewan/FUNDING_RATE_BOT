@@ -1,0 +1,11 @@
+# Dependencias SOLO para herramientas de research locales (no runtime del bot).
+# No se instalan en Railway. Usadas por scripts/scoring_backtest.py y
+# scripts/scoring_optimizer.py.
+#
+#   pip install -r requirements-dev.txt
+#
+# (psycopg2-binary y cryptography ya vienen en requirements.txt)
+optuna
+pandas
+sqlalchemy
+numpy
