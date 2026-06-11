@@ -115,22 +115,27 @@ Antes del cambio, `_record_earnings` grababa `cfr` (la tasa "vigente" al scan) y
 
 ---
 
-## Sistema de scoring v10.5
+## Sistema de scoring v10.6
 
-Puntaje **0–100**, normalizado. Pesos validados con backtest de 90 días sobre `funding_rate_snapshots`.
+Puntaje **0–100**. Pesos re-optimizados con Optuna (600 trials) sobre 90 días de
+`funding_rate_snapshots` vía `scripts/scoring_optimizer.py`. Adoptado por el salto
+en Profit Rate del top (score ≥70): 4% → 11% en validación (~3× más rentable neto),
+con un top más selectivo. Ver `reports/optimizer_20260610.md`.
 
-| Dimensión | Puntos | Factor más importante |
+| Dimensión | Puntos (v10.5→v10.6) | Factor más importante |
 |-----------|--------|-----------------------|
-| Consistencia | 44 | Spearman ρ=0.572 (predictor #1) |
-| Estabilidad | 31 | Spearman ρ=0.317 (predictor #2) |
-| Yield | 13 | Sweet spot 0.03–0.10%/día |
-| Liquidez | 4 | Umbrales por modo (spot_perp > cross > defi) |
-| Fee efficiency | 5 | Fee drag < 0.1 = máximo |
-| Tendencia | 3 | Momentum + percentil |
+| Consistencia | 44 → **46** | Spearman ρ≈0.57 (predictor #1) |
+| Estabilidad | 31 → **21** | Spearman ρ≈0.32 (predictor #2) |
+| Yield | 13 → **17** | Sweet spot 0.03–0.10%/día |
+| Fee efficiency | 5 → **8** | Fee drag < 0.1 = máximo |
+| Liquidez | 4 → **6** | Umbrales por modo (spot_perp > cross > defi) |
+| Tendencia | 3 → **1** | Momentum + percentil |
 
-**Penalizaciones:** z-score > 0.8 (hasta −28 pts), momentum negativo/decelerado (hasta −8 pts).  
-**Hard caps:** z>2.5 → máx 39; streak<3 con percentil≥80 → máx 50; reality penalty → máx 61.  
+**Penalizaciones:** z-score > 0.5 (hasta −20 pts, umbrales 3.2/2.6/2.2/1.5/0.9/0.5), momentum decelerado −3 (accelerating/negative ya no penalizan).  
+**Hard caps:** z>2.5 → máx 47; streak<4 con percentil≥90 → máx 36; reality penalty (rate>2.6×avg) → máx 54.  
 **Thin history** (<5 muestras): defaults neutros (stability=15, consistency=20) para no penalizar símbolos nuevos/DeFi.
+
+> v10.6 se re-optimizó solo sobre `spot_perp`; `cross_exchange`/`defi` conservan la estructura de liquidez de v10.5 (escalada al nuevo peso). El optimizador nunca aplica cambios solo — esta adopción fue manual tras revisar el reporte.
 
 Para **cross_exchange / DeFi**, los indicadores (momentum, z-score, percentile, regime) se calculan sobre `period_diffs` — diferencial por-período emparejado por timestamp — en lugar del `diff_series` diario. Esto garantiza ≥5-15 muestras incluso con pocos días de histórico. Ver `analysis/arbitrage.py:_analyze_differential_history`.
 
@@ -414,6 +419,31 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 
 ---
 
+## Evaluación y re-optimización del scoring (local, manual)
+
+El scoring se revisa periódicamente porque los pesos óptimos cambian con el
+régimen de mercado. Dos herramientas en `scripts/`, **ambas locales** (no corren
+en Railway; leen su DB en **solo lectura** vía `DATABASE_URL`). Dependencias en
+`requirements-dev.txt` (`optuna`, `pandas`, `sqlalchemy`, `numpy`) — **no** van en
+el `requirements.txt` de producción. Capa de datos compartida en
+`scripts/_scoring_data.py` (carga + caché de `funding_rate_snapshots`, features
+crudos por ventana), reusada por ambos scripts.
+
+| Script | Qué hace |
+|--------|----------|
+| `scripts/scoring_backtest.py` | **Evalúa** el scoring v10.5 actual: correlación score↔forward returns por componente, decay, mean-reversion z, valor del accel bonus. Importa el `opportunity_score` real (sin duplicar). Output: `reports/backtest_YYYYMMDD.md`. |
+| `scripts/scoring_optimizer.py` | **Re-optimiza** los pesos vía Optuna sobre un scoring paramétrico que espeja v10.5. Split train/val temporal, gate de monotonicity, guard de overfitting. **Solo genera candidato + reporte; nunca toca `analysis/scoring.py`.** Alcance v1: spot_perp. Output: `reports/optimizer_YYYYMMDD.md`, `reports/scoring_candidate_YYYYMMDD.py`, `_trials.csv`. |
+
+**Flujo de adopción:** correr el optimizer → leer el veredicto del reporte
+(ADOPTAR / REVISAR / MANTENER) → si convence, copiar a mano la función del
+candidato sobre `analysis/scoring.py:opportunity_score`. El optimizer nunca
+aplica cambios automáticamente.
+
+Lanzador local: `run_optimizer.ps1` (carga `DATABASE_URL` desde `.env`, valida
+deps, reenvía flags al script).
+
+---
+
 ## Comandos útiles
 
 ```bash
@@ -431,6 +461,15 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 # Force scan manual
 curl -X POST http://localhost:5000/api/force
+
+# Evaluar el scoring actual (local, read-only sobre la DB)
+pip install -r requirements-dev.txt
+python scripts/scoring_backtest.py
+
+# Re-optimizar pesos del scoring (genera candidato + reporte, no aplica)
+.\run_optimizer.ps1 --trials 20          # prueba rápida
+.\run_optimizer.ps1                       # run completo (600 trials)
+python scripts/scoring_optimizer.py --trials 20   # equivalente sin wrapper
 ```
 
 ---

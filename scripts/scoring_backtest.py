@@ -20,11 +20,10 @@ Output:
 
 import argparse
 import math
-import os
 import statistics
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from pathlib import Path
 
 # ── project root on sys.path so analysis.* imports work ──────────────────────
@@ -32,10 +31,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from analysis.scoring import opportunity_score
 from analysis.indicators import compute_all_indicators  # noqa: F401 (validate import)
+from _scoring_data import (
+    get_engine, load_fr_snapshots, estimate_fee_drag, base_window_features,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 LOOKBACK  = 30           # historical intervals for feature computation
@@ -53,52 +55,29 @@ SCORE_BUCKETS = [
     ("85+",   85, 101),
 ]
 
-# ── Database ──────────────────────────────────────────────────────────────────
-
-def _get_engine():
-    url = os.environ.get("DATABASE_URL", "")
-    if not url:
-        sys.exit("ERROR: DATABASE_URL no está configurada.")
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
-    return create_engine(url, pool_pre_ping=True)
-
-
 # ── Load data ─────────────────────────────────────────────────────────────────
 
 def load_data(force_reload: bool = False) -> tuple:
     """Pull funding_rate_snapshots + score_snapshots.
 
-    Caches results as CSV.  Returns (fr_df, ss_df).
+    funding_rate_snapshots se carga vía el módulo compartido; score_snapshots
+    se consulta aquí (solo lo usa el backtest) con su propio caché CSV.
+    Returns (fr_df, ss_df).
     """
+    fr = load_fr_snapshots(force_reload=force_reload, days=90)
+
     CACHE_DIR.mkdir(exist_ok=True)
-    cache_fr = CACHE_DIR / "fr_snapshots.csv"
     cache_ss = CACHE_DIR / "score_snapshots.csv"
 
-    if not force_reload and cache_fr.exists() and cache_ss.exists():
-        age_h = (datetime.now().timestamp() - cache_fr.stat().st_mtime) / 3600
+    if not force_reload and cache_ss.exists():
+        age_h = (datetime.now().timestamp() - cache_ss.stat().st_mtime) / 3600
         if age_h < 1.0:
-            print(f"  Usando caché ({age_h:.1f}h de antigüedad)")
-            fr = pd.read_csv(cache_fr, parse_dates=["captured_at"])
             ss = pd.read_csv(cache_ss, parse_dates=["captured_at"])
             return fr, ss
 
-    print("  Consultando base de datos...")
-    engine = _get_engine()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=90)
-
+    engine = get_engine()
     try:
         with engine.connect() as conn:
-            fr = pd.read_sql(
-                text("""
-                    SELECT symbol, exchange, rate, volume_24h, interval_hours,
-                           funding_ts, captured_at
-                    FROM   funding_rate_snapshots
-                    WHERE  captured_at >= :cutoff
-                    ORDER  BY symbol, exchange, captured_at
-                """),
-                conn, params={"cutoff": cutoff},
-            )
             ss = pd.read_sql(
                 text("""
                     SELECT symbol, exchange, mode, score, funding_rate, apr,
@@ -111,10 +90,7 @@ def load_data(force_reload: bool = False) -> tuple:
     except Exception as exc:
         sys.exit(f"Error al consultar la DB: {exc}")
 
-    print(f"  funding_rate_snapshots : {len(fr):,} filas")
     print(f"  score_snapshots        : {len(ss):,} filas")
-
-    fr.to_csv(cache_fr, index=False)
     ss.to_csv(cache_ss, index=False)
     return fr, ss
 
@@ -173,18 +149,6 @@ def _fee_pts(fee_drag: float) -> int:
     return 1
 
 
-def _estimate_fee_drag(settlement_avg: float, ppd: float,
-                       hold_days: int = 30) -> float:
-    """Estimate fee_drag = round-trip fees / expected revenue over hold_days.
-
-    Round-trip: ~0.30% (spot 0.10% ×2 + perp 0.05% ×2).
-    """
-    revenue = abs(settlement_avg) * ppd * hold_days
-    if revenue < 1e-10:
-        return 1.0
-    return min(0.003 / revenue, 1.0)
-
-
 # ── Build features ────────────────────────────────────────────────────────────
 
 def build_features(fr_df: pd.DataFrame) -> pd.DataFrame:
@@ -216,36 +180,21 @@ def build_features(fr_df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         for i in range(min_start, max_end):
-            lb_start = max(0, i - LOOKBACK)
-            hist     = rates[lb_start:i]      # lookback window (oldest→newest)
-            curr     = rates[i]
-            vol      = volumes[i]
-            ih       = max(float(intervs[i]), 1.0)
-            ppd      = 24.0 / ih
-
-            # Absolute rates for statistics
-            abs_hist = [abs(r) for r in hist if abs(r) > 1e-12]
-            if len(abs_hist) < 5:
+            bf = base_window_features(rates, volumes, intervs, i, LOOKBACK)
+            if bf is None:
                 continue
 
-            mean_h = statistics.mean(abs_hist)
-            std_h  = statistics.stdev(abs_hist) if len(abs_hist) > 1 else 0.0
-            cv     = std_h / mean_h if mean_h > 1e-12 else 999.0
-
-            # min_ratio: minimum absolute rate / mean absolute rate
-            min_ratio = min(abs_hist) / mean_h if mean_h > 1e-12 else 0.0
-
-            # streak: consecutive positive from end
-            streak = 0
-            for r in reversed(hist):
-                if r > 0:
-                    streak += 1
-                else:
-                    break
-
-            pct            = sum(1 for r in hist if r > 0) / len(hist) * 100
-            settlement_avg = mean_h
-            fee_drag       = _estimate_fee_drag(settlement_avg, ppd)
+            cv             = bf["cv"]
+            min_ratio      = bf["min_ratio"]
+            streak         = bf["streak"]
+            pct            = bf["pct"]
+            settlement_avg = bf["settlement_avg"]
+            ppd            = bf["ppd"]
+            fee_drag       = bf["fee_drag"]
+            curr           = bf["current_rate"]
+            vol            = bf["volume"]
+            ih             = bf["interval_h"]
+            hist           = bf["hist"]
             reality_penalty = settlement_avg > 0 and abs(curr) > settlement_avg * 2
 
             params = {

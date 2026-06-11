@@ -14,3 +14,7 @@ cache/score_snapshots.csv
 
 # Backtest report CSVs (large generated artifacts)
 reports/backtest_*.csv
+
+# Optimizer generated artifacts (candidato + historial de trials)
+reports/optimizer_*_trials.csv
+reports/scoring_candidate_*.py
