@@ -111,9 +111,113 @@ function applyFilters() {
   else if (currentSubTab === 'defi' && _lastDefiData) renderDefiOpps(_lastDefiData);
 }
 
+// ── Unified opportunity filters (Filtros panel) ──────────────
+const ALL_EXCHANGES = ['Binance','Bybit','OKX','Bitget','Hyperliquid','GMX','Aster','Lighter','Extended'];
+let _saveFiltersTimer = null;
+
+function getFilterState() {
+  const num = (id) => {
+    const v = parseFloat(document.getElementById(id)?.value);
+    return isNaN(v) ? null : v;
+  };
+  const exchanges = Array.from(
+    document.querySelectorAll('#f-exchanges input:checked')
+  ).map(c => c.value);
+  return { apr: num('f-apr'), score: num('f-score'),
+           days: num('f-days'), vol: num('f-vol'), exchanges };
+}
+
+function matchesFilters(o, f) {
+  if (f.apr != null && (o.apr || 0) < f.apr) return false;
+  if (f.score != null && (o.score || 0) < f.score) return false;
+  if (f.days != null && (o.estimated_hold_days || 0) < f.days) return false;
+  if (f.vol != null && f.vol > 0) {
+    const v = o.volume_24h || 0;
+    // volume 0/unknown (DeFi) passes; only hide known-but-too-small volume.
+    if (v > 0 && v < f.vol) return false;
+  }
+  if (f.exchanges.length) {
+    const exs = [o.exchange, o.long_exchange, o.short_exchange].filter(Boolean);
+    if (!exs.some(e => f.exchanges.includes(e))) return false;
+  }
+  return true;
+}
+
+function renderExchangeChips(selected) {
+  const cont = document.getElementById('f-exchanges');
+  if (!cont) return;
+  const sel = new Set(selected || []);
+  cont.innerHTML = ALL_EXCHANGES.map(ex =>
+    `<label class="ex-chip"><input type="checkbox" value="${ex}" ${sel.has(ex) ? 'checked' : ''} onchange="onFilterChange()">${ex}</label>`
+  ).join('');
+}
+
+function toggleFilters() {
+  const p = document.getElementById('filter-panel');
+  if (!p) return;
+  const show = p.style.display === 'none';
+  p.style.display = show ? '' : 'none';
+  document.getElementById('btn-filtros')?.classList.toggle('active', show);
+}
+
+function resetFilters() {
+  ['f-apr','f-score','f-days','f-vol'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  renderExchangeChips([]);
+  onFilterChange();
+}
+
+function onFilterChange() {
+  applyFilters();
+  if (_saveFiltersTimer) clearTimeout(_saveFiltersTimer);
+  _saveFiltersTimer = setTimeout(saveFilters, 800);
+}
+
+async function saveFilters() {
+  const f = getFilterState();
+  const data = {
+    min_apr: f.apr != null ? f.apr : 0,
+    min_score: f.score != null ? f.score : 0,
+    min_stability_days: f.days != null ? f.days : 0,
+    min_volume: f.vol != null ? f.vol : 0,
+    allowed_exchanges: f.exchanges.join(','),
+  };
+  try {
+    await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+  } catch (e) { console.error('saveFilters error:', e); }
+}
+
+async function loadFilters() {
+  try {
+    const res = await fetch('/api/config');
+    const cfg = await res.json();
+    const set = (id, val) => {
+      const el = document.getElementById(id);
+      if (el && val != null) el.value = val;
+    };
+    set('f-apr', cfg.min_apr);
+    set('f-score', cfg.min_score);
+    set('f-days', cfg.min_stability_days);
+    set('f-vol', cfg.min_volume);
+    const allowed = (cfg.allowed_exchanges || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    renderExchangeChips(allowed);
+    applyFilters();
+  } catch (e) { console.error('loadFilters error:', e); }
+}
+
 function sortAndFilter(opps) {
   const query = (document.getElementById('search-symbol')?.value || '').toLowerCase();
-  let filtered = query ? opps.filter(o => o.symbol.toLowerCase().includes(query)) : [...opps];
+  const f = getFilterState();
+  let filtered = opps.filter(o =>
+    (!query || o.symbol.toLowerCase().includes(query)) && matchesFilters(o, f)
+  );
 
   const fieldMap = {
     score: o => o.score || 0,
@@ -1774,10 +1878,6 @@ async function loadConfig() {
     const cfg = await res.json();
     document.getElementById('cfg-capital').value = cfg.total_capital;
     document.getElementById('cfg-max-pos').value = cfg.max_positions;
-    document.getElementById('cfg-min-vol').value = cfg.min_volume;
-    document.getElementById('cfg-min-apr').value = cfg.min_apr;
-    document.getElementById('cfg-min-score').value = cfg.min_score;
-    document.getElementById('cfg-min-days').value = cfg.min_stability_days;
     document.getElementById('cfg-alert-min').value = cfg.alert_minutes_before;
     document.getElementById('cfg-email-on').checked = cfg.email_enabled;
     document.getElementById('cfg-tg-token').value = cfg.tg_bot_token || '';
@@ -1791,10 +1891,6 @@ async function saveConfig() {
   const data = {
     total_capital: parseFloat(document.getElementById('cfg-capital').value),
     max_positions: parseInt(document.getElementById('cfg-max-pos').value),
-    min_volume: parseFloat(document.getElementById('cfg-min-vol').value),
-    min_apr: parseFloat(document.getElementById('cfg-min-apr').value),
-    min_score: parseInt(document.getElementById('cfg-min-score').value),
-    min_stability_days: parseInt(document.getElementById('cfg-min-days').value),
     alert_minutes_before: parseInt(document.getElementById('cfg-alert-min').value),
     email_enabled: document.getElementById('cfg-email-on').checked,
     tg_bot_token: document.getElementById('cfg-tg-token').value,
@@ -2028,6 +2124,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Mark first render done after initial load completes
   setTimeout(() => { _isFirstRender = false; }, 2000);
   startRefresh();
+  loadFilters();
   loadUserKeys();
   loadExchangeStatus();
   setInterval(loadExchangeStatus, 300000);

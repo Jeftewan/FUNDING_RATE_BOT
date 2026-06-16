@@ -51,6 +51,8 @@ class UserConfig(db.Model):
     email_enabled = db.Column(db.Boolean, default=False)
     tg_chat_id = db.Column(db.String(64), default="")
     tg_bot_token_encrypted = db.Column(db.String(512), default="")
+    # CSV of exchange names to show in the opportunities list ("" = all).
+    allowed_exchanges = db.Column(db.String(256), default="")
     # Legacy WhatsApp columns kept for migration; unused by new code.
     wa_phone = db.Column(db.String(20), default="")
     wa_apikey_encrypted = db.Column(db.String(512), default="")
