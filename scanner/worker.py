@@ -29,6 +29,11 @@ POST_SETTLEMENT_DELAY_SECS = 3 * 60
 # Tolerance (in seconds) when matching a settlement timestamp against
 # historical entries returned by the exchange / DB snapshots.
 SETTLEMENT_RATE_TOLERANCE_SECS = 120
+# Low, fixed floor used when scanning the opportunity universe. Per-user
+# volume filtering is done client-side from the Filtros panel, so the scan
+# itself only drops genuinely illiquid noise. DeFi venues that report
+# volume_24h=0 (unknown) are not excluded by this floor.
+SCAN_MIN_VOLUME = 100_000
 
 
 class ScannerWorker:
@@ -569,7 +574,9 @@ class ScannerWorker:
         with self.state_manager.lock:
             self.state_manager.set("status", "Escaneando...")
             self.state_manager.set("scanning", True)
-            min_volume = self.state_manager.get("min_volume", 1_000_000)
+            # Scan a broad universe with a low fixed floor; per-user volume
+            # filtering happens client-side in the Filtros panel.
+            min_volume = SCAN_MIN_VOLUME
 
         # 1. Fetch rates from all exchanges via CCXT
         all_rates = self.exchange_manager.fetch_all_funding_rates()
@@ -620,7 +627,7 @@ class ScannerWorker:
                         defi_data.append(fr.to_dict())
 
                 # DeFi cross-exchange opportunities (same logic as CEX).
-                # Both legs must meet the user's min_volume threshold.
+                # DeFi venues reporting volume_24h=0 (unknown) pass the floor.
                 defi_cross = self.arb_scanner.scan_cross_exchange_opportunities(
                     defi_rates, min_volume=min_volume
                 )
@@ -630,8 +637,8 @@ class ScannerWorker:
                     d["is_defi"] = True
                     defi_opportunities.append(d)
 
-                # Also scan CEX vs DeFi cross-exchange. Both legs must meet
-                # min_volume so CEX+DeFi mixed pairs are filtered symmetrically.
+                # Also scan CEX vs DeFi cross-exchange. The DeFi leg may report
+                # volume_24h=0 (unknown), which is treated as passing the floor.
                 combined_rates = {**all_rates, **defi_rates}
                 cex_defi_cross = self.arb_scanner.scan_cross_exchange_opportunities(
                     combined_rates, min_volume=min_volume

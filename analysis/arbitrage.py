@@ -173,7 +173,11 @@ class ArbitrageScanner:
             if len(rates_list) < 2:
                 continue
 
-            vol_rates = [r for r in rates_list if r.volume_24h >= mv]
+            # volume_24h == 0 means "unknown" (DeFi venues like GMX/Aster/
+            # Lighter/Extended don't expose it) → treat as passing the floor
+            # instead of excluding the leg.
+            vol_rates = [r for r in rates_list
+                         if r.volume_24h >= mv or r.volume_24h == 0]
             if len(vol_rates) < 2:
                 continue
 

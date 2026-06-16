@@ -58,11 +58,22 @@
         <button class="sub-tab active" id="subtab-cex" onclick="switchSubTab('cex')">CEX</button>
         <button class="sub-tab" id="subtab-defi" onclick="switchSubTab('defi')">DeFi</button>
       </div>
-      <div class="filter-bar">
-        <label>APR<input type="number" id="f-apr" value="10" class="inp-sm" onchange="loadCurrentOpps()">%</label>
-        <label>Score<input type="number" id="f-score" value="40" class="inp-sm" onchange="loadCurrentOpps()"></label>
-      </div>
+      <button class="btn btn-secondary btn-filtros" id="btn-filtros" onclick="toggleFilters()">Filtros</button>
       <span class="count" id="opp-count">0</span>
+    </div>
+
+    <div class="filter-panel" id="filter-panel" style="display:none">
+      <div class="filter-row">
+        <label>APR mín %<input type="number" id="f-apr" class="inp-sm" oninput="onFilterChange()"></label>
+        <label>Score mín<input type="number" id="f-score" class="inp-sm" oninput="onFilterChange()"></label>
+        <label>Días estab.<input type="number" id="f-days" class="inp-sm" oninput="onFilterChange()"></label>
+        <label>Vol 24h mín<input type="number" id="f-vol" class="inp-sm" style="width:90px" oninput="onFilterChange()"></label>
+      </div>
+      <div class="filter-exchanges" id="f-exchanges"></div>
+      <div class="filter-actions">
+        <button class="btn btn-secondary" onclick="resetFilters()">Limpiar</button>
+        <span class="filter-hint">Se aplican en vivo y se recuerdan. Exchanges vacío = todos.</span>
+      </div>
     </div>
 
     <div class="sort-bar" id="sort-bar">
@@ -112,10 +123,6 @@
       <div class="cfg-grid">
         <label>Capital USD<input type="number" id="cfg-capital" class="inp"></label>
         <label>Max posiciones<input type="number" id="cfg-max-pos" class="inp"></label>
-        <label>Vol min 24h<input type="number" id="cfg-min-vol" class="inp"></label>
-        <label>APR minimo %<input type="number" id="cfg-min-apr" class="inp"></label>
-        <label>Score minimo<input type="number" id="cfg-min-score" class="inp"></label>
-        <label>Dias estabilidad<input type="number" id="cfg-min-days" class="inp"></label>
         <label>Alerta (min antes)<input type="number" id="cfg-alert-min" class="inp"></label>
       </div>
     </div>

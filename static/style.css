@@ -241,6 +241,52 @@ body {
   gap: 3px;
 }
 
+/* ── Filtros panel ─────────────────────────────────── */
+
+.btn-filtros { font-size: 10px; padding: 4px 12px; }
+.btn-filtros.active { border-color: var(--blue); color: #60a5fa; }
+
+.filter-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  margin: 4px 0 6px;
+  background: rgba(17,19,24,0.5);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 10px;
+  font-family: var(--font-ui);
+  color: var(--text-secondary);
+}
+
+.filter-row label { display: flex; align-items: center; gap: 4px; }
+
+.filter-exchanges { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.ex-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-family: var(--font-ui);
+  color: var(--text-secondary);
+  padding: 3px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.filter-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.filter-hint { font-size: 9px; color: var(--text-muted); }
+
 .count {
   font-size: 10px;
   font-family: var(--font);

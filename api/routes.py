@@ -101,6 +101,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "email_enabled": us.get("email_enabled", False),
                     "tg_chat_id": us.get("tg_chat_id", ""),
                     "tg_bot_token": us.get("tg_bot_token", ""),
+                    "allowed_exchanges": us.get("allowed_exchanges", ""),
                 })
             # Fallback defaults if no DB
             return jsonify({
@@ -109,6 +110,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 "min_stability_days": 3, "max_positions": 5,
                 "alert_minutes_before": 5, "email_enabled": False,
                 "tg_chat_id": "", "tg_bot_token": "",
+                "allowed_exchanges": "",
             })
 
         # POST — save config to DB
@@ -135,6 +137,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 db_data["tg_chat_id"] = str(data["tg_chat_id"]).strip()
             if "tg_bot_token" in data:
                 db_data["tg_bot_token"] = str(data["tg_bot_token"]).strip()
+            if "allowed_exchanges" in data:
+                db_data["allowed_exchanges"] = str(data["allowed_exchanges"]).strip()
 
             get_db_persist().save_user_config(uid, db_data)
 
@@ -155,27 +159,24 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @app.route("/api/opportunities")
     @auth_required
     def api_opportunities():
-        """Unified opportunity list sorted by score."""
+        """Unified opportunity list sorted by score.
+
+        Display filters (APR / score / stability days / volume / exchange) are
+        applied client-side from the unified Filtros panel; this endpoint
+        returns the full list so the panel is the single source of truth.
+        """
         with state_manager.lock:
             s = state_manager.state
-            min_apr = s.get("min_apr", 10)
-            min_score = s.get("min_score", 40)
             now = time.time()
-
-            min_stability_days = s.get("min_stability_days", 3)
 
             opps = s.get("opportunities", [])
             filtered = []
             for o in opps:
-                hold_days = o.get("estimated_hold_days", 0)
-                if (o.get("apr", 0) >= min_apr
-                        and o.get("score", 0) >= min_score
-                        and hold_days >= min_stability_days):
-                    # Recalculate mins_to_next live
-                    nts = o.get("next_funding_ts", 0)
-                    if nts and nts > 0:
-                        o["mins_to_next"] = max(0, (nts / 1000 - now) / 60)
-                    filtered.append(o)
+                # Recalculate mins_to_next live
+                nts = o.get("next_funding_ts", 0)
+                if nts and nts > 0:
+                    o["mins_to_next"] = max(0, (nts / 1000 - now) / 60)
+                filtered.append(o)
 
             # Enrich with score trends if DB is available
             if db_enabled and filtered:

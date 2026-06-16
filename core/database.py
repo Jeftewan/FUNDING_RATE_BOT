@@ -96,6 +96,8 @@ def _run_migrations(db):
         # Auto-execution flag: position opened via real API orders (vs manual
         # bookkeeping). Drives the AUTO badge in the UI.
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS auto_executed BOOLEAN DEFAULT FALSE",
+        # Opportunity-list exchange filter (CSV of exchange names, "" = all).
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS allowed_exchanges VARCHAR(256) DEFAULT ''",
     ]
     for sql in migrations:
         try:

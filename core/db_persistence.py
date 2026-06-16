@@ -85,6 +85,7 @@ class DBPersistence:
             "email_enabled": config.email_enabled if config else False,
             "tg_chat_id": config.tg_chat_id if config else "",
             "tg_bot_token": decrypt_value(config.tg_bot_token_encrypted) if config and config.tg_bot_token_encrypted else "",
+            "allowed_exchanges": config.allowed_exchanges if config else "",
             "positions": [self._pos_to_dict(p) for p in positions],
             "history": [self._hist_to_dict(h) for h in history],
             "total_earned": sum(p.earned_real for p in positions),
@@ -104,7 +105,8 @@ class DBPersistence:
 
         for key in ("total_capital", "min_volume", "min_apr",
                      "min_score", "min_stability_days", "max_positions",
-                     "alert_minutes_before", "email_enabled", "tg_chat_id"):
+                     "alert_minutes_before", "email_enabled", "tg_chat_id",
+                     "allowed_exchanges"):
             if key in data:
                 setattr(config, key, data[key])
 
