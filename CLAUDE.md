@@ -251,15 +251,37 @@ Coloca y ejecuta las órdenes reales de ambas piernas usando las API keys del us
 |-------|-------------|
 | `total_capital` | Valida capital disponible al abrir posición (`portfolio/manager.py:43`) |
 | `max_positions` | Bloquea abrir más posiciones (`portfolio/manager.py:68`) |
-| `min_volume` | Filtra ambas piernas individualmente en todos los escaneos: spot_perp, cross_exchange CEX, cross DeFi-only y cross CEX+DeFi (`scanner/worker.py`, `analysis/arbitrage.py:scan_cross_exchange_opportunities`) |
-| `min_apr` | Filtra oportunidades en `/api/opportunities` |
-| `min_score` | Filtra oportunidades en `/api/opportunities` |
-| `min_stability_days` | Filtra por `estimated_hold_days` en `/api/opportunities` |
+| `min_volume` | **Filtro de display** (panel Filtros, client-side). Persistido para recordarlo entre sesiones; ya **no** gatea el scan. El scan usa un piso bajo y fijo `SCAN_MIN_VOLUME` (`scanner/worker.py`). |
+| `min_apr` | **Filtro de display** (panel Filtros, client-side). Ya no se filtra en `/api/opportunities`. |
+| `min_score` | **Filtro de display** (panel Filtros, client-side). Ya no se filtra en `/api/opportunities`. |
+| `min_stability_days` | **Filtro de display** (panel Filtros, client-side, sobre `estimated_hold_days`). Ya no se filtra en `/api/opportunities`. |
+| `allowed_exchanges` | **Filtro de display** (panel Filtros, client-side): CSV de exchanges a mostrar; `""` = todos. Matchea `exchange`/`long_exchange`/`short_exchange`. |
 | `alert_minutes_before` | Dispara `PRE_PAYMENT_UNFAVORABLE` N minutos antes del pago |
 | `email_enabled` | Master switch de notificaciones Telegram |
 | `tg_chat_id` / `tg_bot_token` | Credenciales Telegram (token cifrado con Fernet) |
 
 `scan_interval` existe en la tabla DB pero **no se usa** — el scanner es event-driven.
+
+### Filtros unificados de oportunidades (panel Filtros)
+
+Todos los filtros de la lista viven en **un solo panel "Filtros"** en la pestaña
+Oportunidades (`templates/index.html`, `static/app.js`), aplicados **en vivo
+client-side** sobre la lista completa que devuelve el backend, válidos tanto para
+CEX como DeFi. Antes estaban dispersos: los inputs APR/Score del toolbar estaban
+muertos (disparaban un reload pero su valor nunca se leía) y los reales vivían en
+la pestaña Config filtrando server-side.
+
+- `static/app.js:sortAndFilter()` filtra por `apr` / `score` / `estimated_hold_days`
+  / `volume_24h` / exchange + búsqueda por símbolo. El volumen `0`/desconocido
+  (DeFi) **no oculta** la oportunidad.
+- Los valores se persisten en `user_configs` vía `/api/config` (debounced) y se
+  cargan con `loadFilters()` al iniciar. La pestaña Config solo conserva
+  `total_capital`, `max_positions`, `alert_minutes_before` y Telegram.
+- `/api/opportunities` y `/api/defi_opportunities` devuelven la lista **completa**
+  (sin filtrar para display); el panel es la única fuente de verdad.
+- El scan corre con `SCAN_MIN_VOLUME` (piso bajo fijo) para un universo amplio; en
+  el gate cross-exchange, `volume_24h == 0` (desconocido en DeFi) **pasa** en vez
+  de excluir la pierna (`analysis/arbitrage.py`).
 
 ---
 
@@ -356,6 +378,7 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 | `GET /auth/page` | Pública | `301 → /?login=1` (compat deep-links) |
 | `GET /health` | Pública | JSON (healthcheck Railway) |
 | `GET /api/*` | `@auth_required` | JSON — 401 JSON si no auth |
+| `GET /api/opportunities` | `@auth_required` | Lista **completa** (sin filtrar para display); los filtros se aplican client-side en el panel Filtros. Recalcula `mins_to_next` y enriquece con `score_trend`. |
 | `GET /api/earnings/daily?days=N` | `@auth_required` | Rollup diario combinando activas + cerradas: `{today, yesterday, last_7d, last_30d, all_time, realized_apr_7d, series:[{date, earned, fees, net}]}` |
 | `PATCH /api/positions/<id>/earnings` | `@auth_required` | Body `{earned: float}` — override absoluto reseteable: setea `earned_real` + `last_earn_update=now`, agrega entry `kind:"manual_adjust"` a `payments_json`. Próximos settlements se acumulan encima. |
 | `PATCH /api/history/<id>/earnings` | `@auth_required` | Body `{earned?, fees?}` — edita posición cerrada, recalcula `net_earned`, registra en `notes`. |
@@ -405,7 +428,8 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 
 ### Mejoras identificadas
 
-- **DeFi history fiabilidad**: `fetch_funding_history` en `defi_manager.py` depende de que los snapshots existan en DB. En deploys nuevos o símbolos nuevos, thin-history (<5 muestras) da scoring neutro — correcto pero subóptimo para toma de decisiones. Nota: GMX, Aster, Lighter y Extended reportan `volume_24h=0`; con el filtro `min_volume` ahora aplicado a cada pierna, estos pares quedan excluidos a menos que el usuario baje `min_volume` a 0.
+- **DeFi history fiabilidad**: `fetch_funding_history` en `defi_manager.py` depende de que los snapshots existan en DB. En deploys nuevos o símbolos nuevos, thin-history (<5 muestras) da scoring neutro — correcto pero subóptimo para toma de decisiones. Nota: GMX, Aster, Lighter y Extended reportan `volume_24h=0`; el gate de volumen del scan trata ese `0` (desconocido) como **pasa**, así que estos pares ya no quedan excluidos (el filtro de volumen real es de display, client-side).
+- **Scoring DeFi bajo (pendiente)**: los modos `cross_exchange`/`defi` puntúan bajo de forma estructural — consistency (46) + stability (21) = 67% del score se calculan sobre el *diferencial* (`period_diffs`), que cambia de signo mucho más que una tasa única → streak/consistencia bajos, CV alto. A esto se suma thin-history y `volume_24h=0`. **Pendiente** (otro plan): `defi_opportunity_score()` separado con umbrales heurísticos, tras verificar cuántos snapshots/muestras hay acumulados.
 - **Alertas sin posiciones activas**: el scanner solo corre cuando hay posiciones abiertas o se fuerza manualmente. Si no hay posiciones, las oportunidades excepcionales no se escanean automáticamente.
 - **Tests**: no hay suite de tests automatizados. El proyecto depende del syntax check via `python -c "import ast; ast.parse(...)"`.
 - **Rate limits DeFi**: los adaptadores DeFi no tienen retry exponencial ante errores HTTP 429/503.
@@ -478,6 +502,7 @@ python scripts/scoring_optimizer.py --trials 20   # equivalente sin wrapper
 
 | Hash | Cambio |
 |------|--------|
+| `29cfc04` | feat(filters): unificar filtros de oportunidades en un panel (APR/score/días/volumen + filtro por exchange) aplicado en vivo client-side; `/api/opportunities` deja de filtrar para display; scan con piso `SCAN_MIN_VOLUME`; DeFi `volume_24h=0` ya no se excluye; nueva columna `user_configs.allowed_exchanges` |
 | `pending` | feat(positions): minidashboard de earnings (KPIs hoy/7d/30d/total + chart toggle cumulativo/diario), edición manual de earnings en activas y cerradas, limpieza flujo Telegram (credenciales explícitas sin mutar state, dedup_key consolidada, validación de formato, drop orphan alerts, fix logs legacy WhatsApp) |
 | `ec872cd` | feat(routing): landing pública en `/`, dashboard SPA en `/app`, login modal en landing |
 | `85b4f6a` | Fix timing captura tasa al pago: fetch_settlement_rate CEX/DeFi, triggers 3→2 |
