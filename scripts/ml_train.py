@@ -42,6 +42,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 
 import scoring_optimizer as opt
 from ml_diagnostic import TARGET, md_table, reconstruct_v11_params, spearman
+from ml_stability import top_stats   # net_apr medio + %rent del top por ranking
 from analysis.ml_features import build_feature_vector, FEATURE_NAMES
 
 REPORT_DIR = ROOT / "reports"
@@ -180,13 +181,25 @@ def walk_forward(feat: pd.DataFrame, fmat: pd.DataFrame, heur_scores: pd.Series,
         # POSICIÓN, igual que el vector-lista que le pasa prod (analysis/ml_scorer).
         gbr.fit(fmat.loc[tr_idx].values, feat.loc[tr_idx, TARGET])
         pred = gbr.predict(fmat.loc[te_mask].values)
-        h_ic = spearman(heur_scores[te_mask], feat.loc[te_mask, TARGET])
-        m_ic = spearman(pd.Series(pred, index=feat[te_mask].index), feat.loc[te_mask, TARGET])
+        test_df = feat.loc[te_mask]
+        heur_te = heur_scores[te_mask].values
+        h_ic = spearman(pd.Series(heur_te, index=test_df.index), test_df[TARGET])
+        m_ic = spearman(pd.Series(pred, index=test_df.index), test_df[TARGET])
+        # Significancia ECONÓMICA: net_apr medio del top por ranking (no solo el
+        # IC estadístico). Cuánta plata gana ordenar por modelo vs por heurístico.
+        h_d10, _ = top_stats(test_df, heur_te, 0.10)
+        m_d10, m_d10p = top_stats(test_df, pred, 0.10)
+        h_t1, _ = top_stats(test_df, heur_te, 0.01)
+        m_t1, _ = top_stats(test_df, pred, 0.01)
         folds.append(dict(win=f"{ws.date()}→{we.date()}", n_te=n_te,
                           h_ic=round(h_ic, 3), m_ic=round(m_ic, 3),
-                          uplift=round(m_ic - h_ic, 3)))
+                          uplift=round(m_ic - h_ic, 3),
+                          h_d10=h_d10, m_d10=m_d10, d10_lift=round(m_d10 - h_d10, 1),
+                          h_t1=h_t1, m_t1=m_t1, t1_lift=round(m_t1 - h_t1, 1),
+                          m_d10p=m_d10p))
         print(f"  {folds[-1]['win']}: IC heur={h_ic:.3f} ml={m_ic:.3f} "
-              f"uplift={m_ic - h_ic:+.3f}")
+              f"uplift={m_ic - h_ic:+.3f} | net_apr top10 heur={h_d10} ml={m_d10} "
+              f"(Δ{m_d10 - h_d10:+.1f})")
         ws = we
     return folds
 
@@ -241,7 +254,18 @@ def main():
     mean_up = statistics.mean(ups)
     sd_up = statistics.pstdev(ups) if len(ups) > 1 else 0.0
     all_pos = all(u > 0 for u in ups)
-    stable = all_pos and mean_up >= 0.05 and sd_up <= 0.05
+
+    def _nanmean(xs):
+        xs = [x for x in xs if x == x]  # descarta NaN (folds con top <5 muestras)
+        return round(statistics.mean(xs), 1) if xs else float("nan")
+
+    mean_d10_lift = _nanmean([f["d10_lift"] for f in folds])
+    mean_t1_lift = _nanmean([f["t1_lift"] for f in folds])
+    # PROMOVER exige robustez estadística (uplift IC) Y económica (el net_apr del
+    # top sube, no solo la correlación). Un IC mejor que no eleva la ganancia del
+    # top no justifica desplegar.
+    econ_ok = (mean_d10_lift == mean_d10_lift and mean_d10_lift > 0)
+    stable = all_pos and mean_up >= 0.05 and sd_up <= 0.05 and econ_ok
 
     print("[6/6] Entrenando modelo FINAL + calibrando + exportando...")
     fit_idx = feat.sample(n=min(TRAIN_SAMPLE, len(feat)), random_state=42).index
@@ -270,6 +294,8 @@ def main():
             "wf_uplift_mean": round(mean_up, 3),
             "wf_uplift_sd": round(sd_up, 3),
             "wf_all_positive": all_pos,
+            "wf_net_apr_top10_lift_mean": mean_d10_lift,
+            "wf_net_apr_top1pct_lift_mean": mean_t1_lift,
         },
     }
     MODELS_DIR.mkdir(exist_ok=True)
@@ -281,11 +307,17 @@ def main():
     # ── Reporte ──
     import sklearn
     imp = sorted(zip(FEATURE_NAMES, model.feature_importances_), key=lambda x: -x[1])
-    verdict = ("PROMOVER — el modelo bate al heurístico de forma estable; commit + push."
-               if stable else
-               ("NO PROMOVER — uplift inconsistente entre folds; investigar drift."
-                if not all_pos else
-                "REVISAR — uplift positivo pero marginal/ruidoso; decidir según el detalle."))
+    if stable:
+        verdict = ("PROMOVER — el modelo bate al heurístico de forma estable (IC) Y "
+                   "eleva el net_apr del top (económico); commit + push.")
+    elif not all_pos:
+        verdict = "NO PROMOVER — uplift IC inconsistente entre folds; investigar drift."
+    elif not econ_ok:
+        verdict = ("REVISAR — el IC mejora pero el net_apr del top NO sube "
+                   f"(Δtop-decil {mean_d10_lift}); el ranking gana correlación sin "
+                   "traducirse en ganancia. No desplegar sin entender por qué.")
+    else:
+        verdict = "REVISAR — uplift positivo pero marginal/ruidoso; decidir según el detalle."
     live_line = {
         "ok": f"IC en vivo {live['ic']} sobre {live['n']} predicciones (modelo {live['version']}). "
               "Compará contra el uplift esperado; una caída fuerte = drift.",
@@ -310,15 +342,27 @@ def main():
 
 ## 2. Walk-forward — modelo nuevo vs heurístico v11.0 ({len(folds)} folds)
 
-{md_table(["Ventana test", "n_test", "IC heur", "IC ML", "Uplift"],
-          [[f["win"], f["n_te"], f["h_ic"], f["m_ic"], f"{f['uplift']:+.3f}"] for f in folds])}
+Por fold: rank-IC (robustez estadística) + net_apr medio del top-10% por ranking
+(robustez ECONÓMICA — cuánta plata gana ordenar por modelo vs por heurístico).
+
+{md_table(["Ventana test", "n_test", "IC heur", "IC ML", "Uplift",
+           "net_apr top10 heur", "net_apr top10 ML", "Δtop10", "Δtop1%"],
+          [[f["win"], f["n_te"], f["h_ic"], f["m_ic"], f"{f['uplift']:+.3f}",
+            f["h_d10"], f["m_d10"], f"{f['d10_lift']:+.1f}", f"{f['t1_lift']:+.1f}"]
+           for f in folds])}
 
 {md_table(["Métrica", "Valor"],
           [["Uplift IC medio", f"{mean_up:+.3f}"],
            ["Uplift IC σ", f"{sd_up:.3f}"],
-           ["Positivo en todos los folds", "Sí" if all_pos else "No"]])}
+           ["Positivo en todos los folds", "Sí" if all_pos else "No"],
+           ["Δ net_apr top-decil medio (ML − heur)", f"{mean_d10_lift:+.1f}"],
+           ["Δ net_apr top-1% medio (ML − heur)", f"{mean_t1_lift:+.1f}"]])}
 
-Umbral PROMOVER: uplift>0 en todos los folds, medio ≥0.05, σ≤0.05.
+**net_apr está en % anualizado.** El Δtop es lo que subiría tu rendimiento si
+tradeás las mejores oportunidades rankeadas por el modelo en vez de por el score.
+
+Umbral PROMOVER: uplift IC>0 en todos los folds, medio ≥0.05, σ≤0.05, **y**
+Δ net_apr top-decil medio > 0 (la mejora estadística se traduce en ganancia).
 
 ## 3. Feature importances (modelo final)
 
@@ -337,7 +381,9 @@ requirements-dev.txt. Un mismatch rompe `joblib.load` en Railway.
     report_path.write_text(out, encoding="utf-8")
 
     print(f"\n  Reporte: {report_path}")
-    print(f"  Walk-forward: uplift medio={mean_up:+.3f} σ={sd_up:.3f} all_pos={all_pos}")
+    print(f"  Walk-forward: uplift IC medio={mean_up:+.3f} σ={sd_up:.3f} all_pos={all_pos}")
+    print(f"  Significancia económica: Δnet_apr top-decil medio={mean_d10_lift:+.1f} "
+          f"top-1%={mean_t1_lift:+.1f}")
     print(f"  -> {verdict}")
     if stable:
         print("\n  Para desplegar:")
