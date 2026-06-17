@@ -115,27 +115,43 @@ Antes del cambio, `_record_earnings` grababa `cfr` (la tasa "vigente" al scan) y
 
 ---
 
-## Sistema de scoring v10.6
+## Sistema de scoring v11.0
 
-Puntaje **0–100**. Pesos re-optimizados con Optuna (600 trials) sobre 90 días de
-`funding_rate_snapshots` vía `scripts/scoring_optimizer.py`. Adoptado por el salto
-en Profit Rate del top (score ≥70): 4% → 11% en validación (~3× más rentable neto),
-con un top más selectivo. Ver `reports/optimizer_20260610.md`.
+Puntaje **0–100**. Re-optimizado con Optuna (600 trials) sobre 90 días de
+`funding_rate_snapshots` vía `scripts/scoring_optimizer.py`. **Cambio de objetivo
+vs v10.6:** el optimizer ahora maximiza **APR-neto (velocidad de capital)** neto de
+fees, ajustado a riesgo y predictivo — no la durabilidad. Motivo: v10.6 premiaba la
+estabilidad e **invertía el yield** (daba más score a 0.05%/día que a 0.18%/día). En
+validación el bucket de score alto pasa de Net APR −10.9 a **+34.3** y el decil top
+deja de empatar con el tier 2. Ver `reports/optimizer_20260617.md` y
+`reports/profit_{diagnosis,simulation}_20260616.md`.
 
-| Dimensión | Puntos (v10.5→v10.6) | Factor más importante |
+| Dimensión | Puntos (v10.6→v11.0) | Cambio |
 |-----------|--------|-----------------------|
-| Consistencia | 44 → **46** | Spearman ρ≈0.57 (predictor #1) |
-| Estabilidad | 31 → **21** | Spearman ρ≈0.32 (predictor #2) |
-| Yield | 13 → **17** | Sweet spot 0.03–0.10%/día |
-| Fee efficiency | 5 → **8** | Fee drag < 0.1 = máximo |
-| Liquidez | 4 → **6** | Umbrales por modo (spot_perp > cross > defi) |
-| Tendencia | 3 → **1** | Momentum + percentil |
+| Consistencia | 46 → **50** | streak/pct_positive (predictor real, ρ≈0.4) |
+| Yield | 17 → **30** | **monótono** ahora (más yield = más score) |
+| Fee efficiency | 8 → **16** | clave para el neto |
+| Estabilidad | 21 → **4** | cv es peso muerto (ρ≈0.05 vs net) |
+| Liquidez | 6 → **0** (spot_perp) | sin poder predictivo; cross/defi conservan 6 |
+| Tendencia | 1 → **0** | irrelevante |
 
-**Penalizaciones:** z-score > 0.5 (hasta −20 pts, umbrales 3.2/2.6/2.2/1.5/0.9/0.5), momentum decelerado −3 (accelerating/negative ya no penalizan).  
-**Hard caps:** z>2.5 → máx 47; streak<4 con percentil≥90 → máx 36; reality penalty (rate>2.6×avg) → máx 54.  
-**Thin history** (<5 muestras): defaults neutros (stability=15, consistency=20) para no penalizar símbolos nuevos/DeFi.
+**Yield monótono con saturación:** `yield_day_pct` → factor creciente
+(0.25/0.40/0.60/0.90/1.0) en umbrales 0.025/0.08/0.19/0.44 %/día × peso 30. El
+reality-guard ya no es hard-cap sino un **multiplicador suave** (×0.90 si
+`current_rate > 4× settlement_avg`).  
+**Penalizaciones:** momentum accel −1 / decel −8 / neg −4; z-score (umbrales
+3.3/2.6/1.8/1.5/0.9, hasta −23).  
+**Hard caps:** z>2.0 → máx 47; streak<3 con percentil≥85 → máx 36 (el reality
+hard-cap desaparece, vive en el multiplicador de yield).  
+**Thin history** (<5 muestras): defaults neutros **re-escalados** a v11.0
+(stability=3, consistency=22) para no sobre-acreditar símbolos nuevos/DeFi.
 
-> v10.6 se re-optimizó solo sobre `spot_perp`; `cross_exchange`/`defi` conservan la estructura de liquidez de v10.5 (escalada al nuevo peso). El optimizador nunca aplica cambios solo — esta adopción fue manual tras revisar el reporte.
+> v11.0 se re-optimizó solo sobre `spot_perp` (liquidez→0). Para
+`cross_exchange`/`defi` se **conserva** la estructura de liquidez de v10.6 (6 pts),
+sin re-validar — pendiente de un tuning propio. El optimizador nunca aplica cambios
+solo — esta adopción fue manual tras revisar el reporte. **Pendiente de sync:**
+`scripts/scoring_optimizer.py:BASELINE_PARAMS` sigue en v10.6; actualizarlo a v11.0
+antes de la próxima re-optimización.
 
 Para **cross_exchange / DeFi**, los indicadores (momentum, z-score, percentile, regime) se calculan sobre `period_diffs` — diferencial por-período emparejado por timestamp — en lugar del `diff_series` diario. Esto garantiza ≥5-15 muestras incluso con pocos días de histórico. Ver `analysis/arbitrage.py:_analyze_differential_history`.
 
