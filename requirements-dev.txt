@@ -1,6 +1,6 @@
 # Dependencias SOLO para herramientas de research locales (no runtime del bot).
-# No se instalan en Railway. Usadas por scripts/scoring_backtest.py y
-# scripts/scoring_optimizer.py.
+# No se instalan en Railway. Usadas por scripts/scoring_backtest.py,
+# scripts/scoring_optimizer.py y scripts/ml_diagnostic.py.
 #
 #   pip install -r requirements-dev.txt
 #
@@ -9,3 +9,4 @@ optuna
 pandas
 sqlalchemy
 numpy
+scikit-learn  # ml_diagnostic.py — techo de predictibilidad (GradientBoosting)
