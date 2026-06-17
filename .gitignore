@@ -18,3 +18,6 @@ reports/backtest_*.csv
 # Optimizer generated artifacts (candidato + historial de trials)
 reports/optimizer_*_trials.csv
 reports/scoring_candidate_*.py
+
+# Profit simulation per-window CSVs (datos generados; el .md es el resumen)
+reports/profit_sim_*.csv

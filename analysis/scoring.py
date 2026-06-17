@@ -1,37 +1,40 @@
-"""Opportunity scoring v10.6 — pesos re-optimizados (Optuna, 600 trials).
+"""Opportunity scoring v11.0 — re-optimizado hacia ganancia neta (Optuna, 600 trials).
 
-Adoptado desde scripts/scoring_optimizer.py. Ver reports/optimizer_20260610.md.
+Adoptado desde scripts/scoring_optimizer.py. Ver reports/optimizer_20260617.md.
 
-Changes from v10.5:
-  * Re-optimizado sobre 90 días de funding_rate_snapshots. Objetivo:
-    durabilidad + rentabilidad neta + monotonicity. Motivo de adopción: el
-    Profit Rate del top (score ≥70) sube 4% → 11% en validación (~3× más
-    rentable neto), con un top más selectivo (33.5% → 28% de observaciones).
-  * Pesos: Stability 31→21, Consistency 44→46, Liquidity 4→6, Yield 13→17,
-    Fee 5→8, Trend 3→1.
-  * Yield reality-penalty threshold 2.0× → 2.6×.
-  * Momentum penalties relajadas: accelerating/negative → 0; decelerating −8→−3.
-  * Z-penalties recalibradas (umbrales 3.2/2.6/2.2/1.5/0.9/0.5).
-  * Hard caps: z>2.5 39→47; streak-cap (streak<3 & pctl≥80 → ≤50) pasa a
-    (streak<4 & pctl≥90 → ≤36); reality 61→54.
-  * Mode-awareness y thin-history defaults se conservan de v10.5. La
-    optimización valida solo spot_perp; cross_exchange/defi conservan la
-    estructura de liquidez de v10.5 (solo escalan con el nuevo peso).
+Cambio de objetivo vs v10.6: el optimizer ahora maximiza **APR-neto (velocidad de
+capital)** neto de fees, ajustado a riesgo y predictivo — no la durabilidad. Motivo:
+v10.6 premiaba la estabilidad y SUB-premiaba/invertía el yield (daba más score a
+0.05%/día que a 0.18%/día, castigando justo las oportunidades más rentables). En
+validación el yield queda monótono (más yield = más score), el bucket de score alto
+pasa de Net APR negativo (−10.9) a positivo (+34.3) y el decil top deja de empatar
+con el tier 2.
 
-Base dimensions (99 pts max):
-  1. Stability       (21 pts)
-  2. Consistency     (46 pts)
-  3. Liquidity       ( 6 pts)
-  4. Yield           (17 pts)
-  5. Fee Efficiency  ( 8 pts)
-  6. Trend           ( 1 pts)
+Cambios vs v10.6:
+  * YIELD: no-monotónico (sweet-spot 0.03–0.10%/día) → MONOTÓNICO con saturación
+    (más yield = más score hasta 0.44%/día). El reality-guard pasa de hard-cap a
+    un multiplicador suave (×0.90 si current > 4× settlement).
+  * Pesos: Stability 21→4 (cv es peso muerto, ρ≈0.05 vs net), Consistency 46→50,
+    Yield 17→30, Fee 8→16, Trend 1→0, Liquidity 6→0 (solo spot_perp; ver abajo).
+  * Momentum penalties: accel 0→−1, decel −3→−8, neg 0→−4.
+  * Z-penalties y hard caps recalibrados (z>2.0→47, streak<3 & pctl≥85→36; el
+    reality hard-cap desaparece, ahora vive en el multiplicador de yield).
+  * Thin-history defaults re-escalados a los pesos nuevos (stability 15→3,
+    consistency 20→22) para no sobre-acreditar símbolos nuevos/DeFi.
+  * LIQUIDITY: la optimización valida solo spot_perp (→0). Para cross_exchange/defi
+    se CONSERVA la estructura de liquidez de v10.6 (6 pts), para no degradar una
+    dimensión que este run no re-validó.
+
+Base dimensions:
+  spot_perp (100 pts): Consistency 50 | Yield 30 | Fee 16 | Stability 4 | Liq 0 | Trend 0
+  cross_exchange/defi: + Liquidity (6 pts, estructura v10.6 conservada)
 """
 import math
 from analysis.indicators import compute_all_indicators
 
 
 def opportunity_score(params: dict) -> int:
-    """Unified scoring for any arbitrage opportunity (v10.6)."""
+    """Unified scoring for any arbitrage opportunity (v11.0)."""
     sc = 0
 
     cv = params.get("cv", 999)
@@ -48,109 +51,88 @@ def opportunity_score(params: dict) -> int:
 
     # Thin-history detection: <5 samples means we can't trust consistency
     # metrics; use neutral fallbacks so new/DeFi symbols aren't scored 0.
+    # Defaults re-escalados a los pesos v11.0 (stability máx 4, consistency 50).
     thin = len(rates) < 5
 
-    # -- 1. STABILITY (21 pts) ------------------------------------
+    # -- 1. STABILITY (4 pts) -------------------------------------
     if thin:
-        sc += 15  # neutral
-    elif cv < 0.2 and min_ratio > 0.5:   sc += 21
-    elif cv < 0.3 and min_ratio > 0.3:   sc += 16
-    elif cv < 0.3:                        sc += 14
-    elif cv < 0.5:                        sc += 9
-    elif cv < 0.8:                        sc += 5
-    elif cv < 1.2:                        sc += 2
-    else:                                 sc += 1
+        sc += 3  # neutral (re-escalado)
+    elif cv < 0.2 and min_ratio > 0.5:   sc += 4
+    elif cv < 0.3 and min_ratio > 0.3:   sc += 3
+    elif cv < 0.3:                        sc += 3
+    elif cv < 0.5:                        sc += 2
+    elif cv < 0.8:                        sc += 1
+    elif cv < 1.2:                        sc += 0
+    else:                                 sc += 0
 
-    # -- 2. CONSISTENCY (46 pts) ----------------------------------
+    # -- 2. CONSISTENCY (50 pts) ----------------------------------
     if thin:
-        sc += 20  # neutral baseline
-    elif streak >= 12 and pct >= 90:     sc += 46
-    elif streak >= 8 and pct >= 85:      sc += 37
-    elif streak >= 5 and pct >= 80:      sc += 30
-    elif streak >= 3 and pct >= 70:      sc += 23
-    elif pct >= 60:                      sc += 14
+        sc += 22  # neutral baseline (re-escalado)
+    elif streak >= 12 and pct >= 90:     sc += 50
+    elif streak >= 8 and pct >= 85:      sc += 40
+    elif streak >= 5 and pct >= 80:      sc += 33
+    elif streak >= 3 and pct >= 70:      sc += 25
+    elif pct >= 60:                      sc += 15
     else:                                sc += 3
 
-    # -- 3. LIQUIDITY (6 pts) -------------------------------------
-    # For cross-exchange and DeFi, volume is the MIN of the two sides
-    # (constrained by the weakest side). Thresholds lowered for DeFi
-    # since DeFi venues are thinner than CEX by nature. Optimización v10.6
-    # valida solo spot_perp; cross/defi conservan estructura, escalan al peso.
+    # -- 3. LIQUIDITY (cross/defi: 6 pts v10.6; spot_perp: 0 por optimización) --
+    # La optimización v11.0 valida solo spot_perp y mandó liquidez a 0 (volumen
+    # sin poder predictivo, ρ≈0.07 vs net). Para cross_exchange/defi se conserva
+    # la estructura v10.6 para no degradar una dimensión no re-validada.
     if mode == "defi":
         if volume >= 20e6:    sc += 6
         elif volume >= 10e6:  sc += 4
         elif volume >= 3e6:   sc += 3
         elif volume >= 500e3: sc += 2
-        else:                 sc += 0
     elif mode == "cross_exchange":
         if volume >= 30e6:    sc += 6
         elif volume >= 10e6:  sc += 4
         elif volume >= 3e6:   sc += 3
         elif volume >= 1e6:   sc += 2
-        else:                 sc += 0
-    else:  # spot_perp
-        if volume >= 50e6:    sc += 6
-        elif volume >= 20e6:  sc += 4
-        elif volume >= 5e6:   sc += 3
-        elif volume >= 1e6:   sc += 2
-        else:                 sc += 0
+    # else spot_perp: +0 (liquidez optimizada a 0)
 
-    # -- 4. YIELD (17 pts, non-monotonic) -------------------------
+    # -- 4. YIELD (30 pts, MONOTÓNICO con saturación) -------------
+    # Más yield = más score hasta saturar; guard suave para spikes no sostenibles.
     yield_day_pct = settlement_avg * ppd * 100
-    reality_penalty = False
-    if settlement_avg > 0 and current_rate > settlement_avg * 2.6:
-        reality_penalty = True
+    reality_penalty = settlement_avg > 0 and current_rate > settlement_avg * 4.0
+    if   yield_day_pct >= 0.44:  yf = 1.0
+    elif yield_day_pct >= 0.19:  yf = 0.90
+    elif yield_day_pct >= 0.08:  yf = 0.60
+    elif yield_day_pct >= 0.025: yf = 0.40
+    else:                        yf = 0.25
+    sc += round(30 * yf * (0.90 if reality_penalty else 1.0))
 
-    if reality_penalty:
-        if yield_day_pct >= 0.10:     sc += 4
-        elif yield_day_pct >= 0.03:   sc += 7
-        elif yield_day_pct >= 0.01:   sc += 4
-        else:                         sc += 1
-    else:
-        if 0.03 <= yield_day_pct < 0.10:     sc += 17
-        elif 0.10 <= yield_day_pct < 0.15:   sc += 13
-        elif 0.01 <= yield_day_pct < 0.03:   sc += 12
-        elif 0.15 <= yield_day_pct < 0.25:   sc += 5
-        elif yield_day_pct >= 0.25:          sc += 1
-        else:                                sc += 1
-
-    # -- 5. FEE EFFICIENCY (8 pts) --------------------------------
-    if fee_drag < 0.1:     sc += 8
-    elif fee_drag < 0.2:   sc += 6
-    elif fee_drag < 0.3:   sc += 3
-    elif fee_drag < 0.5:   sc += 2
+    # -- 5. FEE EFFICIENCY (16 pts) -------------------------------
+    if fee_drag < 0.1:     sc += 16
+    elif fee_drag < 0.2:   sc += 13
+    elif fee_drag < 0.3:   sc += 6
+    elif fee_drag < 0.5:   sc += 3
     else:                  sc += 0
 
-    # -- 6. TREND (1 pt) ------------------------------------------
+    # -- 6. TREND (0 pts) -----------------------------------------
+    # w_trend optimizado a 0; los indicadores se computan para las penalizaciones.
     indicators = compute_all_indicators(current_rate, rates)
-    mom_pts  = min(2, indicators["momentum"]["points"])
-    pctl_pts = min(1, indicators["percentile"]["points"])
-    sc += round((mom_pts + pctl_pts) / 3.0)
 
     # -- 7. MOMENTUM PENALTIES ------------------------------------
-    # accelerating / negative → sin penalización (optimizado en v10.6)
     mom_signal = indicators["momentum"].get("signal", "flat")
-    if mom_signal == "decelerating":
-        sc -= 3
+    if mom_signal == "accelerating":   sc -= 1
+    elif mom_signal == "decelerating": sc -= 8
+    elif mom_signal == "negative":     sc -= 4
 
     # -- 8. Z-SCORE PENALTY ---------------------------------------
     z_val = indicators["z_score"].get("z", 0)
-    if z_val > 3.2:       sc -= 20
-    elif z_val > 2.6:     sc -= 18
-    elif z_val > 2.2:     sc -= 17
-    elif z_val > 1.5:     sc -= 14
-    elif z_val > 0.9:     sc -= 9
-    elif z_val > 0.5:     sc -= 5
+    if z_val > 3.3:       sc -= 23
+    elif z_val > 2.6:     sc -= 17
+    elif z_val > 1.8:     sc -= 13
+    elif z_val > 1.5:     sc -= 5
+    elif z_val > 0.9:     sc -= 4
 
-    # -- 9. HARD CAPS ---------------------------------------------
+    # -- 9. HARD CAPS (z + streak; reality vía el multiplicador de yield) --
     percentile = indicators["percentile"].get("percentile", 0)
-
-    if z_val > 2.5:
+    if z_val > 2.0:
         sc = min(sc, 47)
-    if not thin and streak < 4 and percentile >= 90:
+    if not thin and streak < 3 and percentile >= 85:
         sc = min(sc, 36)
-    if reality_penalty:
-        sc = min(sc, 54)
 
     params["_indicators"] = indicators
     return max(0, min(sc, 100))

@@ -62,12 +62,15 @@ REPORT_DIR = ROOT / "reports"
 DEFAULT_TRIALS     = 600       # más trials = mejor búsqueda (más lento)
 SEARCH_SAMPLE      = 150_000   # filas de train usadas en la búsqueda (perf)
 TOTAL_DAYS         = 90        # ventana de datos
-OBJECTIVE_HORIZON  = 24        # horizonte forward del objetivo, en HORAS
+OBJECTIVE_HORIZON  = 168       # horizonte forward de REFERENCIA (reporte), en HORAS
 LOOKBACK           = 30
 MIN_HIST           = 10
 MAX_SCORE          = 100
-FWD_HOURS          = [8, 24, 72, 168]   # horizontes forward en horas
-ROUND_TRIP_FEE     = 0.003              # spot 0.10%×2 + perp 0.05%×2
+FWD_HOURS          = [72, 168, 336]     # horizontes forward de reporte en horas (3d/7d/14d)
+ROUND_TRIP_FEE     = 0.003              # spot 0.10%×2 + perp 0.05%×2 (= tu 0.30% taker)
+HOLD_MAX_HOURS     = 336                # tope del hold sostenible medido (14d)
+NET_APR_CAP        = 400.0              # techo del APR-neto (evita artefacto holds ultra-cortos)
+NET_APR_FLOOR      = -100.0             # piso del APR-neto (no-hold / pérdida acotada)
 
 # ── Tier ratios (shape fija del scoring, linaje v10.5) ───────────────────────
 # Los tiers se derivan como round(weight * ratio) para que (a) el baseline
@@ -170,10 +173,13 @@ def extract_features(fr_df: pd.DataFrame) -> pd.DataFrame:
             if obj_key not in fwd:
                 continue
 
-            # ── Durabilidad: intervalos positivos consecutivos tras entrar ──
-            max_look = min(n - i - 1, round(168 / ih))
+            # ── Hold sostenible: intervalos positivos consecutivos tras entrar ──
+            #   net_apr = velocidad de capital neta de fees = lo que el usuario maximiza.
+            #   El fee se descuenta UNA vez (round-trip); el APR se acota arriba y abajo
+            #   para que el optimizer no persiga el artefacto de holds ultra-cortos.
+            max_look_int = min(n - i - 1, round(HOLD_MAX_HOURS / ih))
             consec_pos, cumul_rate = 0, 0.0
-            for j in range(1, max_look + 1):
+            for j in range(1, max_look_int + 1):
                 if rates[i + j] > 0:
                     consec_pos += 1
                     cumul_rate += rates[i + j]
@@ -183,10 +189,16 @@ def extract_features(fr_df: pd.DataFrame) -> pd.DataFrame:
             duration_hours = consec_pos * ih
             hold_days = duration_hours / 24.0 if duration_hours > 0 else 0
             net_revenue = cumul_rate - ROUND_TRIP_FEE
-            net_apr = ((net_revenue / max(hold_days, 1 / ppd)) * 365 * 100
-                       if hold_days > 0 else -999)
+            if hold_days > 0:
+                net_apr = (net_revenue / max(hold_days, 1 / ppd)) * 365 * 100
+                net_apr = max(NET_APR_FLOOR, min(net_apr, NET_APR_CAP))
+            else:
+                net_apr = NET_APR_FLOOR  # no-hold (negativo inmediato): pérdida acotada
 
             fwd["duration_hours"] = duration_hours
+            fwd["hold_surv"] = consec_pos / max_look_int if max_look_int > 0 else 0
+            fwd["cumul_rate"] = cumul_rate           # para recomputar net a otros fees
+            fwd["hold_days"] = hold_days
             fwd["net_apr"] = net_apr
             fwd["is_profitable"] = int(net_revenue > 0)
 
@@ -221,12 +233,12 @@ def extract_features(fr_df: pd.DataFrame) -> pd.DataFrame:
 # ── PARAMETRIC SCORING (espeja analysis/scoring.py) ──────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parametric_score(row, p):
-    """Score paramétrico con la MISMA estructura de tiers que el scoring real.
+def score_v106_baseline(row, p):
+    """BASELINE CONGELADO — espeja analysis/scoring.py v10.6 EXACTO.
 
-    Hot loop: sin asignaciones costosas. Los tiers se derivan de los pesos
-    mediante los ratios fijos, de modo que p == BASELINE_PARAMS reproduce el
-    scoring de producción vigente.
+    Estructura de tiers fija (yield sweet-spot no-monotónico + reality hard-cap).
+    Con p == BASELINE_PARAMS reproduce el scoring de producción vigente. NO se
+    modifica: es la referencia contra la que se compara el candidato.
     """
     sc = 0.0
 
@@ -317,6 +329,98 @@ def parametric_score(row, p):
     return max(0, min(sc, MAX_SCORE))
 
 
+def parametric_score_candidate(row, p):
+    """CANDIDATO — yield MONOTÓNICO con saturación + guard anti-reversión suave.
+
+    Diferencias vs baseline v10.6:
+      * Sección 4 (yield): non-monotónico sweet-spot → monotónico-creciente con
+        umbrales/ratios searchables (y_t1..y_sat, y_r0..y_r3). Más yield = más
+        score hasta saturar; nunca castiga el yield alto.
+      * Guard anti-reversión: en vez del HARD CAP de reality, un MULTIPLICADOR
+        `reality_mult ∈ [0.6,1.0]` que descuenta SOLO el aporte de yield cuando
+        el rate actual es un spike (current >> settlement). Premia magnitud
+        sostenida, frena solo el pico no sostenible.
+      * Resto de dimensiones y penalizaciones idénticas a la estructura v10.x.
+    """
+    sc = 0.0
+
+    # -- 1. STABILITY --------------------------------------------------
+    cv, mr, w = row["cv"], row["min_ratio"], p["w_stab"]
+    if   cv < 0.2 and mr > 0.5: sc += w * STAB_RATIOS[0]
+    elif cv < 0.3 and mr > 0.3: sc += w * STAB_RATIOS[1]
+    elif cv < 0.3:              sc += w * STAB_RATIOS[2]
+    elif cv < 0.5:              sc += w * STAB_RATIOS[3]
+    elif cv < 0.8:              sc += w * STAB_RATIOS[4]
+    elif cv < 1.2:              sc += w * STAB_RATIOS[5]
+    else:                       sc += w * STAB_RATIOS[6]
+
+    # -- 2. CONSISTENCY ------------------------------------------------
+    streak, pct, w = row["streak"], row["pct"], p["w_cons"]
+    if   streak >= 12 and pct >= 90: sc += w * CONS_RATIOS[0]
+    elif streak >= 8 and pct >= 85:  sc += w * CONS_RATIOS[1]
+    elif streak >= 5 and pct >= 80:  sc += w * CONS_RATIOS[2]
+    elif streak >= 3 and pct >= 70:  sc += w * CONS_RATIOS[3]
+    elif pct >= 60:                  sc += w * CONS_RATIOS[4]
+    else:                            sc += w * CONS_RATIOS[5]
+
+    # -- 3. LIQUIDITY (spot_perp) --------------------------------------
+    vol, w = row["volume"], p["w_liq"]
+    if   vol >= 50e6: sc += w * LIQ_RATIOS[0]
+    elif vol >= 20e6: sc += w * LIQ_RATIOS[1]
+    elif vol >= 5e6:  sc += w * LIQ_RATIOS[2]
+    elif vol >= 1e6:  sc += w * LIQ_RATIOS[3]
+
+    # -- 4. YIELD (MONOTÓNICO con saturación + guard suave) ------------
+    settlement_avg = abs(row["settlement_avg"])
+    current_rate = abs(row["current_rate"])
+    yd = settlement_avg * row["ppd"] * 100
+    reality_penalty = (settlement_avg > 0 and
+                       current_rate > settlement_avg * p["reality_thresh"])
+    if   yd >= p["y_sat"]: frac = 1.0
+    elif yd >= p["y_t3"]:  frac = p["y_r3"]
+    elif yd >= p["y_t2"]:  frac = p["y_r2"]
+    elif yd >= p["y_t1"]:  frac = p["y_r1"]
+    else:                  frac = p["y_r0"]
+    rm = p["reality_mult"] if reality_penalty else 1.0
+    sc += p["w_yield"] * frac * rm
+
+    # -- 5. FEE EFFICIENCY ---------------------------------------------
+    fd, w = row["fee_drag"], p["w_fee"]
+    if   fd < 0.1: sc += w * FEE_RATIOS[0]
+    elif fd < 0.2: sc += w * FEE_RATIOS[1]
+    elif fd < 0.3: sc += w * FEE_RATIOS[2]
+    elif fd < 0.5: sc += w * FEE_RATIOS[3]
+
+    # -- 6. TREND ------------------------------------------------------
+    mom_pts  = min(2, row["mom_points"])
+    pctl_pts = min(1, row["pctl_points"])
+    sc += (mom_pts + pctl_pts) / 3.0 * p["w_trend"]
+
+    # -- 7. MOMENTUM PENALTIES -----------------------------------------
+    sig = row["mom_signal"]
+    if   sig == "accelerating": sc += p["mom_accel"]
+    elif sig == "decelerating": sc += p["mom_decel"]
+    elif sig == "negative":     sc += p["mom_neg"]
+
+    # -- 8. Z-SCORE PENALTY --------------------------------------------
+    z = row["z_value"]
+    if   z > p["z_t6"]: sc += p["z_p6"]
+    elif z > p["z_t5"]: sc += p["z_p5"]
+    elif z > p["z_t4"]: sc += p["z_p4"]
+    elif z > p["z_t3"]: sc += p["z_p3"]
+    elif z > p["z_t2"]: sc += p["z_p2"]
+    elif z > p["z_t1"]: sc += p["z_p1"]
+
+    # -- 9. HARD CAPS (z + streak; reality YA gestionado por reality_mult) --
+    if p["caps_enabled"]:
+        if z > p["cap_z_thresh"]:
+            sc = min(sc, p["cap_z_val"])
+        if streak < p["cap_streak_thresh"] and row["pctl_percentile"] >= p["cap_streak_pctl"]:
+            sc = min(sc, p["cap_streak_val"])
+
+    return max(0, min(sc, MAX_SCORE))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── EVALUATION ───────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
@@ -346,15 +450,37 @@ def attach_ranks(df, horizon=OBJECTIVE_HORIZON):
     return df
 
 
-def evaluate_params(feat_df, p, horizon=OBJECTIVE_HORIZON):
-    """Puntúa todas las filas con p y devuelve métricas para arbitraje."""
+def _sharpe_clip(series):
+    """Sharpe-like (media/desvío) acotado a [-1.5,1.5]→/1.5 → [-1,1] (escala ~Spearman).
+
+    Permite negativo: a fee alto el net_apr del top puede ser negativo, y un Sharpe
+    menos-negativo (mayor media / menor desvío) DEBE seguir siendo discriminable.
+    """
+    s = series.dropna()
+    if len(s) < 2:
+        return 0.0
+    sd = s.std()
+    if sd is None or sd == 0 or math.isnan(sd):
+        return 0.0
+    sh = s.mean() / sd
+    return max(-1.5, min(sh, 1.5)) / 1.5
+
+
+def evaluate_params(feat_df, p, scorer=parametric_score_candidate,
+                    horizon=OBJECTIVE_HORIZON):
+    """Puntúa todas las filas con (scorer, p) y devuelve métricas para arbitraje.
+
+    Objetivo = APR-neto (velocidad de capital) ajustado a riesgo. La monotonicidad
+    se mide sobre net_apr (no sobre APR bruto). `scorer` permite comparar la
+    función baseline-v10.6 contra la candidata con la misma maquinaria.
+    """
     col_apr  = f"fwd_{horizon}h_apr"
     col_pos  = f"fwd_{horizon}h_pos"
     col_surv = f"fwd_{horizon}h_survival"
 
-    scores = feat_df.apply(lambda row: parametric_score(row, p), axis=1)
+    scores = feat_df.apply(lambda row: scorer(row, p), axis=1)
 
-    # Spearman vía rangos precomputados (ver _attach_ranks); sin scipy.
+    # Spearman vía rangos precomputados (ver attach_ranks); sin scipy.
     sp_apr = _spearman(scores, feat_df["_r_apr"]) if "_r_apr" in feat_df else 0
     sp_net = _spearman(scores, feat_df["_r_net"]) if "_r_net" in feat_df else 0
     sp_dur = _spearman(scores, feat_df["_r_dur"]) if "_r_dur" in feat_df else 0
@@ -362,29 +488,39 @@ def evaluate_params(feat_df, p, horizon=OBJECTIVE_HORIZON):
     buckets = pd.cut(scores, bins=[0, 40, 55, 70, 85, 101],
                      labels=["<40", "40-55", "55-70", "70-85", "85+"],
                      include_lowest=True)
-    b_apr  = feat_df.groupby(buckets, observed=True)[col_apr].mean()
-    b_dur  = feat_df.groupby(buckets, observed=True)["duration_hours"].mean()
+    b_net  = feat_df.groupby(buckets, observed=True)["net_apr"].mean()
     b_prof = feat_df.groupby(buckets, observed=True)["is_profitable"].mean()
 
-    mono_apr  = _mono_score(b_apr.values)
-    mono_dur  = _mono_score(b_dur.values)
+    # Monotonicidad orientada a profit: net_apr y % rentable deben crecer con el score.
+    mono_net  = _mono_score(b_net.values)
     mono_prof = _mono_score(b_prof.values)
-    monotonicity = (mono_apr + mono_dur + mono_prof) / 3.0
+    monotonicity = (mono_net + mono_prof) / 2.0
 
-    top_mask = scores >= 70
-    bot_mask = scores < 40
-    n_top, n_bot = int(top_mask.sum()), int(bot_mask.sum())
+    # Métricas de profit sobre el TOP FIJO POR RANGO (15%) — game-proof: el
+    # optimizer no puede inflar el net del top encogiendo el set ≥70; solo mejora
+    # rankeando las oportunidades rentables arriba.
+    srank = scores.rank(pct=True)
+    qtop = srank >= 0.85    # top 15% por score
+    qbot = srank <= 0.40    # bottom 40%
+    nqt, nqb = int(qtop.sum()), int(qbot.sum())
 
-    hit_top = feat_df.loc[top_mask, col_pos].mean() if n_top > 10 else 0.5
-    hit_bot = feat_df.loc[bot_mask, col_pos].mean() if n_bot > 10 else 0.5
-    apr_top = feat_df.loc[top_mask, col_apr].mean() if n_top > 10 else 0
-    apr_bot = feat_df.loc[bot_mask, col_apr].mean() if n_bot > 10 else 0
-    dur_top = feat_df.loc[top_mask, "duration_hours"].mean() if n_top > 10 else 0
-    profit_top  = feat_df.loc[top_mask, "is_profitable"].mean() if n_top > 10 else 0
-    net_apr_top = feat_df.loc[top_mask, "net_apr"].mean() if n_top > 10 else 0
-    surv_top = feat_df.loc[top_mask, col_surv].mean() if (n_top > 10 and col_surv in feat_df) else 0
+    hit_top = feat_df.loc[qtop, col_pos].mean() if nqt > 10 else 0.5
+    hit_bot = feat_df.loc[qbot, col_pos].mean() if nqb > 10 else 0.5
+    apr_top = feat_df.loc[qtop, col_apr].mean() if nqt > 10 else 0
+    apr_bot = feat_df.loc[qbot, col_apr].mean() if nqb > 10 else 0
+    dur_top = feat_df.loc[qtop, "duration_hours"].mean() if nqt > 10 else 0
+    profit_top  = feat_df.loc[qtop, "is_profitable"].mean() if nqt > 10 else 0
+    net_apr_top = feat_df.loc[qtop, "net_apr"].mean() if nqt > 10 else 0
+    # Nivel de ganancia del top normalizado a ~[-1,1] (rango realista ±100 APR) —
+    # término "lo máximo posible" del objetivo.
+    napr_norm = max(-1.0, min(net_apr_top / 100.0, 1.0))
+    # Sharpe del APR-neto en el top: "lo más consistente posible".
+    sharpe_top  = _sharpe_clip(feat_df.loc[qtop, "net_apr"]) if nqt > 10 else 0
+    surv_top = feat_df.loc[qtop, col_surv].mean() if (nqt > 10 and col_surv in feat_df) else 0
 
-    pct_top = n_top / len(scores) * 100
+    # Fracción que supera el umbral ABSOLUTO ≥70 — solo para la penalización de
+    # selectividad (usabilidad del umbral en la app), no para las métricas de profit.
+    pct_top = int((scores >= 70).sum()) / len(scores) * 100
     sel_pen = 0
     if   pct_top < 5:  sel_pen = -0.15
     elif pct_top < 8:  sel_pen = -0.05
@@ -398,11 +534,12 @@ def evaluate_params(feat_df, p, horizon=OBJECTIVE_HORIZON):
         "spearman_apr": _z(sp_apr), "spearman_net": _z(sp_net),
         "spearman_dur": _z(sp_dur),
         "monotonicity": monotonicity,
-        "mono_apr": mono_apr, "mono_dur": mono_dur, "mono_prof": mono_prof,
+        "mono_net": mono_net, "mono_prof": mono_prof,
         "hit_top": hit_top, "hit_bot": hit_bot, "hit_spread": hit_top - hit_bot,
         "apr_top": apr_top, "apr_bot": apr_bot,
         "dur_top": dur_top, "profit_top": profit_top,
-        "net_apr_top": net_apr_top, "surv_top": surv_top,
+        "net_apr_top": net_apr_top, "napr_norm": napr_norm,
+        "sharpe_top": sharpe_top, "surv_top": surv_top,
         "pct_top": pct_top, "selectivity_penalty": sel_pen,
         "scores": scores,
     }
@@ -413,10 +550,12 @@ def evaluate_params(feat_df, p, horizon=OBJECTIVE_HORIZON):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def objective(trial, train_df):
-    w_stab  = trial.suggest_int("w_stab",  20, 45)
+    # Rangos liberados (Etapa 2): w_stab puede caer a 0 (cv es peso muerto),
+    # w_yield puede subir a 40 (yield = mejor predictor de APR-neto).
+    w_stab  = trial.suggest_int("w_stab",  0,  25)
     w_cons  = trial.suggest_int("w_cons",  25, 50)
     w_liq   = trial.suggest_int("w_liq",   0,  10)
-    w_yield = trial.suggest_int("w_yield", 5,  20)
+    w_yield = trial.suggest_int("w_yield", 5,  40)
     w_fee   = trial.suggest_int("w_fee",   0,  10)
     w_trend = trial.suggest_int("w_trend", 0,  8)
 
@@ -458,21 +597,42 @@ def objective(trial, train_df):
     p["cap_streak_thresh"]  = trial.suggest_int("cap_streak_thresh", 2, 5)
     p["cap_streak_pctl"]    = trial.suggest_int("cap_streak_pctl", 70, 95, step=5)
     p["cap_streak_val"]     = trial.suggest_int("cap_streak_val", 35, 60)
-    p["reality_thresh"]     = trial.suggest_float("reality_thresh", 1.3, 3.0, step=0.1)
-    p["cap_reality_val"]    = trial.suggest_int("cap_reality_val", 45, 70)
 
-    m = evaluate_params(train_df, p)
+    # Guard anti-reversión SUAVE (reemplaza el hard cap de reality):
+    # reality_thresh más permisivo; reality_mult descuenta solo el aporte de yield.
+    p["reality_thresh"]     = trial.suggest_float("reality_thresh", 1.8, 4.0, step=0.1)
+    p["reality_mult"]       = trial.suggest_float("reality_mult", 0.6, 1.0, step=0.05)
 
-    # Gate duro: si no ordena, está roto.
+    # Yield MONOTÓNICO: umbrales (%/día) calibrados a la distribución real
+    # (mediana 0.03, p90 0.13, p95 0.22) y ratios crecientes (más yield = más score).
+    p["y_t1"]  = trial.suggest_float("y_t1",  0.01, 0.04, step=0.005)
+    p["y_t2"]  = trial.suggest_float("y_t2",  0.05, 0.12, step=0.01)
+    p["y_t3"]  = trial.suggest_float("y_t3",  0.12, 0.22, step=0.01)
+    p["y_sat"] = trial.suggest_float("y_sat", 0.20, 0.45, step=0.01)
+    if not (p["y_t1"] < p["y_t2"] < p["y_t3"] < p["y_sat"]):
+        return -999
+    p["y_r0"] = trial.suggest_float("y_r0", 0.0,  0.30, step=0.05)
+    p["y_r1"] = trial.suggest_float("y_r1", 0.20, 0.50, step=0.05)
+    p["y_r2"] = trial.suggest_float("y_r2", 0.45, 0.75, step=0.05)
+    p["y_r3"] = trial.suggest_float("y_r3", 0.70, 0.95, step=0.05)
+    if not (p["y_r0"] < p["y_r1"] < p["y_r2"] < p["y_r3"]):
+        return -999
+
+    m = evaluate_params(train_df, p)  # scorer = candidato (default)
+
+    # Gate duro: si no ordena por net_apr, está roto.
     if m["monotonicity"] < 0.5:
         return -999
 
+    # Objetivo: APR-neto (velocidad de capital), predictivo + máximo + consistente.
+    #   spearman_net = ranking predictivo  | napr_norm = nivel de ganancia del top
+    #   profit_top   = fiabilidad (% rentable) | sharpe_top = ajuste a riesgo
     return (
-        0.35 * m["monotonicity"] +
-        0.25 * m["spearman_dur"] +
-        0.20 * m["spearman_net"] +
-        0.10 * m["hit_spread"] +
-        0.10 * m["profit_top"] +
+        0.25 * m["monotonicity"] +
+        0.30 * m["spearman_net"] +
+        0.20 * m["napr_norm"] +
+        0.15 * m["profit_top"] +
+        0.10 * m["sharpe_top"] +
         m["selectivity_penalty"]
     )
 
@@ -487,7 +647,8 @@ def best_params_from_study(study):
     for k in ("z_t1", "z_p1", "z_t2", "z_p2", "z_t3", "z_p3", "z_t4", "z_p4",
               "z_t5", "z_p5", "z_t6", "z_p6", "mom_accel", "mom_decel", "mom_neg",
               "caps_enabled", "cap_z_thresh", "cap_z_val", "cap_streak_thresh",
-              "cap_streak_pctl", "cap_streak_val", "reality_thresh", "cap_reality_val"):
+              "cap_streak_pctl", "cap_streak_val", "reality_thresh", "reality_mult",
+              "y_t1", "y_t2", "y_t3", "y_sat", "y_r0", "y_r1", "y_r2", "y_r3"):
         p[k] = bp[k]
     return p
 
@@ -505,21 +666,17 @@ def generate_candidate_code(p, m_train, m_val):
     s = [round(w_stab * r) for r in STAB_RATIOS]
     c = [round(w_cons * r) for r in CONS_RATIOS]
     l = [round(w_liq * r) for r in LIQ_RATIOS]
-    yn = [round(w_yield * r) for r in YIELD_NORM]
-    yr = [round(w_yield * r) for r in YIELD_REAL]
     fp = [round(w_fee * r) for r in FEE_RATIOS]
 
     caps = ""
     if p["caps_enabled"]:
         caps = f"""
-    # -- 9. HARD CAPS ---------------------------------------------
+    # -- 9. HARD CAPS (z + streak; reality ya gestionado por reality_mult) --
     percentile = indicators["percentile"].get("percentile", 0)
     if z_val > {p['cap_z_thresh']:.2f}:
         sc = min(sc, {round(p['cap_z_val'])})
     if not thin and streak < {round(p['cap_streak_thresh'])} and percentile >= {round(p['cap_streak_pctl'])}:
         sc = min(sc, {round(p['cap_streak_val'])})
-    if reality_penalty:
-        sc = min(sc, {round(p['cap_reality_val'])})
 """
     else:
         caps = "\n    # Hard caps DESHABILITADOS por el optimizador\n"
@@ -531,9 +688,9 @@ NO es producción: revisa reports/optimizer_*.md y, si convence, copia esta
 función sobre analysis/scoring.py:opportunity_score.
 
 Validación (val set):
-  Spearman net   : {m_val["spearman_net"]:.3f}  (train {m_train["spearman_net"]:.3f})
-  Spearman durac : {m_val["spearman_dur"]:.3f}  (train {m_train["spearman_dur"]:.3f})
-  Monotonicity   : {m_val["monotonicity"]:.2f}   (train {m_train["monotonicity"]:.2f})
+  Spearman net APR : {m_val["spearman_net"]:.3f}  (train {m_train["spearman_net"]:.3f})
+  Sharpe top       : {m_val["sharpe_top"]:.3f}  (train {m_train["sharpe_top"]:.3f})
+  Monotonicity     : {m_val["monotonicity"]:.2f}   (train {m_train["monotonicity"]:.2f})
 
 Dimensiones ({total_w} pts): Stability {w_stab} | Consistency {w_cons} | Liquidity {w_liq} | Yield {w_yield} | Fee {w_fee} | Trend {w_trend}
 """
@@ -597,21 +754,16 @@ def opportunity_score(params: dict) -> int:
         elif volume >= 5e6:   sc += {l[2]}
         elif volume >= 1e6:   sc += {l[3]}
 
-    # -- 4. YIELD ({w_yield} pts, non-monotonic) ------------------
+    # -- 4. YIELD ({w_yield} pts, MONOTÓNICO con saturación) ------
+    # Más yield = más score hasta saturar; guard suave reality_mult para spikes.
     yield_day_pct = settlement_avg * ppd * 100
     reality_penalty = settlement_avg > 0 and current_rate > settlement_avg * {p['reality_thresh']:.1f}
-    if reality_penalty:
-        if yield_day_pct >= 0.10:     sc += {yr[0]}
-        elif yield_day_pct >= 0.03:   sc += {yr[1]}
-        elif yield_day_pct >= 0.01:   sc += {yr[2]}
-        else:                         sc += {yr[3]}
-    else:
-        if 0.03 <= yield_day_pct < 0.10:     sc += {yn[0]}
-        elif 0.10 <= yield_day_pct < 0.15:   sc += {yn[1]}
-        elif 0.01 <= yield_day_pct < 0.03:   sc += {yn[2]}
-        elif 0.15 <= yield_day_pct < 0.25:   sc += {yn[3]}
-        elif yield_day_pct >= 0.25:          sc += {yn[4]}
-        else:                                sc += {yn[5]}
+    if yield_day_pct >= {p['y_sat']:.2f}:    _yf = 1.0
+    elif yield_day_pct >= {p['y_t3']:.2f}:   _yf = {p['y_r3']:.2f}
+    elif yield_day_pct >= {p['y_t2']:.2f}:   _yf = {p['y_r2']:.2f}
+    elif yield_day_pct >= {p['y_t1']:.3f}:   _yf = {p['y_r1']:.2f}
+    else:                                    _yf = {p['y_r0']:.2f}
+    sc += round({w_yield} * _yf * ({p['reality_mult']:.2f} if reality_penalty else 1.0))
 
     # -- 5. FEE EFFICIENCY ({w_fee} pts) --------------------------
     if fee_drag < 0.1:     sc += {fp[0]}
@@ -673,7 +825,8 @@ def generate_report(p, m_train, m_val, base_train, base_val,
         f"**Trials:** {len(study.trials)}",
         f"**Train:** {len(train_df):,} rows (hasta {train_df['captured_at'].max().date()}) | "
         f"**Val:** {len(val_df):,} rows (desde {val_df['captured_at'].min().date()})",
-        f"**Horizonte objetivo:** {OBJECTIVE_HORIZON}h | **Alcance:** spot_perp",
+        f"**Objetivo:** APR-neto (velocidad de capital) ajustado a riesgo | "
+        f"**Hold máx:** {HOLD_MAX_HOURS}h | **Fee:** {ROUND_TRIP_FEE*100:.2f}% | **Alcance:** spot_perp",
         "",
         "> El optimizador SOLO genera este reporte + un candidato. No aplica "
         "nada. Revisa abajo y, si convence, copia el candidato a "
@@ -688,12 +841,12 @@ def generate_report(p, m_train, m_val, base_train, base_val,
                 ["Spearman (Net APR)", _f(base_train["spearman_net"]), _f(base_val["spearman_net"]),
                  _f(m_train["spearman_net"]), _f(m_val["spearman_net"]),
                  _f(m_val["spearman_net"] - base_val["spearman_net"])],
-                ["Spearman (Duración)", _f(base_train["spearman_dur"]), _f(base_val["spearman_dur"]),
-                 _f(m_train["spearman_dur"]), _f(m_val["spearman_dur"]),
-                 _f(m_val["spearman_dur"] - base_val["spearman_dur"])],
-                ["Spearman (APR)", _f(base_train["spearman_apr"]), _f(base_val["spearman_apr"]),
-                 _f(m_train["spearman_apr"]), _f(m_val["spearman_apr"]),
-                 _f(m_val["spearman_apr"] - base_val["spearman_apr"])],
+                ["Sharpe top (APR-neto)", _f(base_train["sharpe_top"]), _f(base_val["sharpe_top"]),
+                 _f(m_train["sharpe_top"]), _f(m_val["sharpe_top"]),
+                 _f(m_val["sharpe_top"] - base_val["sharpe_top"])],
+                ["Net APR top", _f(base_train["net_apr_top"], 1), _f(base_val["net_apr_top"], 1),
+                 _f(m_train["net_apr_top"], 1), _f(m_val["net_apr_top"], 1),
+                 _f(m_val["net_apr_top"] - base_val["net_apr_top"], 1)],
                 ["Monotonicity", _f(base_train["monotonicity"], 2), _f(base_val["monotonicity"], 2),
                  _f(m_train["monotonicity"], 2), _f(m_val["monotonicity"], 2),
                  _f(m_val["monotonicity"] - base_val["monotonicity"], 2)],
@@ -753,17 +906,42 @@ def generate_report(p, m_train, m_val, base_train, base_val,
                 ["Score", "N", "APR% avg", "Profitable%", "Duración", "Net APR%"], rows))
         lines.append("")
 
+    # Sensibilidad al fee (bucket top del candidato): a partir de qué fee el
+    # switching deja de pagar. Recomputa net APR variando solo el fee round-trip.
+    lines += ["## 3b. Sensibilidad al fee — top 15% del candidato (val)",
+              "",
+              "Mismo top-15% por rango que la sección 1. El ranking no cambia con el fee; "
+              "cambian los niveles absolutos. Muestra a qué fee el top deja de ser rentable "
+              "(→ holdear más o subir el umbral de score).",
+              ""]
+    _sr = pd.Series(m_val["scores"].values, index=val_df.index).rank(pct=True)
+    top = val_df[_sr >= 0.85]
+    if len(top) > 10:
+        hd = top["hold_days"]; ppd_s = top["ppd"]
+        denom = hd.clip(lower=1.0 / ppd_s)
+        frows = []
+        for f in (0.0015, 0.0020, 0.0030, 0.0040):
+            nr = top["cumul_rate"] - f
+            apr = ((nr / denom) * 365 * 100).clip(lower=NET_APR_FLOOR, upper=NET_APR_CAP)
+            apr = apr.where(hd > 0, NET_APR_FLOOR)
+            frows.append([f"{f*100:.2f}%", _f(apr.mean(), 1),
+                          f'{(nr > 0).mean()*100:.0f}%'])
+        lines.append(_md_table(["Fee round-trip", "Net APR top", "Profitable%"], frows))
+    else:
+        lines.append("_(muestra insuficiente en el top para la tabla de fees)_")
+    lines.append("")
+
     # Veredicto
     lines += ["## 4. Veredicto", ""]
     mono_ok = m_val["monotonicity"] >= 0.75
     net_better = m_val["spearman_net"] > base_val["spearman_net"]
-    dur_better = m_val["spearman_dur"] > base_val["spearman_dur"]
-    if mono_ok and net_better and dur_better and sp_drop <= 0.05:
-        lines.append("✅ **ADOPTAR** — el candidato mejora net + duración manteniendo "
-                     "monotonicity, sin overfitting. Copia a `analysis/scoring.py`.")
-    elif mono_ok and (net_better or dur_better):
-        lines.append("⚠️ **REVISAR** — mejora parcial. Evalúa si compensa el cambio "
-                     "antes de adoptar.")
+    profit_better = m_val["net_apr_top"] > base_val["net_apr_top"]
+    if mono_ok and net_better and profit_better and sp_drop <= 0.05:
+        lines.append("✅ **ADOPTAR** — el candidato mejora el ranking (Spearman) y el APR-neto "
+                     "del top manteniendo monotonicity, sin overfitting. Copia a `analysis/scoring.py`.")
+    elif mono_ok and (net_better or profit_better):
+        lines.append("⚠️ **REVISAR** — mejora parcial (ranking o nivel de ganancia, no ambos). "
+                     "Evalúa si compensa el cambio antes de adoptar.")
     else:
         lines.append(f"❌ **MANTENER {BASELINE_LABEL}** — el candidato no mejora de forma "
                      "robusta (o pierde monotonicity / overfittea).")
@@ -790,11 +968,16 @@ def _load_dotenv():
 
 
 def main():
+    global ROUND_TRIP_FEE
     ap = argparse.ArgumentParser(description="Optimizador local del scoring (read-only sobre la DB)")
     ap.add_argument("--trials", type=int, default=DEFAULT_TRIALS, help="trials de Optuna")
     ap.add_argument("--days", type=int, default=TOTAL_DAYS, help="ventana de datos")
     ap.add_argument("--force-reload", action="store_true", help="ignorar caché de la DB")
+    ap.add_argument("--fee", type=float, default=ROUND_TRIP_FEE,
+                    help="fee round-trip (fracción) para el target net APR (default 0.003 = 0.30%%)")
     args = ap.parse_args()
+
+    ROUND_TRIP_FEE = args.fee
 
     # Consola de Windows (cp1252) no imprime acentos ni emojis: forzar UTF-8.
     try:
@@ -841,10 +1024,10 @@ def main():
         search_df = train_df
 
     print(f"[4/6] Evaluando baseline {BASELINE_LABEL}...")
-    base_train = evaluate_params(train_df, BASELINE_PARAMS)
-    base_val   = evaluate_params(val_df,   BASELINE_PARAMS)
+    base_train = evaluate_params(train_df, BASELINE_PARAMS, scorer=score_v106_baseline)
+    base_val   = evaluate_params(val_df,   BASELINE_PARAMS, scorer=score_v106_baseline)
     print(f"  {BASELINE_LABEL} Val: Sp(net)={base_val['spearman_net']:.3f} "
-          f"Sp(dur)={base_val['spearman_dur']:.3f} Mono={base_val['monotonicity']:.2f}")
+          f"Sharpe_top={base_val['sharpe_top']:.3f} Mono={base_val['monotonicity']:.2f}")
 
     print(f"\n[5/6] Optimizando ({args.trials} trials)...\n")
     study = optuna.create_study(
@@ -860,10 +1043,10 @@ def main():
     best_p = best_params_from_study(study)
 
     print("[6/6] Evaluando candidato...")
-    m_train = evaluate_params(train_df, best_p)
+    m_train = evaluate_params(train_df, best_p)   # scorer = candidato (default)
     m_val   = evaluate_params(val_df,   best_p)
     print(f"  Cand. Val: Sp(net)={m_val['spearman_net']:.3f} "
-          f"Sp(dur)={m_val['spearman_dur']:.3f} Mono={m_val['monotonicity']:.2f}")
+          f"Sharpe_top={m_val['sharpe_top']:.3f} Mono={m_val['monotonicity']:.2f}")
 
     REPORT_DIR.mkdir(exist_ok=True)
     today = datetime.now().strftime("%Y%m%d")
@@ -884,12 +1067,12 @@ def main():
 
     mono_ok = m_val["monotonicity"] >= 0.75
     net_better = m_val["spearman_net"] > base_val["spearman_net"]
-    dur_better = m_val["spearman_dur"] > base_val["spearman_dur"]
+    profit_better = m_val["net_apr_top"] > base_val["net_apr_top"]
     sp_drop = m_train["spearman_net"] - m_val["spearman_net"]
     print()
-    if mono_ok and net_better and dur_better and sp_drop <= 0.05:
+    if mono_ok and net_better and profit_better and sp_drop <= 0.05:
         print("  → ✅ ADOPTAR: mejora robusta en val. Revisa el reporte y copia el candidato.")
-    elif mono_ok and (net_better or dur_better):
+    elif mono_ok and (net_better or profit_better):
         print("  → ⚠️ REVISAR: mejora parcial. Decide según el reporte.")
     else:
         print(f"  → ❌ MANTENER {BASELINE_LABEL}: el candidato no mejora de forma robusta.")
