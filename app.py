@@ -33,6 +33,15 @@ persistence = JSONPersistence(os.path.join(Config.DATA_DIR, "portfolio_state.jso
 state_manager = StateManager(persistence)
 state_manager.load()
 
+# ── ML scoring model (optional) ───────────────────────────────
+# El modelo entrenado offline (scripts/ml_train.py) manda el ranking de
+# oportunidades; si no carga, el scan cae al heurístico v11.0 (fallback).
+from analysis import ml_scorer
+
+_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "models", "scoring_model.joblib")
+ml_scorer.load_model(_MODEL_PATH)
+
 # ── Exchange Manager (CCXT) ───────────────────────────────────
 from exchanges.manager import ExchangeManager
 

@@ -15,6 +15,7 @@ import threading
 from datetime import datetime
 from analysis.ai_analyzer import analyze_top_opportunities
 from analysis.indicators import detect_exceptional
+from analysis import ml_scorer
 
 log = logging.getLogger("bot")
 
@@ -926,6 +927,8 @@ class ScannerWorker:
                         volume_24h=opp.get("volume_24h", 0) or 0,
                         z_score=indicators.get("z_score", 0) if isinstance(indicators, dict) else 0,
                         momentum_signal=indicators.get("momentum_signal", "flat") if isinstance(indicators, dict) else "flat",
+                        model_prediction=opp.get("model_prediction"),
+                        model_version=ml_scorer.model_version,
                         scan_number=scan_count,
                         captured_at=now,
                     ))
