@@ -73,6 +73,8 @@ class SpotPerpOpportunity:
     spread_cost: float = 0
     break_even_hours: float = 0
     score: int = 0
+    score_heuristic: int = 0      # score v11.0 (fallback / comparación vs modelo)
+    model_prediction: float = None  # net_apr crudo predicho por el modelo ML (o None)
     has_spot: bool = True
     spot_volume: float = 0
     mins_to_next: float = -1
@@ -100,6 +102,8 @@ class SpotPerpOpportunity:
             "fees_total": self.fees_total,
             "break_even_hours": self.break_even_hours,
             "score": self.score, "has_spot": self.has_spot,
+            "score_heuristic": self.score_heuristic,
+            "model_prediction": self.model_prediction,
             "mins_to_next": self.mins_to_next,
             "next_funding_ts": self.next_funding_ts,
             "rsi": self.rsi,
@@ -151,6 +155,8 @@ class CrossExchangeOpportunity:
     short_ppd: float = 3
     break_even_hours: float = 0
     score: int = 0
+    score_heuristic: int = 0      # score v11.0 (fallback / comparación vs modelo)
+    model_prediction: float = None  # net_apr crudo predicho por el modelo ML (o None)
     margin_required_per_1000: float = 2000  # Need margin on both sides
     liquidation_risk: str = "MEDIUM"
     mins_to_next: float = -1
@@ -185,6 +191,8 @@ class CrossExchangeOpportunity:
             "total_fees": self.total_fees,
             "break_even_hours": self.break_even_hours,
             "score": self.score,
+            "score_heuristic": self.score_heuristic,
+            "model_prediction": self.model_prediction,
             "margin_required_per_1000": self.margin_required_per_1000,
             "liquidation_risk": self.liquidation_risk,
             "mins_to_next": self.mins_to_next,

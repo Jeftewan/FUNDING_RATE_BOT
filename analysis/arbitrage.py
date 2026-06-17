@@ -6,6 +6,7 @@ from analysis.funding import FundingAggregator
 from analysis.fees import (calculate_spot_perp_fees, calculate_cross_exchange_fees,
                            calculate_break_even_hours)
 from analysis.scoring import opportunity_score, stability_grade, estimated_hold_days
+from analysis import ml_scorer
 
 log = logging.getLogger("bot")
 
@@ -19,6 +20,20 @@ class ArbitrageScanner:
         self.config = config
         self.aggregator = FundingAggregator()
         self._defi_exchanges = set(getattr(config, "DEFI_EXCHANGES", []))
+
+    @staticmethod
+    def _resolve_score(heuristic_score: int, score_params: dict):
+        """Devuelve (display_score, score_heuristic, model_prediction).
+
+        Si el modelo ML está cargado y predice, el MODELO manda el ranking; el
+        score heurístico v11.0 se conserva para fallback/comparación en vivo.
+        Si no hay modelo o falla, se usa el heurístico (model_prediction=None).
+        """
+        ms = ml_scorer.predict_score(score_params, score_params.get("_indicators"))
+        if ms is not None:
+            model_score, model_pred = ms
+            return model_score, heuristic_score, model_pred
+        return heuristic_score, heuristic_score, None
 
     def _fetch_history(self, symbol: str, exchange: str, limit: int):
         """Route history fetch to the correct manager (CEX vs DeFi)."""
@@ -122,7 +137,8 @@ class ArbitrageScanner:
             "mode": "spot_perp",
         }
         sc = opportunity_score(score_params)
-        grade = stability_grade(sc)
+        display_score, score_heuristic, model_pred = self._resolve_score(sc, score_params)
+        grade = stability_grade(display_score)
         est_days = estimated_hold_days(hist_dict)
 
         has_spot = self.exchange_manager.fetch_spot_availability(
@@ -143,7 +159,9 @@ class ArbitrageScanner:
             net_3d_revenue_per_1000=net_3d,
             fees_total=fees["total_cost"],
             break_even_hours=break_even_h,
-            score=sc,
+            score=display_score,
+            score_heuristic=score_heuristic,
+            model_prediction=model_pred,
             has_spot=has_spot,
             mins_to_next=fr.mins_to_next,
             next_funding_ts=fr.next_funding_ts,
@@ -307,6 +325,8 @@ class ArbitrageScanner:
             "mode": cross_mode,
         }
         sc = opportunity_score(cross_score_params)
+        display_score, score_heuristic, model_pred = self._resolve_score(
+            sc, cross_score_params)
 
         liq_risk = "LOW"
         if NOTIONAL < 2000:
@@ -314,7 +334,7 @@ class ArbitrageScanner:
         elif NOTIONAL < 5000:
             liq_risk = "MEDIUM"
 
-        grade = stability_grade(sc)
+        grade = stability_grade(display_score)
 
         # Estimated hold days based on differential history
         est_days = 0
@@ -348,7 +368,9 @@ class ArbitrageScanner:
             net_3d_revenue_per_1000=net_3d,
             total_fees=fees["total_cost"],
             break_even_hours=break_even_h,
-            score=sc,
+            score=display_score,
+            score_heuristic=score_heuristic,
+            model_prediction=model_pred,
             liquidation_risk=liq_risk,
             mins_to_next=min(long_fr.mins_to_next, short_fr.mins_to_next),
             next_funding_ts=min(long_fr.next_funding_ts, short_fr.next_funding_ts),

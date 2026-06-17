@@ -9,3 +9,9 @@ psycopg2-binary
 cryptography
 itsdangerous
 groq
+# ML scoring model serving. scikit-learn DEBE coincidir EXACTO con la versión
+# que generó models/scoring_model.joblib (ver requirements-dev.txt) — un
+# mismatch rompe joblib.load. Re-pinnear ambos al re-entrenar si cambia.
+scikit-learn==1.9.0
+numpy==2.4.6
+joblib==1.5.3

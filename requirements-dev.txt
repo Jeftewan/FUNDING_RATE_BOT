@@ -8,5 +8,9 @@
 optuna
 pandas
 sqlalchemy
-numpy
-scikit-learn  # ml_diagnostic.py — techo de predictibilidad (GradientBoosting)
+numpy==2.4.6
+# scikit-learn DEBE coincidir EXACTO con requirements.txt (prod): el .joblib
+# que genera ml_train.py se carga en Railway con esa misma versión o joblib.load
+# falla. Usado por ml_diagnostic.py / ml_stability.py / ml_train.py.
+scikit-learn==1.9.0
+joblib==1.5.3

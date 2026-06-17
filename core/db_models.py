@@ -203,6 +203,11 @@ class ScoreSnapshot(db.Model):
     volume_24h = db.Column(db.Float, default=0)
     z_score = db.Column(db.Float, default=0)
     momentum_signal = db.Column(db.String(20), default="flat")
+    # ML model audit: predicción cruda (net_apr) + versión del modelo que la
+    # generó. Null cuando el scan corrió con el heurístico (sin modelo). Alimenta
+    # la validación de predicciones previas en scripts/ml_train.py.
+    model_prediction = db.Column(db.Float)
+    model_version = db.Column(db.String(50))
     scan_number = db.Column(db.Integer, default=0)
     captured_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
                             nullable=False, index=True)
