@@ -1,4 +1,5 @@
 """Flask API routes — v10.0 unified."""
+import os
 import time
 import threading
 import logging
@@ -11,6 +12,21 @@ from portfolio.actions import calculate_position_estimate
 log = logging.getLogger("bot")
 
 api = Blueprint("api", __name__)
+
+
+def _asset_version(app) -> int:
+    """Cache-busting token para los assets estáticos (app.js/style.css).
+
+    Usa el mtime más reciente de los dos archivos. Cambia en cada deploy (los
+    archivos se reescriben), forzando al navegador a recargar el JS/CSS nuevo en
+    vez de servir una versión vieja cacheada. Fallback a time() si falla el stat.
+    """
+    try:
+        sf = app.static_folder
+        return int(max(os.path.getmtime(os.path.join(sf, "app.js")),
+                       os.path.getmtime(os.path.join(sf, "style.css"))))
+    except OSError:
+        return int(time.time())
 
 
 def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, db_enabled=False):
@@ -1373,7 +1389,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         if db_enabled:
             from flask_login import current_user
             user_email = current_user.email if current_user.is_authenticated else ""
-        return render_template("index.html", db_enabled=db_enabled, user_email=user_email)
+        return render_template("index.html", db_enabled=db_enabled,
+                               user_email=user_email, asset_v=_asset_version(app))
 
     # ── Favicon at root — required for Google Search crawler ─────────
     @app.route("/favicon.ico")
