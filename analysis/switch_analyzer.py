@@ -13,9 +13,15 @@ v10.3 recalibration (aligned with scoring v10.3 backtest findings):
     compress in v10.3 due to hard caps and stronger z-penalty, so large
     absolute gaps are rarer even when the alternative is genuinely better.
 
-Decision thresholds:
-  SWITCH:  adjusted_switch_value > 0 AND break_even < 24h AND score_new > score + 10
-  CONSIDER: adjusted_switch_value > 0 AND break_even < 48h
+Ranking metric (post-ML): the candidate quality is el Net APR predicho por el
+modelo (`model_prediction`), no el score 0–100 calibrado — que se comprime arriba
+(casi todo 95–100) y rompe los umbrales de mejora/floor. Si el modelo no está
+cargado (model_prediction None) se cae al score heurístico con sus umbrales viejos.
+
+Decision thresholds (en Net APR cuando hay modelo):
+  SWITCH:  adjusted_switch_value > 0 AND break_even < 24h AND
+           net_apr_new > net_apr_cur + SWITCH_NET_APR_MARGIN AND net_apr_new >= SWITCH_MIN_NET_APR
+  CONSIDER: adjusted_switch_value > 0 AND break_even < 48h AND net_apr_new >= SWITCH_MIN_NET_APR
   HOLD:    anything else
 """
 import math
@@ -25,6 +31,18 @@ from analysis.fees import (calculate_spot_perp_fees, calculate_cross_exchange_fe
 from portfolio.manager import position_fees as _pf
 
 log = logging.getLogger("bot")
+
+# Umbrales del switch en unidades de Net APR predicho (% anual neto). Tunables,
+# calibrados sobre la distribución real de model_prediction en prod (spot_perp
+# p50≈30%). Floor: la alternativa debe ser al menos "grade C" (8%). Margin: como
+# el IC del modelo es ~0.11 (predicción ruidosa) y el switch cuesta fees reales,
+# se exige que la alternativa supere al actual por ≥10 pts de net APR para no
+# rotar posiciones persiguiendo ruido.
+SWITCH_MIN_NET_APR = 8.0
+SWITCH_NET_APR_MARGIN = 10.0
+# Fallback (modelo caído): umbrales viejos en unidades de score 0–100.
+SWITCH_MIN_SCORE = 55
+SWITCH_SCORE_MARGIN = 10
 
 
 def calculate_switch_cost(current_pos: dict, new_opp: dict,
@@ -397,9 +415,11 @@ def analyze_switch(position: dict, opportunities: list,
         pos_sym_ex = f"{sym}_{pos_long_ex}_{pos_short_ex}"
 
     current_score = 0
+    current_net_apr = None
     for opp in opportunities:
         if opp.get("symbol") == sym and _opp_key(opp) == pos_sym_ex:
             current_score = opp.get("score", 0)
+            current_net_apr = opp.get("model_prediction")
             break
 
     # Evaluate top opportunities as switch candidates
@@ -480,6 +500,7 @@ def analyze_switch(position: dict, opportunities: list,
             "exchange": opp_ex,
             "mode": opp_mode,
             "score": opp_score,
+            "net_apr": opp.get("model_prediction"),
             "apr": opp.get("apr", 0) or round(alt_apr, 1),
             "switch_cost": switch_cost["total_cost"],
             "projected_gain_new": projected_new,
@@ -502,22 +523,30 @@ def analyze_switch(position: dict, opportunities: list,
     best = alternatives[0] if alternatives else None
     recommendation = "HOLD"
 
-    # v10.3: score improvement threshold lowered from +15 to +10 because
-    # hard caps + stronger z-penalty compress the score distribution. We
-    # also require the candidate to clear a minimum absolute score (55) so
-    # a near-hard-capped alternative never triggers SWITCH.
+    # Gating sobre el Net APR predicho por el modelo (model_prediction). El
+    # candidato debe (a) superar un floor de calidad y (b) batir al actual por
+    # un margen. Si no hay modelo (net_apr None), se usa el score heurístico con
+    # los umbrales viejos.
+    alt_clears_floor = False
+    alt_beats_current = False
+    if best:
+        if best.get("net_apr") is not None:
+            cur_metric = current_net_apr if current_net_apr is not None else 0
+            alt_clears_floor = best["net_apr"] >= SWITCH_MIN_NET_APR
+            alt_beats_current = best["net_apr"] > cur_metric + SWITCH_NET_APR_MARGIN
+        else:
+            alt_clears_floor = best["score"] >= SWITCH_MIN_SCORE
+            alt_beats_current = best["score"] > current_score + SWITCH_SCORE_MARGIN
+
     if best and best["adjusted_switch_value"] > 0:
-        alt_clears_floor = best["score"] >= 55
         if (best["break_even_h"] < 24 and
-                best["score"] > current_score + 10 and
-                alt_clears_floor):
+                alt_beats_current and alt_clears_floor):
             recommendation = "SWITCH"
         elif best["break_even_h"] < 48 and alt_clears_floor:
             recommendation = "CONSIDER"
 
     # Factor in position health: if health is very low, lower threshold for switching
     if position_health["health_score"] < 30 and best:
-        alt_clears_floor = best["score"] >= 55
         if (best["adjusted_switch_value"] > 0 and
                 best["break_even_h"] < 48 and alt_clears_floor):
             recommendation = "SWITCH"
@@ -536,6 +565,7 @@ def analyze_switch(position: dict, opportunities: list,
         "current_market_rate": current_market_rate,
         "current_apr": round(current_apr, 1),
         "current_score": current_score,
+        "current_net_apr": current_net_apr,
         "recommendation": recommendation,
         "position_health": position_health,
         "decision_summary": decision_summary,

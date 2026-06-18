@@ -683,23 +683,26 @@ class ScannerWorker:
         except Exception as e:
             log.warning(f"AI analysis skipped: {e}")
 
-        # 6c. Detect exceptional opportunities (global score percentile)
-        # One global query for the p95 threshold, then check each top opp.
-        # Only alerts NEW exceptional opportunities (not in previous scan).
+        # 6c. Detect exceptional opportunities (global Net APR percentile)
+        # One global query for the p95 threshold over the predicted net APR
+        # (model_prediction), then check each top opp. Only alerts NEW
+        # exceptional opportunities (not in previous scan). Opps without an ML
+        # prediction (model down) are skipped.
         exceptional_alerts = []
         current_exceptional_keys = set()
         if self._flask_app:
             try:
                 with self._flask_app.app_context():
                     db_persist = self._get_db_persist()
-                    global_p95 = db_persist.get_global_score_p95() if db_persist else None
+                    global_p95 = db_persist.get_global_netapr_p95() if db_persist else None
                     if global_p95 is not None:
                         for opp in opportunities[:10]:
-                            score = opp.get("score", 0)
+                            net_apr = opp.get("model_prediction")
+                            if net_apr is None:
+                                continue
                             exc = detect_exceptional(
-                                current_score=score,
-                                global_p95=global_p95,
-                                current_apr=opp.get("apr", 0),
+                                net_apr=net_apr,
+                                global_netapr_p95=global_p95,
                             )
                             opp["is_exceptional"] = exc["is_exceptional"]
                             opp["exceptional_reasons"] = exc["reasons"]
@@ -715,7 +718,7 @@ class ScannerWorker:
                                         "severity": "INFO",
                                         "symbol": sym,
                                         "exchange": ex,
-                                        "_score": score,
+                                        "_score": net_apr,
                                         "funding_ts": day,
                                         # user_id/dedup_key are injected per
                                         # recipient in _broadcast_alerts_all_users
@@ -723,7 +726,7 @@ class ScannerWorker:
                                         "_exc_bucket": day,
                                         "message": (
                                             f"Oportunidad excepcional: {sym} en {ex}. "
-                                            f"Score {score}, APR {opp.get('apr', 0):.1f}%. "
+                                            f"Net APR {net_apr:.1f}%, APR {opp.get('apr', 0):.1f}%. "
                                             + " | ".join(exc["reasons"][:2])
                                         ),
                                     })

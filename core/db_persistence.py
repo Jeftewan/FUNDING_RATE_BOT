@@ -11,6 +11,8 @@ _HIST_STATS_TTL = 300  # 5 minutes
 
 # Cache for global score threshold
 _global_score_cache = {"ts": 0, "p95": None, "count": 0}
+# Cache for global Net APR (model_prediction) threshold
+_global_netapr_cache = {"ts": 0, "p95": None, "count": 0}
 
 
 class DBPersistence:
@@ -723,4 +725,35 @@ class DBPersistence:
             return p95
         except Exception as e:
             log.warning(f"get_global_score_p95 failed: {e}")
+            return None
+
+    def get_global_netapr_p95(self) -> float | None:
+        """Return the 95th percentile of the predicted Net APR across ALL tokens.
+
+        Sobre la columna ScoreSnapshot.model_prediction (net APR predicho por el
+        modelo ML). Cached for 5 minutes. Returns None si hay pocos datos ML
+        (<50 predicciones no nulas) → la detección de excepcionales se salta.
+        """
+        now = _time_mod.time()
+        if _global_netapr_cache["p95"] is not None and now - _global_netapr_cache["ts"] < _HIST_STATS_TTL:
+            return _global_netapr_cache["p95"]
+
+        try:
+            from core.db_models import ScoreSnapshot
+
+            all_preds = [s.model_prediction for s in
+                         ScoreSnapshot.query.with_entities(ScoreSnapshot.model_prediction)
+                         .filter(ScoreSnapshot.model_prediction.isnot(None)).all()]
+            if len(all_preds) < 50:
+                log.debug(f"Global net APR p95: only {len(all_preds)} preds, need 50+")
+                return None
+
+            all_preds.sort()
+            idx = int(len(all_preds) * 0.95)
+            p95 = all_preds[min(idx, len(all_preds) - 1)]
+            _global_netapr_cache.update({"ts": now, "p95": p95, "count": len(all_preds)})
+            log.info(f"Global net APR p95={p95:.1f}% (from {len(all_preds)} preds)")
+            return p95
+        except Exception as e:
+            log.warning(f"get_global_netapr_p95 failed: {e}")
             return None
