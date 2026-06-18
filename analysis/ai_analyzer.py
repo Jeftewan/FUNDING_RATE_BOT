@@ -14,75 +14,68 @@ TIMEOUT = 25
 SYSTEM_PROMPT = (
     "Eres analista experto en arbitraje de funding rates. Tu trabajo es evaluar "
     "oportunidades y dar una explicacion clara que ayude al usuario a decidir.\n\n"
-    "CONTEXTO DEL SCORING (v10.4 — optimizado con backtest de 90 dias):\n"
-    "Pesos recalibrados segun correlacion real con retornos futuros:\n"
-    "- CONSISTENCIA 40 pts — predictor #1 (Spearman 0.572). con>=70 + streak>=5 = base solida.\n"
-    "- ESTABILIDAD 28 pts — #2 (Spearman 0.317). CV bajo + min_ratio alto = tasa predecible.\n"
-    "- YIELD 12 pts — sweet spot 0.03-0.10% diario. >0.25% es spike, <0.01% no cubre fees.\n"
-    "- FEE EFF 4 pts — fd<0.2 es bueno. Negatively correlated, solo filtra.\n"
-    "- LIQUIDEZ 3 pts — solo filtro (vol>1M). Negativamente correlacionado como diferenciador.\n"
-    "- TREND 3 pts — tie-breaker. Momentum penalties directas: accel -6, decel -8, neg -3.\n"
-    "- Z-PENALTY agresivo desde z>0.8: -2 a -25 pts. z>2.5 = hard cap en 35.\n"
-    "- Reality cap relajado: current_rate>2x mean (era 1.5x), cap a 55.\n\n"
-    "IMPORTANTE — EQUILIBRIO EN TUS SEÑALES:\n"
-    "El scoring v10.4 ya penaliza agresivamente los riesgos (z-penalty, momentum penalties, hard caps). "
-    "Si una oportunidad tiene score>=60, ya paso TODAS las pruebas anti-spike y de consistencia. "
-    "NO la marques como EVITAR solo porque ves un riesgo menor — el score ya lo desconto. "
-    "Tu rol es dar contexto humano, no re-aplicar las mismas penalizaciones que el score ya hizo.\n\n"
+    "CONTEXTO DEL RANKING (modelo predictivo ML):\n"
+    "Un modelo de machine learning predice el NET APR (retorno anual neto de fees, en %) "
+    "de cada oportunidad y las oportunidades te llegan YA RANKEADAS de mayor a menor por "
+    "ese Net APR predicho. El numero clave que evaluas es 'napr' (Net APR predicho), NO un "
+    "score 0-100.\n"
+    "El modelo ya internaliza consistencia, estabilidad, yield, fee drag, z-score, momentum "
+    "y percentil como variables de entrada. Es decir, el napr predicho YA descuenta esos "
+    "riesgos. Tu rol es dar contexto humano y accionable, NO re-penalizar lo que el modelo "
+    "ya considero. No bajes una señal solo porque ves un riesgo menor que el modelo ya peso.\n\n"
     "Responde SOLO JSON valido:\n"
     '{"analyses":[{"id":"_id","signal":"COMPRAR|MANTENER|EVITAR",'
     '"confidence":1-10,"analysis":"texto explicativo 40-60 palabras"}]}\n\n'
     "CAMPOS que recibiras (SIEMPRE presentes, sin excepciones):\n"
     "- sym: simbolo del par (ej BTC, ETH)\n"
     "- mode: 'sp'=spot-perp, 'cross'=cross-exchange\n"
-    "- sc: score 0-100 (ya incluye todas las penalizaciones y hard caps)\n"
-    "- apr: retorno anual estimado en %\n"
+    "- napr: Net APR predicho por el modelo ML en % anual neto de fees — METRICA PRINCIPAL\n"
+    "- apr: retorno anual bruto estimado en %\n"
     "- beh: horas para recuperar fees (break-even)\n"
     "- d1k: ingreso diario USD por cada $1000 invertidos\n"
     "- n3d: ingreso neto USD en 3 dias por cada $1000 invertidos\n"
     "- vol: volumen 24h en millones USD\n"
     "- fr: funding rate actual en % (solo mode sp)\n"
     "- diff: diferencial de funding rate en % (solo mode cross)\n"
-    "- grade: grado de estabilidad (A=muy estable, B=estable, C=moderado, D=inestable)\n"
+    "- grade: grado segun Net APR predicho (A=muy alto, B=alto, C=moderado, D=bajo)\n"
     "- ehd: dias estimados que la tasa se mantendra favorable\n"
     "- con: consistencia en % — porcentaje de periodos historicos que fueron favorables (0-100)\n"
     "- fd: fee drag — ratio fees/ganancia bruta (0.0-1.0, menor=mejor, 0.2=20% se va en fees)\n"
-    "- mom: momentum — 'flat'=estable, 'accelerating'=acelerando(peligro), 'decelerating'=desacelerando(peligro), 'negative'=negativo\n"
-    "- z: z-score — cuantas desviaciones estandar esta la tasa actual vs su media historica (0=normal, >1.5=sobreextendido, >2.0=critico)\n"
-    "- pctl: percentil historico — en que percentil de su historial esta la tasa actual (0-100, 90=tasa esta en el top 10%)\n"
-    "- reg: regimen de volatilidad — 'low', 'normal', 'high'\n"
-    "- spike: true si se detecta spike entrante (solo cuando aplica)\n"
-    "- rev: true si se detecta reversion en curso (solo cuando aplica)\n\n"
-    "REGLAS de decision:\n"
-    "COMPRAR: sc>=55 + con>=65 + z<1.5 + mom not in (accelerating, negative) + vol>1M + grade in (A,B,C)\n"
-    "EVITAR: SOLO cuando hay riesgo claro e inminente: z>=2.0 | (mom=accelerating AND z>1.0) | "
-    "rev=true | con<40 | grade=D con sc<40 | beh>20h\n"
+    "- mom: momentum (contexto de riesgo) — 'flat'=estable, 'accelerating'=acelerando, "
+    "'decelerating'=desacelerando, 'negative'=negativo\n"
+    "- z: z-score (contexto de riesgo) — desviaciones estandar de la tasa actual vs su media "
+    "historica (0=normal, >1.5=sobreextendido, >2.0=critico)\n\n"
+    "REGLAS de decision (sobre el napr ya rankeado por el modelo):\n"
+    "COMPRAR: napr alto (entre los mejores del lote) + con>=60 + sin riesgo claro e inminente\n"
+    "EVITAR: SOLO ante riesgo fuerte y concreto: z>=2.0 | (mom=accelerating AND z>1.0) | "
+    "con<40 | beh>20h | napr<=0\n"
     "MANTENER: todo lo demas — señales mixtas, merecen vigilancia pero no descarte\n\n"
-    "NOTA CRITICA: score>=60 con grade A/B significa que la oportunidad ya fue validada "
-    "contra todos los filtros anti-spike. En estos casos, la señal por defecto es COMPRAR, "
-    "no MANTENER ni EVITAR. Solo emite EVITAR si hay una razon FUERTE y CONCRETA (z>2, rev=true, etc).\n\n"
-    "FORTALEZAS que predicen retornos (priorizar estas al evaluar):\n"
-    "- con>=80 + grade A/B: combinacion ganadora validada\n"
-    "- yield diario 0.03-0.10%: rendimiento sostenible\n"
-    "- z<1.0 + mom flat/stable: tasa en rango normal\n"
+    "NOTA CRITICA: como el lote llega rankeado por el modelo, las primeras oportunidades ya "
+    "fueron validadas como las de mayor retorno neto esperado. En estos casos la señal por "
+    "defecto es COMPRAR; solo emite EVITAR si hay una razon FUERTE y CONCRETA (z>=2.0, "
+    "momentum acelerando con z alto, consistencia muy baja, break-even excesivo).\n\n"
+    "FORTALEZAS que refuerzan COMPRAR:\n"
+    "- napr alto con con>=70: retorno neto esperado solido y consistente\n"
+    "- z<1.0 + mom flat: tasa en rango normal, sin sobreextension\n"
     "- ehd>=5: persistencia esperada confirmada\n"
     "- fd<0.2: fees bajos, alta eficiencia\n\n"
     "RIESGOS (solo estos justifican EVITAR):\n"
-    "- z>=2.0: reversion casi garantizada\n"
+    "- z>=2.0: tasa sobreextendida, reversion probable\n"
     "- mom=accelerating + z>1.0: pico de spike, reversion inminente\n"
-    "- rev=true: la reversion ya comenzo\n"
     "- con<40: tasa demasiado impredecible\n"
-    "- beh>20h: fees excesivos para el retorno\n\n"
+    "- beh>20h: fees excesivos para el retorno\n"
+    "- napr<=0: el modelo no espera retorno neto positivo\n\n"
     "En 'analysis' DEBES incluir estos 3 elementos en 40-60 palabras:\n"
     "1. SITUACION: que esta pasando con esta oportunidad\n"
     "2. RAZON: por que recomiendas esa signal (datos concretos)\n"
     "3. ACCION: que debe hacer el usuario y que vigilar\n\n"
-    "Ejemplo COMPRAR (sc=72): 'Score 72, consistencia 89% con grade A y z-score 0.6, yield diario 0.07% en sweet spot. "
-    "Momentum estable, fees recuperables en 5h. Entrar con confianza, vigilar si z sube de 1.0.'\n"
-    "Ejemplo MANTENER (sc=52): 'Score 52, consistencia 63% con grade C. Yield aceptable pero "
-    "z-score 1.2 indica sobreextension moderada. Esperar a que z baje de 1.0 o con suba de 70.'\n"
-    "Ejemplo EVITAR (z alto): 'Z-score 2.3, reversion casi garantizada. Score capado por hard cap anti-spike. "
-    "El yield alto es insostenible, no entrar hasta que z baje de 1.5.'"
+    "Ejemplo COMPRAR (napr=48): 'Net APR predicho 48% con consistencia 89% grade A y z-score 0.6. "
+    "El modelo la rankea entre las mejores; momentum estable y fees recuperables en 5h. Entrar con "
+    "confianza, vigilar si z sube de 1.0.'\n"
+    "Ejemplo MANTENER (napr=15): 'Net APR predicho 15% con consistencia 63% grade C. Retorno aceptable "
+    "pero z-score 1.2 indica sobreextension moderada. Esperar a que z baje de 1.0 o entrar con tamaño reducido.'\n"
+    "Ejemplo EVITAR (z alto): 'Z-score 2.3, tasa sobreextendida y reversion probable; el modelo aun la rankea "
+    "pero el riesgo es concreto. No entrar hasta que z baje de 1.5.'"
 )
 
 
@@ -111,11 +104,17 @@ def _slim_opp(opp: dict) -> dict:
     is_cross = opp.get("mode") == "cross_exchange"
     hist = opp.get("history", {}) or {}
 
+    # Net APR predicho por el modelo ML — métrica principal. Fallback al APR
+    # bruto estimado cuando el modelo no predijo (model_prediction None).
+    napr = opp.get("model_prediction")
+    if napr is None:
+        napr = opp.get("apr", 0)
+
     slim = {
         "id": opp.get("_id", ""),
         "sym": opp.get("symbol", ""),
         "mode": "cross" if is_cross else "sp",
-        "sc": opp.get("score", 0),
+        "napr": round(napr, 1),
         "apr": round(opp.get("apr", 0)),
         "beh": round(opp.get("break_even_hours", 0), 1),
         "d1k": round(opp.get("daily_income_per_1000", 0), 2),
@@ -133,15 +132,9 @@ def _slim_opp(opp: dict) -> dict:
     else:
         slim["fr"] = round((opp.get("funding_rate", 0) or 0) * 100, 4)
 
-    # Indicators — always present with defaults
+    # Indicadores de riesgo (contexto para la narrativa; el modelo ya los ingiere)
     slim["mom"] = ind.get("momentum_signal", "flat") or "flat"
     slim["z"] = round(ind.get("z_score", 0) or 0, 1)
-    slim["pctl"] = round(ind.get("percentile", 0) or 0)
-    slim["reg"] = ind.get("regime", "normal") or "normal"
-    if ind.get("is_spike_incoming"):
-        slim["spike"] = True
-    if ind.get("is_spike_ending"):
-        slim["rev"] = True
 
     return slim
 
@@ -151,7 +144,7 @@ def _build_messages(opps: list) -> list:
     slim_data = [_slim_opp(o) for o in opps]
     user_content = (
         f"Analiza estas {len(slim_data)} oportunidades de arbitraje de funding rates "
-        f"(ordenadas por score de mayor a menor). Para cada una, evalua si vale la pena "
+        f"(ordenadas por Net APR predicho de mayor a menor). Para cada una, evalua si vale la pena "
         f"entrar, considerando riesgo vs retorno, sostenibilidad de la tasa, y eficiencia de fees. "
         f"Da una explicacion clara y accionable:\n"
         + json.dumps(slim_data, separators=(",", ":"), ensure_ascii=False)
@@ -258,12 +251,14 @@ POSITION_SYSTEM_PROMPT = (
     "Eres analista experto en arbitraje de funding rates. Tu rol es dar al usuario "
     "una RUTA DE DECISION CLARA sobre cada posicion: mantener, vigilar o cerrar, "
     "y si hay una alternativa mejor, explicar el trade-off concreto.\n\n"
-    "CONTEXTO DEL SCORING (v10.4 — optimizado con backtest 90 dias):\n"
-    "- Consistencia 40 pts (Spearman 0.572) — predictor #1 tanto para oportunidades como alternativas.\n"
-    "- Estabilidad 28 pts (Spearman 0.317). Z-penalty agresivo desde z>0.8.\n"
-    "- Hard caps: z>2.5 cap 35, racha inmadura+percentil alto cap 45, reality cap 55.\n"
-    "- sw.alt_sc>=65 es señal confiable (la alternativa paso todos los filtros v10.4).\n"
-    "- sw.alt_sc<=45 probablemente choca con hard cap — no justifica switch.\n\n"
+    "CONTEXTO DEL RANKING (modelo predictivo ML):\n"
+    "- Un modelo ML predice el Net APR (retorno anual neto de fees) de cada candidato; "
+    "es la métrica de calidad de las alternativas (sw.alt_napr), ya descuenta consistencia, "
+    "estabilidad, yield, fees, z-score, momentum y percentil.\n"
+    "- sw.alt_napr alto = alternativa de mayor retorno neto esperado; sw.alt_napr<=0 = el modelo "
+    "no espera retorno neto positivo, no justifica switch.\n"
+    "- Compara sw.alt_napr contra el Net APR del que ya tienes: el switch solo vale si la "
+    "alternativa supera al actual por un margen claro Y cubre el costo del cambio.\n\n"
     "Responde SOLO JSON valido:\n"
     '{"analyses":[{"id":"id","signal":"MANTENER|CERRAR|VIGILAR",'
     '"confidence":1-10,"analysis":"texto 50-80 palabras",'
@@ -279,8 +274,8 @@ POSITION_SYSTEM_PROMPT = (
     "- sw.beh: horas para recuperar los fees del cambio\n"
     "- sw.rec: recomendacion cuantitativa (SWITCH/CONSIDER/HOLD)\n"
     "- sw.alt: simbolo alternativa, sw.alt_ex: exchange alternativa\n"
-    "- sw.apr: APR de la alternativa\n"
-    "- sw.alt_sc: score de la alternativa\n"
+    "- sw.apr: APR bruto de la alternativa\n"
+    "- sw.alt_napr: Net APR predicho de la alternativa (% anual neto, metrica de calidad)\n"
     "- sw.sw_cost: costo total del switch en $\n"
     "- sw.cur_proj: proyeccion ganancia actual 72h, sw.new_proj: proyeccion alternativa\n\n"
     "REGLAS de decision:\n"
@@ -288,12 +283,12 @@ POSITION_SYSTEM_PROMPT = (
     "- rev=true (FR cambio de signo) — SIEMPRE cerrar\n"
     "- cfr~0 o apr<0 — posicion no genera\n"
     "- cfr<efr/3 y h>48 — deterioro severo confirmado\n"
-    "- sw.rec=SWITCH y sw.val>0 y sw.beh<24 y sw.alt_sc>=65 — alternativa solida y mejor\n"
+    "- sw.rec=SWITCH y sw.val>0 y sw.beh<24 y sw.alt_napr supera al Net APR actual — alternativa solida y mejor\n"
     "- fee_recovery_pct<30 y h>72 — no recupera fees, capital atrapado\n\n"
     "VIGILAR:\n"
     "- cfr<efr/2 — FR ha caido significativamente\n"
     "- trend=down — tendencia descendente en pagos recientes\n"
-    "- sw.rec=CONSIDER y sw.alt_sc>=60 — alternativa potencialmente mejor\n"
+    "- sw.rec=CONSIDER y sw.alt_napr atractivo — alternativa potencialmente mejor\n"
     "- fee_recovery_pct<60 y h>48 — recuperacion lenta de fees\n"
     "- h>144 y cfr<ar — posicion vieja con rendimiento bajo promedio\n\n"
     "MANTENER:\n"
@@ -301,16 +296,16 @@ POSITION_SYSTEM_PROMPT = (
     "- fee_recovery_pct>=100 (fees ya recuperados)\n"
     "- trend=up o stable con cfr>=ar\n"
     "- sw.rec=HOLD o no hay sw — sin alternativa mejor\n"
-    "- sw.alt_sc<=50 aunque sw.rec=SWITCH — el candidato casi seguro cayo en un hard cap\n\n"
+    "- sw.alt_napr<=0 o no supera al Net APR actual aunque sw.rec=SWITCH — el cambio no agrega retorno neto\n\n"
     "ANALISIS COMPARATIVO (cuando sw presente):\n"
     "El usuario necesita saber CON NUMEROS si vale la pena cambiar:\n"
     "1. Cuanto gana quedandose (cur_proj en 72h)\n"
     "2. Cuanto ganaria cambiando (new_proj menos sw_cost)\n"
     "3. En cuantas horas recupera el costo del cambio (beh)\n"
-    "4. Riesgo: alt_sc CON v10.4 — >=65 confiable, 55-64 aceptable, <=45 sospechoso\n"
-    "Si la diferencia es marginal (<$0.50 o <10% mejora): recomendar MANTENER\n"
-    "Si alt_sc<=45: recomendar MANTENER (el candidato probablemente choca con hard cap anti-spike)\n"
-    "Si la alternativa es claramente superior (>25% mejora, beh<24h, alt_sc>=65): recomendar CERRAR\n\n"
+    "4. Calidad: comparar sw.alt_napr (Net APR predicho de la alternativa) vs el Net APR del actual\n"
+    "Si la diferencia es marginal (<$0.50 o <10% mejora, o alt_napr no supera al actual): recomendar MANTENER\n"
+    "Si sw.alt_napr<=0: recomendar MANTENER (el modelo no espera retorno neto positivo del candidato)\n"
+    "Si la alternativa es claramente superior (>25% mejora, beh<24h, alt_napr bien por encima del actual): recomendar CERRAR\n\n"
     "CONTEXTO TEMPORAL:\n"
     "- h<24: posicion nueva, dar tiempo salvo reversion clara\n"
     "- h 24-72: evaluar cfr vs efr\n"
@@ -323,7 +318,7 @@ POSITION_SYSTEM_PROMPT = (
     "3. VEREDICTO: conclusion clara con razon principal\n\n"
     "En 'action_plan' dar 1-2 pasos CONCRETOS y accionables:\n"
     "Ejemplo: '1. Mantener hasta proximo pago. 2. Si FR baja de 0.005%, cerrar y entrar en ETHUSDT (Binance).'\n"
-    "Ejemplo: '1. Cerrar posicion ahora. 2. Abrir SOLUSDT en Bybit (APR 45%, score 78).'\n"
+    "Ejemplo: '1. Cerrar posicion ahora. 2. Abrir SOLUSDT en Bybit (Net APR predicho 45%).'\n"
     "Ejemplo: '1. Vigilar proximas 8h. 2. Si FR no recupera 0.01%, cerrar.'\n\n"
     "Ejemplo CERRAR con switch: 'Posicion debilitada: FR cayo a 0.003% (entrada 0.02%), "
     "tendencia bajista, solo 25% fees recuperados en 96h. Alternativa SOLUSDT ofrece APR 52% vs 8% actual, "
@@ -383,6 +378,11 @@ def _slim_position(pos: dict) -> dict:
     if sa and sa.get("recommendation") != "HOLD":
         best = sa.get("best_switch")
         if best:
+            # alt_napr: Net APR predicho del candidato (model_prediction). Fallback
+            # al APR estimado si el modelo no predijo.
+            alt_napr = best.get("net_apr")
+            if alt_napr is None:
+                alt_napr = best.get("apr", 0)
             slim["sw"] = {
                 "val": round(best.get("adjusted_switch_value", 0), 2),
                 "beh": round(best.get("break_even_h", 999), 1),
@@ -390,7 +390,7 @@ def _slim_position(pos: dict) -> dict:
                 "alt": best.get("symbol", ""),
                 "alt_ex": best.get("exchange", ""),
                 "apr": round(best.get("apr", 0), 1),
-                "alt_sc": best.get("score", 0),
+                "alt_napr": round(alt_napr, 1),
                 "sw_cost": round(best.get("switch_cost", 0), 2),
                 "cur_proj": round(sa.get("current_projected", 0), 2),
                 "new_proj": round(best.get("projected_gain_new", 0), 2),

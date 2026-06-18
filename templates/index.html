@@ -65,7 +65,6 @@
     <div class="filter-panel" id="filter-panel" style="display:none">
       <div class="filter-row">
         <label>APR mín %<input type="number" id="f-apr" class="inp-sm" oninput="onFilterChange()"></label>
-        <label>Score mín<input type="number" id="f-score" class="inp-sm" oninput="onFilterChange()"></label>
         <label>Días estab.<input type="number" id="f-days" class="inp-sm" oninput="onFilterChange()"></label>
         <label>Vol 24h mín<input type="number" id="f-vol" class="inp-sm" style="width:90px" oninput="onFilterChange()"></label>
       </div>
@@ -78,7 +77,7 @@
 
     <div class="sort-bar" id="sort-bar">
       <input type="text" id="search-symbol" placeholder="Buscar..." class="inp-sm" style="width:90px" oninput="applyFilters()">
-      <button class="sort-btn active" data-sort="score" onclick="setSort('score')">Score &#9660;</button>
+      <button class="sort-btn active" data-sort="score" onclick="setSort('score')">Net APR &#9660;</button>
       <button class="sort-btn" data-sort="apr" onclick="setSort('apr')">APR</button>
       <button class="sort-btn" data-sort="fr" onclick="setSort('fr')">FR</button>
       <button class="sort-btn" data-sort="net3d" onclick="setSort('net3d')">Neto 3d</button>
@@ -188,32 +187,26 @@
     <div class="cfg-section">
       <h3>Senales e indicadores</h3>
       <div class="help-group">
-        <h4>Badges de oportunidad</h4>
+        <h4>Net APR predicho (modelo ML)</h4>
         <dl class="help-list">
-          <dt><span class="ind-badge ind-bonanza">BONANZA</span> Regimen de alta volatilidad</dt>
-          <dd>El mercado esta en un periodo de tasas de funding inusualmente altas. Las oportunidades son mas rentables pero tambien menos estables. Buen momento para entrar si el score es alto.</dd>
-          <dt><span class="ind-badge ind-lowvol">BAJA VOL</span> Regimen de baja volatilidad</dt>
-          <dd>El mercado tiene tasas de funding bajas y estables. Las ganancias seran menores pero mas predecibles. Requiere mayor capital para que valga la pena.</dd>
-          <dt><span class="ind-badge ind-spike">SPIKE &#8593;</span> Spike entrante</dt>
-          <dd>Se detecta un aumento rapido del funding rate. Puede ser temporal — si entras, monitorea de cerca porque la tasa puede caer pronto.</dd>
-          <dt><span class="ind-badge ind-warn">REVERSION</span> Reversion en curso</dt>
-          <dd>La tasa esta bajando despues de un spike. Senal de que el pico ya paso. <b>No es buen momento para abrir</b> una nueva posicion; si ya tienes una, considera cerrar.</dd>
-          <dt><span class="ind-badge ind-danger">Z:2.5</span> Z-Score (riesgo)</dt>
-          <dd>Mide que tan lejos esta la tasa actual de su promedio historico en desviaciones estandar. <b>Z &gt; 2</b> = tasa extrema, probablemente insostenible. <b>Z &gt; 3</b> = muy riesgoso, alta probabilidad de reversion.</dd>
+          <dt>Net APR</dt>
+          <dd>Numero principal de cada oportunidad: el <b>retorno anual neto de fees</b> (%) que un modelo de machine learning predice para esa posicion. El modelo aprende de 90 dias de historico y ya pondera consistencia, estabilidad, yield, fees, z-score y momentum. Las oportunidades se ordenan de mayor a menor Net APR predicho.</dd>
+          <dt><span class="ind-badge ind-exceptional">&#11088; EXCEPCIONAL</span> Oportunidad excepcional</dt>
+          <dd>El Net APR predicho esta en el top 5% de toda la flota y supera un piso de calidad. Se notifica por Telegram aunque no tengas posiciones abiertas.</dd>
         </dl>
       </div>
 
       <div class="help-group">
-        <h4>Grades y Score</h4>
+        <h4>Grades (por Net APR predicho)</h4>
         <dl class="help-list">
-          <dt><span class="opp-badge A">A</span> Excelente (Score &ge; 85)</dt>
-          <dd>Tasa alta, volumen saludable, tendencia estable. Las mejores oportunidades para abrir posiciones.</dd>
-          <dt><span class="opp-badge B">B</span> Buena (Score &ge; 70)</dt>
-          <dd>Oportunidad viable con buen balance de estabilidad y rendimiento. Candidatas solidas.</dd>
-          <dt><span class="opp-badge C">C</span> Aceptable (Score &ge; 55)</dt>
-          <dd>Oportunidad con alguna debilidad (volumen bajo, momentum incierto, o fees altos vs ganancia).</dd>
-          <dt><span class="opp-badge D">D</span> Debil (Score &lt; 55)</dt>
-          <dd>Metricas debiles. Solo considerar si conoces bien el par y tienes una razon especifica.</dd>
+          <dt><span class="opp-badge A">A</span> Excelente (Net APR &ge; 40%)</dt>
+          <dd>Retorno neto esperado muy alto. Las mejores oportunidades para abrir posiciones.</dd>
+          <dt><span class="opp-badge B">B</span> Buena (Net APR &ge; 20%)</dt>
+          <dd>Retorno neto esperado solido. Candidatas viables.</dd>
+          <dt><span class="opp-badge C">C</span> Aceptable (Net APR &ge; 8%)</dt>
+          <dd>Retorno neto moderado. Revisar fees y consistencia antes de entrar.</dd>
+          <dt><span class="opp-badge D">D</span> Debil (Net APR &lt; 8%)</dt>
+          <dd>Retorno neto esperado bajo. Solo considerar con una razon especifica.</dd>
         </dl>
       </div>
     </div>

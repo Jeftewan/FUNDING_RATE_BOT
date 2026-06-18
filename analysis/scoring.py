@@ -145,6 +145,24 @@ def stability_grade(score: int) -> str:
     return "D"
 
 
+# Umbrales de grade sobre Net APR predicho por el modelo ML (% anual neto de fees).
+# Se usan cuando el modelo está cargado; el score 0–100 calibrado es un percentil
+# contra el train y se comprime arriba (todo "A"), así que no sirve para gradar.
+# Calibrados sobre la distribución real de model_prediction en prod (spot_perp:
+# p50≈30%, p75≈37%, p90≈87%): el opp típico queda B y el top ~25% queda A.
+NET_APR_GRADE_A = 40.0
+NET_APR_GRADE_B = 20.0
+NET_APR_GRADE_C = 8.0
+
+
+def grade_from_net_apr(net_apr: float) -> str:
+    """Grade A/B/C/D según el Net APR predicho (no el score percentil)."""
+    if net_apr >= NET_APR_GRADE_A: return "A"
+    elif net_apr >= NET_APR_GRADE_B: return "B"
+    elif net_apr >= NET_APR_GRADE_C: return "C"
+    return "D"
+
+
 def estimated_hold_days(hist: dict) -> int:
     streak = hist.get("streak", 0)
     pct = hist.get("pct", 0)

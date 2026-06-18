@@ -123,13 +123,12 @@ function getFilterState() {
   const exchanges = Array.from(
     document.querySelectorAll('#f-exchanges input:checked')
   ).map(c => c.value);
-  return { apr: num('f-apr'), score: num('f-score'),
+  return { apr: num('f-apr'),
            days: num('f-days'), vol: num('f-vol'), exchanges };
 }
 
 function matchesFilters(o, f) {
   if (f.apr != null && (o.apr || 0) < f.apr) return false;
-  if (f.score != null && (o.score || 0) < f.score) return false;
   if (f.days != null && (o.estimated_hold_days || 0) < f.days) return false;
   if (f.vol != null && f.vol > 0) {
     const v = o.volume_24h || 0;
@@ -161,7 +160,7 @@ function toggleFilters() {
 }
 
 function resetFilters() {
-  ['f-apr','f-score','f-days','f-vol'].forEach(id => {
+  ['f-apr','f-days','f-vol'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });
@@ -179,7 +178,6 @@ async function saveFilters() {
   const f = getFilterState();
   const data = {
     min_apr: f.apr != null ? f.apr : 0,
-    min_score: f.score != null ? f.score : 0,
     min_stability_days: f.days != null ? f.days : 0,
     min_volume: f.vol != null ? f.vol : 0,
     allowed_exchanges: f.exchanges.join(','),
@@ -202,7 +200,6 @@ async function loadFilters() {
       if (el && val != null) el.value = val;
     };
     set('f-apr', cfg.min_apr);
-    set('f-score', cfg.min_score);
     set('f-days', cfg.min_stability_days);
     set('f-vol', cfg.min_volume);
     const allowed = (cfg.allowed_exchanges || '')
@@ -220,7 +217,9 @@ function sortAndFilter(opps) {
   );
 
   const fieldMap = {
-    score: o => o.score || 0,
+    // 'score' ahora ordena por Net APR predicho (número principal mostrado);
+    // fallback al score calibrado cuando no hay predicción del modelo.
+    score: o => (o.model_prediction != null ? o.model_prediction : (o.score || 0)),
     apr: o => o.apr || 0,
     fr: o => o.funding_rate || o.rate_differential || 0,
     net3d: o => o.net_3d_revenue_per_1000 || 0,
@@ -242,7 +241,7 @@ let _isFirstRender = true;
 function oppHash(data) {
   // Hash based on opportunity IDs + scores + scan_count (ignoring mins_to_next which changes every tick)
   const opps = data.opportunities || [];
-  const key = opps.map(o => o._id + ':' + (o.score||0) + ':' + (o.apr||0).toFixed(1)).join('|');
+  const key = opps.map(o => o._id + ':' + (o.model_prediction != null ? o.model_prediction.toFixed(1) : (o.score||0)) + ':' + (o.apr||0).toFixed(1)).join('|');
   return key + '#' + (data.scan_count || 0) + '#' + opps.length;
 }
 
@@ -567,16 +566,9 @@ function renderOpps(data) {
     const fr = !isCross ? o.funding_rate : o.rate_differential;
     const frPct = (fr * 100).toFixed(4);
     const days = o.estimated_hold_days || '?';
-    const ind = o.indicators || {};
-    const momSignal = ind.momentum_signal || '';
-    const momArrow = momSignal === 'accelerating' ? '⬆' : momSignal === 'decelerating' ? '⬇' : momSignal === 'negative' ? '↓' : '→';
-    const momClass = momSignal === 'accelerating' ? 'ind-up' : momSignal === 'negative' ? 'ind-down' : 'ind-flat';
-    const regimeBadge = ind.regime === 'high_vol' ? '<span class="ind-badge ind-bonanza">BONANZA</span>' :
-                        ind.regime === 'low_vol' ? '<span class="ind-badge ind-lowvol">BAJA VOL</span>' : '';
-    const spikeBadge = ind.is_spike_incoming ? '<span class="ind-badge ind-spike">SPIKE ↑</span>' :
-                       ind.is_spike_ending ? '<span class="ind-badge ind-warn">REVERSION</span>' : '';
-    const zBadge = ind.z_risk === 'extreme' ? '<span class="ind-badge ind-danger">Z:'+ind.z_score+'</span>' :
-                   ind.z_risk === 'high' ? '<span class="ind-badge ind-warn">Z:'+ind.z_score+'</span>' : '';
+    // Net APR predicho por el modelo ML — número principal y discriminante.
+    // Fallback al APR estimado si el modelo no predijo (model_prediction null).
+    const netApr = o.model_prediction != null ? o.model_prediction : o.apr;
 
     const isExc = o.is_exceptional;
     const excReasons = (o.exceptional_reasons || []).join(' · ');
@@ -589,11 +581,11 @@ function renderOpps(data) {
           <span class="opp-symbol">${o.symbol}</span>
           <span class="opp-mode">${mode}</span>
           <span class="opp-exchange">${exchange}</span>
-          ${excBadge}${spikeBadge}${regimeBadge}${zBadge}
+          ${excBadge}
         </div>
         <div class="opp-header-right">
           <span class="opp-badge ${grade}">${grade}</span>
-          <span class="opp-score">${o.score}</span>
+          <span class="opp-score" title="Net APR predicho (modelo ML)">${netApr.toFixed(1)}%</span>
         </div>
       </div>
 
@@ -606,8 +598,6 @@ function renderOpps(data) {
         <div class="opp-stat"><span class="label">Fees</span><span class="value">$${o.fees_total?.toFixed(2) || o.total_fees?.toFixed(2)}</span></div>
         <div class="opp-stat"><span class="label">Break-even</span><span class="value">${o.break_even_hours?.toFixed(1)}h</span></div>
         <div class="opp-stat"><span class="label">Hold</span><span class="value">${days}d</span></div>
-        ${ind.momentum_signal ? `<div class="opp-stat"><span class="label">Mom</span><span class="value ${momClass}">${momArrow}</span></div>` : ''}
-        ${ind.percentile !== undefined ? `<div class="opp-stat"><span class="label">Pctl</span><span class="value">${Math.round(ind.percentile||0)}%</span></div>` : ''}
       </div>
 
       <div class="opp-meta">
@@ -713,12 +703,7 @@ function renderDefiOpps(data) {
     const modeLabel = isMixed ? 'CEX+DeFi' : 'DeFi';
     const borderColor = isMixed ? 'var(--orange)' : 'var(--purple)';
 
-    const dInd = o.indicators || {};
-    const dSpikeBadge = dInd.is_spike_incoming ? '<span class="ind-badge ind-spike">SPIKE ↑</span>' :
-                        dInd.is_spike_ending ? '<span class="ind-badge ind-warn">REVERSION</span>' : '';
-    const dRegimeBadge = dInd.regime === 'high_vol' ? '<span class="ind-badge ind-bonanza">BONANZA</span>' :
-                         dInd.regime === 'low_vol' ? '<span class="ind-badge ind-lowvol">BAJA VOL</span>' : '';
-    const dZBadge = (dInd.z_risk === 'extreme' || dInd.z_risk === 'high') ? '<span class="ind-badge ind-danger">Z:'+dInd.z_score+'</span>' : '';
+    const netApr = o.model_prediction != null ? o.model_prediction : o.apr;
 
     return `
     <div class="opp-card" style="border-left:3px solid ${borderColor}">
@@ -727,11 +712,10 @@ function renderDefiOpps(data) {
           <span class="opp-symbol">${o.symbol}</span>
           <span class="opp-mode">${modeLabel}</span>
           <span class="opp-exchange">${le}/${se}</span>
-          ${dSpikeBadge}${dRegimeBadge}${dZBadge}
         </div>
         <div class="opp-header-right">
           <span class="opp-badge ${grade}">${grade}</span>
-          <span class="opp-score">${o.score}</span>
+          <span class="opp-score" title="Net APR predicho (modelo ML)">${netApr.toFixed(1)}%</span>
         </div>
       </div>
 
@@ -1360,9 +1344,9 @@ function renderPositions(data) {
                 <span style="color:${best.apr > (sa.current_apr || 0) ? 'var(--green)' : 'var(--text-secondary)'}">${best.apr?.toFixed(1)}%</span>
               </div>
               <div class="dp-comp-row">
-                <span class="dp-comp-label">Score</span>
-                <span>${sa.current_score || '?'}</span>
-                <span style="color:${best.score > (sa.current_score || 0) ? 'var(--green)' : 'var(--text-secondary)'}">${best.score}</span>
+                <span class="dp-comp-label">Net APR</span>
+                <span>${sa.current_net_apr != null ? sa.current_net_apr.toFixed(1) + '%' : '?'}</span>
+                <span style="color:${(best.net_apr != null ? best.net_apr : best.score) > (sa.current_net_apr != null ? sa.current_net_apr : (sa.current_score || 0)) ? 'var(--green)' : 'var(--text-secondary)'}">${best.net_apr != null ? best.net_apr.toFixed(1) + '%' : (best.apr != null ? best.apr.toFixed(1) + '%' : '?')}</span>
               </div>
               <div class="dp-comp-row">
                 <span class="dp-comp-label">Proy 72h</span>

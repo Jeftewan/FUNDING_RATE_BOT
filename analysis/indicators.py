@@ -268,32 +268,34 @@ def acceleration_bonus(rates: list, window: int = 8) -> dict:
     }
 
 
-def detect_exceptional(current_score: int, global_p95: float,
-                       current_apr: float = 0) -> dict:
+def detect_exceptional(net_apr: float, global_netapr_p95: float,
+                       floor: float = 40.0) -> dict:
     """Detect if an opportunity is statistically exceptional.
 
+    Se evalúa sobre el Net APR predicho por el modelo ML (magnitud económica
+    real), no sobre el score 0–100 percentil (que se comprime arriba).
+
     Criteria (both required):
-      1. Score >= global p95 threshold (top 5% of ALL tokens historically)
-      2. Score >= 70 (minimum quality floor)
+      1. Net APR >= global p95 (top 5% de la distribución reciente de net APR)
+      2. Net APR >= floor (piso absoluto, alineado con grade A = 40% net APR;
+         calibrado sobre la distribución real de model_prediction en prod)
 
     Args:
-      current_score: this opportunity's score
-      global_p95: the 95th percentile score across all tokens (from DB)
-      current_apr: current APR (informational context only)
+      net_apr: Net APR predicho de esta oportunidad (% anual neto de fees)
+      global_netapr_p95: percentil 95 del net APR predicho en toda la flota (DB)
+      floor: piso absoluto de net APR para calificar como excepcional
 
     Returns:
       {"is_exceptional": bool, "reasons": [...]}
     """
     reasons = []
 
-    is_exceptional = current_score >= global_p95 and current_score >= 70
+    is_exceptional = net_apr >= global_netapr_p95 and net_apr >= floor
 
     if is_exceptional:
         reasons.append(
-            f"Score {current_score} >= {global_p95} (percentil 95 global)"
+            f"Net APR {net_apr:.1f}% >= {global_netapr_p95:.1f}% (percentil 95 global)"
         )
-    if current_apr > 0:
-        reasons.append(f"APR {current_apr:.1f}%")
 
     return {
         "is_exceptional": is_exceptional,

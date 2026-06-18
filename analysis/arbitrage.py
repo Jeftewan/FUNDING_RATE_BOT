@@ -5,7 +5,7 @@ from core.models import FundingRate, SpotPerpOpportunity, CrossExchangeOpportuni
 from analysis.funding import FundingAggregator
 from analysis.fees import (calculate_spot_perp_fees, calculate_cross_exchange_fees,
                            calculate_break_even_hours)
-from analysis.scoring import opportunity_score, stability_grade, estimated_hold_days
+from analysis.scoring import opportunity_score, stability_grade, grade_from_net_apr, estimated_hold_days
 from analysis import ml_scorer
 
 log = logging.getLogger("bot")
@@ -138,7 +138,7 @@ class ArbitrageScanner:
         }
         sc = opportunity_score(score_params)
         display_score, score_heuristic, model_pred = self._resolve_score(sc, score_params)
-        grade = stability_grade(display_score)
+        grade = grade_from_net_apr(model_pred) if model_pred is not None else stability_grade(display_score)
         est_days = estimated_hold_days(hist_dict)
 
         has_spot = self.exchange_manager.fetch_spot_availability(
@@ -334,7 +334,7 @@ class ArbitrageScanner:
         elif NOTIONAL < 5000:
             liq_risk = "MEDIUM"
 
-        grade = stability_grade(display_score)
+        grade = grade_from_net_apr(model_pred) if model_pred is not None else stability_grade(display_score)
 
         # Estimated hold days based on differential history
         est_days = 0
