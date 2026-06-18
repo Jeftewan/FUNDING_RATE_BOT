@@ -80,7 +80,7 @@ function showSkeletons(el, count = 3) {
 }
 
 // ── Sort & filter state ──────────────────────────────────────
-let sortState = { field: 'score', dir: 'desc' };
+let sortState = { field: 'netapr', dir: 'desc' };
 let _lastCexData = null;
 let _lastDefiData = null;
 
@@ -217,16 +217,16 @@ function sortAndFilter(opps) {
   );
 
   const fieldMap = {
-    // 'score' ahora ordena por Net APR predicho (número principal mostrado);
-    // fallback al score calibrado cuando no hay predicción del modelo.
-    score: o => (o.model_prediction != null ? o.model_prediction : (o.score || 0)),
+    // Ordena por Net APR predicho (número principal mostrado); fallback al score
+    // calibrado solo cuando no hay predicción del modelo.
+    netapr: o => (o.model_prediction != null ? o.model_prediction : (o.score || 0)),
     apr: o => o.apr || 0,
     fr: o => o.funding_rate || o.rate_differential || 0,
     net3d: o => o.net_3d_revenue_per_1000 || 0,
     volume: o => o.volume_24h || 0,
     be: o => o.break_even_hours || 999,
   };
-  const getter = fieldMap[sortState.field] || fieldMap.score;
+  const getter = fieldMap[sortState.field] || fieldMap.netapr;
   const mult = sortState.dir === 'desc' ? -1 : 1;
   filtered.sort((a, b) => mult * (getter(a) - getter(b)));
   return filtered;
@@ -562,7 +562,7 @@ function renderOpps(data) {
     const isCross = o.mode === 'cross_exchange';
     const exchange = !isCross ? o.exchange :
       `${o.long_exchange}/${o.short_exchange}`;
-    const grade = o.stability_grade || gradeFromScore(o.score);
+    const grade = o.stability_grade || gradeFromNetApr(o.model_prediction != null ? o.model_prediction : o.apr);
     const fr = !isCross ? o.funding_rate : o.rate_differential;
     const frPct = (fr * 100).toFixed(4);
     const days = o.estimated_hold_days || '?';
@@ -692,7 +692,7 @@ function renderDefiOpps(data) {
   const base = 1000;
   el.innerHTML = opps.map((o, i) => {
     const idx = base + i;
-    const grade = o.stability_grade || gradeFromScore(o.score);
+    const grade = o.stability_grade || gradeFromNetApr(o.model_prediction != null ? o.model_prediction : o.apr);
     const fr = o.rate_differential || 0;
     const frPct = (fr * 100).toFixed(4);
 
@@ -759,10 +759,13 @@ function renderDefiOpps(data) {
   });
 }
 
-function gradeFromScore(s) {
-  if (s >= 85) return 'A';
-  if (s >= 70) return 'B';
-  if (s >= 55) return 'C';
+// Fallback de grade cuando el backend no envía stability_grade (datos viejos).
+// Mismos umbrales de Net APR que analysis/scoring.grade_from_net_apr (40/20/8).
+function gradeFromNetApr(v) {
+  if (v == null) return 'D';
+  if (v >= 40) return 'A';
+  if (v >= 20) return 'B';
+  if (v >= 8) return 'C';
   return 'D';
 }
 
