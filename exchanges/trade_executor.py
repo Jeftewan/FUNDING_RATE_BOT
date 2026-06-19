@@ -33,6 +33,10 @@ SPOT_LIMIT_TIMEOUT = 60
 CROSS_LIMIT_TIMEOUT = 90
 POLL_INTERVAL = 2.0
 
+# Holgura para que el límite spot favorable quede por debajo del perp y siga siendo
+# maker (no cruza el spread). 0.0005 == 0.05%.
+FAVORABLE_BASIS_EPS = 0.0005
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 def is_cex(name: str) -> bool:
@@ -90,20 +94,29 @@ def _ensure_markets(client):
         client.load_markets()
 
 
-def _mid_price(client, ccxt_symbol: str, fallback: float = 0.0) -> float:
-    """Best-effort mid price from the ticker; falls back to a provided price."""
+def _top_of_book(client, ccxt_symbol: str, fallback: float = 0.0):
+    """(bid, ask, mid) desde el ticker. Cae al fallback si no hay bid/ask.
+
+    Cuando solo hay 'last' (sin bid/ask en el ticker), bid==ask==mid==last.
+    """
     try:
         t = client.fetch_ticker(ccxt_symbol)
-        bid = t.get("bid") or 0
-        ask = t.get("ask") or 0
+        bid = float(t.get("bid") or 0)
+        ask = float(t.get("ask") or 0)
         if bid and ask:
-            return (bid + ask) / 2
-        last = t.get("last") or t.get("close") or 0
+            return bid, ask, (bid + ask) / 2
+        last = float(t.get("last") or t.get("close") or 0)
         if last:
-            return float(last)
+            return last, last, last
     except Exception as e:
         log.warning(f"ticker fetch failed {ccxt_symbol}: {e}")
-    return float(fallback or 0)
+    fb = float(fallback or 0)
+    return fb, fb, fb
+
+
+def _mid_price(client, ccxt_symbol: str, fallback: float = 0.0) -> float:
+    """Best-effort mid price from the ticker; falls back to a provided price."""
+    return _top_of_book(client, ccxt_symbol, fallback)[2]
 
 
 def _norm_amount(client, ccxt_symbol: str, base_amount: float) -> float:
@@ -160,12 +173,119 @@ def _order_fee_usd(order: dict) -> float:
     return total
 
 
-def _set_leverage(client, ccxt_symbol: str, leverage: int):
-    """Best-effort leverage set. Non-fatal: account may already be configured."""
+def _exchange_margin_params(client) -> dict:
+    """Params extra que requiere set_margin_mode por exchange."""
+    if getattr(client, "id", "") == "bitget":
+        return {"marginCoin": "USDT", "productType": "USDT-FUTURES"}
+    return {}
+
+
+def _exchange_leverage_params(client, ccxt_symbol: str, side: str | None) -> dict:
+    """Params extra que requiere set_leverage por exchange.
+
+    En hedge mode Bitget/OKX fijan el leverage por lado (holdSide/posSide); en
+    one-way no se pasa el lado.
+    """
+    ex = getattr(client, "id", "")
+    hedged = _is_hedged(client, ccxt_symbol) is True
+    if ex == "bitget":
+        p = {"marginCoin": "USDT", "productType": "USDT-FUTURES"}
+        if side and hedged:
+            p["holdSide"] = "long" if side == "long" else "short"
+        return p
+    if ex == "okx":
+        p = {"marginMode": "isolated"}
+        if side and hedged:
+            p["posSide"] = "long" if side == "long" else "short"
+        return p
+    return {}
+
+
+def _is_no_change_error(e: Exception) -> bool:
+    """True si el error indica que el margen/leverage YA estaba en el valor pedido.
+
+    Varios exchanges lanzan en vez de devolver no-op cuando el setting no cambia;
+    eso NO es un fallo — significa que la configuración ya es la correcta.
+    """
+    msg = str(e).lower()
+    needles = ("not be changed", "not changed", "no need to change", "no change",
+               "not modified", "same as", "repeat", "duplicate", "已", "40109", "45117")
+    return any(n in msg for n in needles)
+
+
+def _read_position_config(client, ccxt_symbol: str):
+    """Lee (margin_mode, leverage) configurados para el símbolo desde el exchange.
+
+    Devuelve (None, None) si no se puede leer (algunos exchanges no exponen la
+    config cuando no hay posición). Es la verificación autoritativa de que el
+    set_* realmente surtió efecto.
+    """
     try:
-        client.set_leverage(leverage, ccxt_symbol)
+        positions = client.fetch_positions([ccxt_symbol])
     except Exception as e:
-        log.warning(f"set_leverage({leverage},{ccxt_symbol}) failed: {e}")
+        log.warning(f"read position config {ccxt_symbol} failed: {e}")
+        return (None, None)
+    for p in positions:
+        if p.get("symbol") and p.get("symbol") != ccxt_symbol:
+            continue
+        info = p.get("info") or {}
+        mm = p.get("marginMode") or info.get("marginMode") or info.get("marginType")
+        lev = p.get("leverage")
+        if lev is None:
+            lev = info.get("leverage")
+        mm = str(mm).lower() if mm is not None else None
+        if mm == "crossed":
+            mm = "cross"
+        try:
+            lev = float(lev) if lev is not None else None
+        except (TypeError, ValueError):
+            lev = None
+        return (mm, lev)
+    return (None, None)
+
+
+def _ensure_margin_and_leverage(client, ccxt_symbol: str, leverage: int,
+                                side: str | None = None):
+    """Garantiza margen AISLADO + el leverage exacto, verificando por read-back.
+
+    Devuelve None si quedó garantizado, o un string de error accionable si no.
+    El caller debe abortar ANTES de colocar la primera orden cuando devuelve error,
+    para no quedar expuesto en cruzado o con un leverage distinto al indicado.
+    """
+    leverage = int(leverage)
+    mm_err = lev_err = None
+    try:
+        client.set_margin_mode("isolated", ccxt_symbol, _exchange_margin_params(client))
+    except Exception as e:
+        if not _is_no_change_error(e):
+            mm_err = e
+    try:
+        client.set_leverage(leverage, ccxt_symbol,
+                            _exchange_leverage_params(client, ccxt_symbol, side))
+    except Exception as e:
+        if not _is_no_change_error(e):
+            lev_err = e
+
+    # Read-back: autoritativo cuando está disponible.
+    mm, lev = _read_position_config(client, ccxt_symbol)
+    problems = []
+    if mm is not None:
+        if mm != "isolated":
+            problems.append(f"el margen quedó en '{mm}' (se requiere isolated)")
+    elif mm_err is not None:
+        problems.append(f"no se pudo fijar el margen aislado: {mm_err}")
+    if lev is not None:
+        if int(round(lev)) != leverage:
+            problems.append(f"el leverage quedó en {int(round(lev))}x (se pidió {leverage}x)")
+    elif lev_err is not None:
+        problems.append(f"no se pudo fijar el leverage: {lev_err}")
+
+    if problems:
+        return (f"No se pudo garantizar margen aislado + leverage en {ccxt_symbol}: "
+                + "; ".join(problems)
+                + ". Si hay una posición u orden abierta en ese símbolo, ciérrala e "
+                "inténtalo de nuevo.")
+    return None
 
 
 def _is_hedged(client, ccxt_symbol: str):
@@ -255,18 +375,6 @@ def _ensure_one_way_or_abort(client, ccxt_symbol: str):
                     f"Cierra/cancela esa posición en Bitget e inténtalo de nuevo.")
         log.warning(f"set_position_mode(one-way,{ccxt_symbol}) failed: {e}")
         return None
-
-
-def _set_isolated_margin(client, ccxt_symbol: str):
-    """Best-effort: usar margen aislado (isolated) en vez de cruzado. Non-fatal.
-
-    Cada posicion perp queda con su propio margen, sin compartir colateral con
-    el resto de la cuenta.
-    """
-    try:
-        client.set_margin_mode("isolated", ccxt_symbol)
-    except Exception as e:
-        log.warning(f"set_margin_mode(isolated,{ccxt_symbol}) failed: {e}")
 
 
 def _spot_sellable(client, ccxt_symbol: str, desired: float) -> float:
@@ -385,24 +493,31 @@ def spot_tradeable(exchange_name: str, creds: dict, symbol: str) -> bool:
 
 # ── Public: open ────────────────────────────────────────────────────────────
 def execute_open(creds_by_exchange: dict, opp: dict, capital: float,
-                 leverage: int = 1, dry_run: bool = False) -> dict:
+                 leverage: int = 1, dry_run: bool = False,
+                 allow_market_fallback: bool = True) -> dict:
     """Place the real orders for an opportunity. Returns a result dict.
 
     Success: {ok:True, dry_run, entry_price, entry_fees_usd, order_ids[], legs[]}
     Failure: {ok:False, msg, unwound?:bool, legs?:[]}
+
+    allow_market_fallback (spot_perp): si el límite spot favorable no llena en la
+    ventana, completar a mercado SOLO si el basis sigue ≥ 0 (spot ≤ perp). Con
+    False, en ese caso se aborta sin entrar.
     """
     mode = opp.get("mode", "spot_perp")
     symbol = opp.get("symbol", "")
     leverage = max(1, int(leverage))
 
     if mode == "spot_perp":
-        return _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run)
+        return _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage,
+                               dry_run, allow_market_fallback)
     if mode == "cross_exchange":
         return _open_cross(creds_by_exchange, opp, symbol, capital, leverage, dry_run)
     return {"ok": False, "msg": f"Modo '{mode}' no soportado en auto (usa flujo manual)"}
 
 
-def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
+def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
+                    allow_market_fallback=True):
     exchange = opp.get("exchange", "")
     if not is_cex(exchange):
         return {"ok": False, "msg": f"{exchange} no es CEX soportado"}
@@ -426,60 +541,108 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
     except Exception as e:
         return {"ok": False, "msg": f"No se pudo conectar a {exchange}: {e}"}
 
-    spot_px = _mid_price(spot_cli, spot_sym, opp.get("price", 0))
-    perp_px = _mid_price(perp_cli, perp_sym, opp.get("price", 0))
-    if spot_px <= 0 or perp_px <= 0:
+    spot_bid, spot_ask, spot_mid = _top_of_book(spot_cli, spot_sym, opp.get("price", 0))
+    perp_bid, perp_ask, perp_mid = _top_of_book(perp_cli, perp_sym, opp.get("price", 0))
+    if spot_mid <= 0 or perp_mid <= 0:
         return {"ok": False, "msg": "No se pudo obtener precio de mercado"}
 
-    spot_amt = _norm_amount(spot_cli, spot_sym, spot_size / spot_px)
-    perp_amt = _norm_amount(perp_cli, perp_sym, exposure / perp_px)
+    # Precio límite favorable: comprar el spot al/o por debajo del perp (basis ≥ 0)
+    # para que el slippage juegue a favor. Anclado al bid del perp (menos EPS para
+    # seguir maker) y topeado al bid del spot (nunca postear por encima del mejor bid).
+    fav_px = min(spot_bid, perp_bid * (1 - FAVORABLE_BASIS_EPS))
+    if fav_px <= 0:
+        fav_px = spot_bid or spot_mid
 
-    err = _check_min_notional(spot_cli, spot_sym, spot_amt, spot_px) \
-        or _check_min_notional(perp_cli, perp_sym, perp_amt, perp_px)
+    spot_amt = _norm_amount(spot_cli, spot_sym, spot_size / fav_px)
+    perp_amt = _norm_amount(perp_cli, perp_sym, exposure / perp_mid)
+
+    err = _check_min_notional(spot_cli, spot_sym, spot_amt, fav_px) \
+        or _check_min_notional(perp_cli, perp_sym, perp_amt, perp_mid)
     if err:
         return {"ok": False, "msg": f"Orden bajo el mínimo: {err}"}
+
+    fav_basis_pct = round((perp_bid - fav_px) / fav_px * 100, 4) if fav_px else None
 
     if dry_run:
         return {
             "ok": True, "dry_run": True,
-            "entry_price": perp_px,
+            "entry_price": perp_mid,
             "entry_fees_usd": round((spot_size + exposure) * 0.0006, 4),
             "order_ids": [],
+            "entry_mode": "limit_favorable",
+            "basis_pct": fav_basis_pct,
+            "limit_px": fav_px,
             "legs": [
                 {"side": "buy", "kind": "spot", "exchange": exchange, "symbol": spot_sym,
-                 "amount": spot_amt, "price": spot_px, "type": "limit"},
+                 "amount": spot_amt, "price": fav_px, "type": "limit"},
                 {"side": "sell", "kind": "perp", "exchange": exchange, "symbol": perp_sym,
-                 "amount": perp_amt, "price": perp_px, "type": "market"},
+                 "amount": perp_amt, "price": perp_mid, "type": "market"},
             ],
         }
 
-    _set_isolated_margin(perp_cli, perp_sym)
-    _set_leverage(perp_cli, perp_sym, leverage)
     mode_err = _ensure_one_way_or_abort(perp_cli, perp_sym)
     if mode_err:
         return {"ok": False, "msg": mode_err}
+    cfg_err = _ensure_margin_and_leverage(perp_cli, perp_sym, leverage, side="short")
+    if cfg_err:
+        return {"ok": False, "msg": cfg_err}
 
-    # Leg 1 — maker: limit BUY spot at mid, wait up to 60s.
+    # Leg 1 — maker-first: limit BUY spot al precio favorable; si no llena en la
+    # ventana, completar a mercado SOLO si el basis sigue ≥ 0 (guardia de basis).
     try:
-        spot_order = spot_cli.create_order(spot_sym, "limit", "buy", spot_amt, spot_px)
+        spot_order = spot_cli.create_order(spot_sym, "limit", "buy", spot_amt, fav_px)
     except Exception as e:
         return {"ok": False, "msg": f"No se pudo colocar límite spot: {e}"}
 
     filled, spot_order = _poll_fill(spot_cli, spot_order["id"], spot_sym, SPOT_LIMIT_TIMEOUT)
+    entry_mode = "limit_favorable"
+    spot_fee = _order_fee_usd(spot_order)
+    spot_fill_amt = (spot_order.get("filled") or 0) if spot_order else 0
+    spot_fill_px = (spot_order or {}).get("average") or fav_px
+
     if not filled:
         _safe_cancel(spot_cli, spot_order["id"], spot_sym)
-        # If a partial filled before timeout, unwind it to stay flat.
         part = (spot_order or {}).get("filled") or 0
-        if part > 0:
-            try:
-                spot_cli.create_order(spot_sym, "market", "sell",
-                                      _spot_sellable(spot_cli, spot_sym, part))
-            except Exception as e:
-                return {"ok": False, "msg": f"Límite spot parcial NO deshecho — REVISA MANUALMENTE: {e}"}
-        return {"ok": False, "msg": f"La orden límite spot no se llenó en {SPOT_LIMIT_TIMEOUT}s, abortado"}
+        remaining = spot_amt - part
+        # Guardia de basis: solo ir a mercado si comprar el spot AHORA mantiene
+        # basis ≥ 0 (mejor ask del spot ≤ mejor bid del perp).
+        _, cur_spot_ask, _ = _top_of_book(spot_cli, spot_sym, spot_ask)
+        cur_perp_bid, _, _ = _top_of_book(perp_cli, perp_sym, perp_bid)
+        basis_ok = cur_spot_ask > 0 and cur_perp_bid > 0 and cur_spot_ask <= cur_perp_bid
 
-    spot_fee = _order_fee_usd(spot_order)
-    spot_fill_amt = spot_order.get("filled") or spot_amt
+        if allow_market_fallback and basis_ok and remaining > 0:
+            try:
+                fb = spot_cli.create_order(spot_sym, "market", "buy",
+                                           _norm_amount(spot_cli, spot_sym, remaining))
+            except Exception as e:
+                if part > 0:
+                    try:
+                        spot_cli.create_order(spot_sym, "market", "sell",
+                                              _spot_sellable(spot_cli, spot_sym, part))
+                    except Exception:
+                        return {"ok": False, "msg": f"Fallback de mercado falló y parcial spot NO deshecho — REVISA MANUALMENTE: {e}"}
+                return {"ok": False, "msg": f"Fallback de mercado spot falló: {e}"}
+            spot_fee += _order_fee_usd(fb)
+            spot_fill_amt = part + (fb.get("filled") or 0)
+            spot_fill_px = fb.get("average") or spot_fill_px
+            entry_mode = "market_fallback"
+        else:
+            # Sin fallback (apagado, basis negativo o nada pendiente): quedar flat.
+            if part > 0:
+                try:
+                    spot_cli.create_order(spot_sym, "market", "sell",
+                                          _spot_sellable(spot_cli, spot_sym, part))
+                except Exception as e:
+                    return {"ok": False, "msg": f"Límite spot parcial NO deshecho — REVISA MANUALMENTE: {e}"}
+            if not allow_market_fallback:
+                return {"ok": False, "msg": f"La orden límite spot no se llenó en {SPOT_LIMIT_TIMEOUT}s, abortado"}
+            return {"ok": False,
+                    "msg": (f"No se logró basis favorable en {SPOT_LIMIT_TIMEOUT}s "
+                            f"(spot ask {cur_spot_ask:.6g} > perp bid {cur_perp_bid:.6g}); "
+                            "abortado para no entrar con basis negativo")}
+
+    if spot_fill_amt <= 0:
+        return {"ok": False, "msg": "El spot no se llenó, abortado"}
 
     # Leg 2 — taker: market SHORT perp. On failure, unwind the spot leg.
     try:
@@ -500,16 +663,21 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
         }
 
     perp_fee = _order_fee_usd(perp_order)
-    perp_fill_px = perp_order.get("average") or perp_order.get("price") or perp_px
+    perp_fill_px = perp_order.get("average") or perp_order.get("price") or perp_mid
+    real_basis_pct = (round((perp_fill_px - spot_fill_px) / spot_fill_px * 100, 4)
+                      if spot_fill_px else None)
 
     return {
         "ok": True, "dry_run": False,
         "entry_price": perp_fill_px,
         "entry_fees_usd": round(spot_fee + perp_fee, 6),
         "order_ids": [spot_order.get("id"), perp_order.get("id")],
+        "entry_mode": entry_mode,
+        "basis_pct": real_basis_pct,
+        "limit_px": fav_px,
         "legs": [
             {"side": "buy", "kind": "spot", "exchange": exchange, "symbol": spot_sym,
-             "amount": spot_fill_amt, "price": spot_order.get("average") or spot_px,
+             "amount": spot_fill_amt, "price": spot_fill_px,
              "order_id": spot_order.get("id"), "fee_usd": spot_fee},
             {"side": "sell", "kind": "perp", "exchange": exchange, "symbol": perp_sym,
              "amount": perp_order.get("filled") or perp_amt, "price": perp_fill_px,
@@ -568,13 +736,13 @@ def _open_cross(creds_by_exchange, opp, symbol, capital, leverage, dry_run):
             ],
         }
 
-    _set_isolated_margin(long_cli, sym)
-    _set_isolated_margin(short_cli, sym)
-    _set_leverage(long_cli, sym, leverage)
-    _set_leverage(short_cli, sym, leverage)
     mode_err = _ensure_one_way_or_abort(long_cli, sym) or _ensure_one_way_or_abort(short_cli, sym)
     if mode_err:
         return {"ok": False, "msg": mode_err}
+    cfg_err = (_ensure_margin_and_leverage(long_cli, sym, leverage, side="long")
+               or _ensure_margin_and_leverage(short_cli, sym, leverage, side="short"))
+    if cfg_err:
+        return {"ok": False, "msg": cfg_err}
 
     # Both legs as limit, placed back-to-back, then polled within the window.
     try:

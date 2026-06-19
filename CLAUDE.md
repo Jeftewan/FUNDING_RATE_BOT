@@ -307,8 +307,8 @@ Coloca y ejecuta las órdenes reales de ambas piernas usando las API keys del us
 Única capa que coloca órdenes reales, **aislada** del `ExchangeManager` global de solo-lectura. Cada llamada construye un cliente CCXT autenticado fresco desde las keys *del usuario* (`build_user_client`, importación perezosa de ccxt).
 - `test_connection(ex, creds)` → `fetch_balance` (botón "Probar conexión").
 - `spot_tradeable(ex, creds, symbol)` → gate: el símbolo debe ser mercado **spot centralizado** operable (`spot=True, active`). Excluye Alpha/Onchain/Web3.
-- `execute_open(creds_by_exchange, opp, capital, leverage, dry_run)` — metodología de `build_entry_strategy`:
-  - `spot_perp`: **Limit BUY spot (mid, 60s) → Market SHORT perp** al llenar. Si el perp falla, **unwind** del spot a market.
+- `execute_open(creds_by_exchange, opp, capital, leverage, dry_run, allow_market_fallback=True)` — metodología de `build_entry_strategy`:
+  - `spot_perp`: **Limit BUY spot a precio FAVORABLE → Market SHORT perp** al llenar. El límite se coloca en `fav_px = min(spot_bid, perp_bid·(1−EPS))` (basis ≥ 0, maker). Si no llena en 60s, **fallback a mercado SOLO con guardia de basis**: compra a mercado únicamente si `spot_ask ≤ perp_bid` (basis aún a favor); si no, **aborta** (`allow_market_fallback=False` siempre aborta). El resultado expone `entry_mode` (`limit_favorable`/`market_fallback`), `basis_pct`, `limit_px`. Si el perp falla, **unwind** del spot a market.
   - `cross_exchange`: **Limit en ambas piernas (90s)**; si solo una llena, cancela la otra + **unwind** a market.
 - `execute_close(...)` — revierte ambas piernas a market (`reduceOnly` en perps).
 - `dry_run=True` → simula sin enviar (alimenta el modo "Simular" de la UI). Sizing/precisión vía `amount_to_precision` + `contractSize` (OKX/Bitget usan contratos).
@@ -329,7 +329,7 @@ Coloca y ejecuta las órdenes reales de ambas piernas usando las API keys del us
 
 ### Precondiciones / límites v1
 - Fondos ya en la wallet correcta (spot wallet para la pierna spot, futures para márgenes). **Sin auto-transferencia entre wallets.**
-- `set_leverage` best-effort (no-fatal). Margin mode se deja en el default de la cuenta.
+- **Margen aislado + leverage exacto GARANTIZADOS (verify-and-abort).** Antes de colocar la primera orden, `_ensure_margin_and_leverage(client, sym, leverage, side)` fija `set_margin_mode("isolated")` + `set_leverage` con params por exchange (Bitget: `marginCoin=USDT`/`productType=USDT-FUTURES`/`holdSide` en hedge; OKX: `marginMode=isolated`/`posSide` en hedge) y **verifica por read-back** (`fetch_positions`). Si no se puede confirmar aislado + leverage pedido, **aborta sin tocar el spot** con mensaje accionable. Reemplaza el viejo best-effort que dejaba abrir en cruzado/leverage default (caso real: Bitget cruzado x10). Errores idempotentes "no change" se tratan como éxito.
 - Slippage real asumido (ya estimado por el sistema).
 
 ---
