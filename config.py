@@ -29,10 +29,10 @@ class Config:
     # Coinglass
     COINGLASS_API_KEY = os.environ.get("COINGLASS_API_KEY", "")
 
-    # Groq AI (free tier — Llama 3.3 70B) — multiple keys for rotation
-    GROQ_API_KEY_1 = os.environ.get("GROQ_API_KEY_1", "")
-    GROQ_API_KEY_2 = os.environ.get("GROQ_API_KEY_2", "")
-    GROQ_API_KEY_3 = os.environ.get("GROQ_API_KEY_3", "")
+    # Gemini AI (free tier — Gemini 3.1 Flash-Lite) — multiple keys for rotation
+    GEMINI_API_KEY_1 = os.environ.get("GEMINI_API_KEY_1", "")
+    GEMINI_API_KEY_2 = os.environ.get("GEMINI_API_KEY_2", "")
+    GEMINI_API_KEY_3 = os.environ.get("GEMINI_API_KEY_3", "")
 
     # App
     BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "")
