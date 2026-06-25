@@ -14,7 +14,7 @@ Estado del proyecto al **2026-04-28**, rama activa `claude/integrate-landing-aut
 | Migraciones | `core/database.py._run_migrations()` — ALTER TABLE ADD COLUMN IF NOT EXISTS, sin Flask-Migrate |
 | Exchange CEX | ccxt (Binance, Bybit, OKX, Bitget) |
 | Exchange DeFi | REST APIs propias (Hyperliquid, GMX, Aster, Lighter, Extended) |
-| IA / LLM | Groq Llama 3.3 70B (3 API keys rotadas para evitar rate limits) |
+| IA / LLM | Gemini 3.1 Flash-Lite (`google-genai`, 3 API keys rotadas para evitar rate limits) |
 | Notificaciones | Telegram Bot API (POST JSON, sin dependencias externas) |
 | Cifrado | Fernet simétrico (`core/encryption.py`) para tokens y API keys |
 | Frontend (dashboard) | Vanilla JS + CSS3, sin frameworks (`static/app.js`, `static/style.css`) |
@@ -38,7 +38,7 @@ analysis/
   ml_scorer.py          # Prod: carga el .joblib y rankea (modelo manda)
   indicators.py         # Momentum, z-score, percentil, régimen
   fees.py               # Estimación fees (CCXT + orderbook + fallback)
-  ai_analyzer.py        # Prompts Groq, parse JSON, BUY/HOLD/AVOID
+  ai_analyzer.py        # Prompts Gemini, parse JSON, COMPRAR/MANTENER/EVITAR
   switch_analyzer.py    # Evalúa conveniencia de cambiar posición
   funding.py            # FundingAggregator: acumulados 3d, APR, ingreso diario
 exchanges/
@@ -407,12 +407,19 @@ El usuario puede sobreescribir fees con valores reales una vez que la posición 
 
 ## IA / Análisis LLM
 
-`analysis/ai_analyzer.py` envía las top 5 oportunidades al scan a Groq (Llama 3.3 70B).
+`analysis/ai_analyzer.py` envía las **top 5 oportunidades por Net APR predicho** (`model_prediction`,
+fallback a `score` si el modelo no predijo; excluye `model_prediction <= 0`) a **Gemini 3.1 Flash-Lite**
+(`gemini-3.1-flash-lite`, vía `google-genai`).
 
-- **Señal:** `BUY` / `HOLD` / `AVOID` + score 0–100 + razonamiento en 40–60 palabras
-- **Prompt v10.5:** incluye `mode`, `sym`, indicadores de momentum, z-score, percentil, consistencia, fee drag
-- **Rate limiting:** 3 API keys rotadas (`GROQ_API_KEY_1/2/3`)
-- El prompt está calibrado para no penalizar dos veces lo que el scoring ya penaliza (z-score, momentum)
+- **Señal:** `COMPRAR` / `MANTENER` / `EVITAR` + confidence 1–10 + razonamiento en 40–60 palabras
+- **Prompt:** alineado al modelo ML — `napr` (Net APR predicho) es la métrica principal; flag `mdl`
+  indica si `napr` viene del modelo (1, neto) o es un APR bruto sustituto (0, modelo no predijo). Incluye
+  `mode`, `sym`, momentum, z-score, percentil, consistencia, fee drag, grade.
+- **JSON mode:** `response_mime_type="application/json"`; parseo en `_parse_ai_response`.
+- **Rate limiting:** 3 API keys rotadas (`GEMINI_API_KEY_1/2/3`). El free tier de Gemini es ajustado
+  (~10 RPM, ~250K TPM, RPD según AI Studio); **sin fallback a otro proveedor** — ante 429/timeout el
+  análisis IA degrada a vacío (no rompe el scan ni el endpoint `/api/positions/ai`).
+- El prompt está calibrado para no penalizar dos veces lo que el modelo/scoring ya penaliza (z-score, momentum).
 
 ---
 
@@ -422,9 +429,9 @@ El usuario puede sobreescribir fees con valores reales una vez que la posición 
 DATABASE_URL          # PostgreSQL URI (Railway: PGSQL_URL)
 SECRET_KEY            # Flask session secret
 FERNET_KEY            # Cifrado Fernet (generar: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-GROQ_API_KEY_1        # Llama 3.3 70B (gratuito en groq.com)
-GROQ_API_KEY_2        # (opcional, rotación)
-GROQ_API_KEY_3        # (opcional, rotación)
+GEMINI_API_KEY_1      # Gemini 3.1 Flash-Lite (gratuito en aistudio.google.com)
+GEMINI_API_KEY_2      # (opcional, rotación)
+GEMINI_API_KEY_3      # (opcional, rotación)
 
 # CEX API keys (opcional — sin ellas funciona con datos públicos)
 BINANCE_API_KEY / BINANCE_API_SECRET

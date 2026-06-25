@@ -8,7 +8,7 @@ flask-migrate
 psycopg2-binary
 cryptography
 itsdangerous
-groq
+google-genai
 # ML scoring model serving. scikit-learn DEBE coincidir EXACTO con la versión
 # que generó models/scoring_model.joblib (ver requirements-dev.txt) — un
 # mismatch rompe joblib.load. Re-pinnear ambos al re-entrenar si cambia.

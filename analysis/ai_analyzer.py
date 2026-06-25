@@ -1,4 +1,4 @@
-"""AI-powered opportunity analysis via Groq (Llama 3.3 70B)."""
+"""AI-powered opportunity analysis via Gemini 3.1 Flash-Lite."""
 
 import json
 import logging
@@ -7,7 +7,7 @@ import re
 
 log = logging.getLogger(__name__)
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 MAX_OPPS = 5
 TIMEOUT = 25
 
@@ -22,14 +22,20 @@ SYSTEM_PROMPT = (
     "El modelo ya internaliza consistencia, estabilidad, yield, fee drag, z-score, momentum "
     "y percentil como variables de entrada. Es decir, el napr predicho YA descuenta esos "
     "riesgos. Tu rol es dar contexto humano y accionable, NO re-penalizar lo que el modelo "
-    "ya considero. No bajes una señal solo porque ves un riesgo menor que el modelo ya peso.\n\n"
+    "ya considero. No bajes una señal solo porque ves un riesgo menor que el modelo ya peso.\n"
+    "IMPORTANTE — campo 'mdl': napr es la prediccion NETA del modelo SOLO si mdl=1. Si mdl=0 "
+    "el modelo no predijo esta oportunidad y napr es un APR BRUTO estimado (no descuenta fees ni "
+    "riesgo, y el lote se ordeno por heuristico, no por napr): trata ese napr con mas cautela, no "
+    "asumas que el riesgo ya esta descontado y apoyate mas en con, fd, z y mom.\n\n"
     "Responde SOLO JSON valido:\n"
     '{"analyses":[{"id":"_id","signal":"COMPRAR|MANTENER|EVITAR",'
     '"confidence":1-10,"analysis":"texto explicativo 40-60 palabras"}]}\n\n'
     "CAMPOS que recibiras (SIEMPRE presentes, sin excepciones):\n"
     "- sym: simbolo del par (ej BTC, ETH)\n"
     "- mode: 'sp'=spot-perp, 'cross'=cross-exchange\n"
-    "- napr: Net APR predicho por el modelo ML en % anual neto de fees — METRICA PRINCIPAL\n"
+    "- napr: Net APR predicho por el modelo ML en % anual neto de fees — METRICA PRINCIPAL "
+    "(solo fiable como neto si mdl=1)\n"
+    "- mdl: 1=napr viene del modelo ML (neto, descuenta riesgo); 0=modelo no predijo, napr es APR bruto\n"
     "- apr: retorno anual bruto estimado en %\n"
     "- beh: horas para recuperar fees (break-even)\n"
     "- d1k: ingreso diario USD por cada $1000 invertidos\n"
@@ -79,13 +85,13 @@ SYSTEM_PROMPT = (
 )
 
 
-def _get_groq_key(config) -> str:
-    """Pick a random Groq API key from the configured keys."""
+def _get_gemini_key(config) -> str:
+    """Pick a random Gemini API key from the configured keys."""
     keys = [
         k for k in (
-            getattr(config, "GROQ_API_KEY_1", ""),
-            getattr(config, "GROQ_API_KEY_2", ""),
-            getattr(config, "GROQ_API_KEY_3", ""),
+            getattr(config, "GEMINI_API_KEY_1", ""),
+            getattr(config, "GEMINI_API_KEY_2", ""),
+            getattr(config, "GEMINI_API_KEY_3", ""),
         )
         if k
     ]
@@ -105,16 +111,19 @@ def _slim_opp(opp: dict) -> dict:
     hist = opp.get("history", {}) or {}
 
     # Net APR predicho por el modelo ML — métrica principal. Fallback al APR
-    # bruto estimado cuando el modelo no predijo (model_prediction None).
-    napr = opp.get("model_prediction")
-    if napr is None:
-        napr = opp.get("apr", 0)
+    # bruto estimado cuando el modelo no predijo (model_prediction None). El flag
+    # mdl le dice al LLM si napr es la predicción neta del modelo (1) o un APR
+    # bruto sustituto (0), para que no lo trate como neto-descontado-de-riesgo.
+    model_pred = opp.get("model_prediction")
+    is_model = model_pred is not None
+    napr = model_pred if is_model else opp.get("apr", 0)
 
     slim = {
         "id": opp.get("_id", ""),
         "sym": opp.get("symbol", ""),
         "mode": "cross" if is_cross else "sp",
         "napr": round(napr, 1),
+        "mdl": 1 if is_model else 0,
         "apr": round(opp.get("apr", 0)),
         "beh": round(opp.get("break_even_hours", 0), 1),
         "d1k": round(opp.get("daily_income_per_1000", 0), 2),
@@ -139,8 +148,8 @@ def _slim_opp(opp: dict) -> dict:
     return slim
 
 
-def _build_messages(opps: list) -> list:
-    """Build system + user messages for Groq API."""
+def _build_messages(opps: list) -> tuple:
+    """Build (system_prompt, user_content) for the Gemini API."""
     slim_data = [_slim_opp(o) for o in opps]
     user_content = (
         f"Analiza estas {len(slim_data)} oportunidades de arbitraje de funding rates "
@@ -149,14 +158,11 @@ def _build_messages(opps: list) -> list:
         f"Da una explicacion clara y accionable:\n"
         + json.dumps(slim_data, separators=(",", ":"), ensure_ascii=False)
     )
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
+    return SYSTEM_PROMPT, user_content
 
 
 def _parse_ai_response(text: str, valid_signals: tuple, default_signal: str) -> dict:
-    """Parse Groq JSON response into {id: {signal, confidence, analysis}} map."""
+    """Parse the LLM JSON response into {id: {signal, confidence, analysis}} map."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -195,36 +201,52 @@ def _parse_ai_response(text: str, valid_signals: tuple, default_signal: str) -> 
 
 
 def analyze_top_opportunities(opportunities: list, config, top_n: int = MAX_OPPS) -> list:
-    """Analyze top N opportunities with Groq AI. Returns opportunities with ai_analysis field.
+    """Analyze top N opportunities with Gemini AI. Returns opportunities with ai_analysis field.
 
-    Gracefully degrades: if no API key, Groq fails, or parsing fails,
+    Gracefully degrades: if no API key, Gemini fails, or parsing fails,
     returns opportunities unchanged without ai_analysis field.
     """
-    api_key = _get_groq_key(config)
+    api_key = _get_gemini_key(config)
     if not api_key:
         return opportunities
 
-    # Top N by score (already sorted)
-    top_opps = opportunities[:top_n]
+    # Top N por Net APR predicho por el modelo ML (model_prediction). Fallback a
+    # `score` cuando el modelo no predijo. Se excluyen las que el modelo predice
+    # con retorno neto <= 0 (no vale la pena analizarlas).
+    def _napr_key(o):
+        mp = o.get("model_prediction")
+        return mp if mp is not None else o.get("score", 0)
+
+    ranked = sorted(opportunities, key=_napr_key, reverse=True)
+    ranked = [
+        o for o in ranked
+        if not (o.get("model_prediction") is not None and o.get("model_prediction") <= 0)
+    ]
+    top_opps = ranked[:top_n]
     if not top_opps:
         return opportunities
 
     try:
-        from groq import Groq
+        from google import genai
+        from google.genai import types
 
-        client = Groq(api_key=api_key)
-        messages = _build_messages(top_opps)
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=TIMEOUT * 1000),
+        )
+        system_prompt, user_content = _build_messages(top_opps)
 
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.3,
-            max_tokens=3000,
-            timeout=TIMEOUT,
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.3,
+                response_mime_type="application/json",
+            ),
         )
 
-        raw = resp.choices[0].message.content or ""
+        raw = resp.text or ""
         analysis_map = _parse_ai_response(
             raw, ("COMPRAR", "MANTENER", "EVITAR"), "MANTENER"
         )
@@ -237,7 +259,7 @@ def analyze_top_opportunities(opportunities: list, config, top_n: int = MAX_OPPS
 
             log.info(f"AI analysis: {len(analysis_map)}/{len(top_opps)} opportunities analyzed")
         else:
-            log.warning("AI analysis: empty response from Groq")
+            log.warning("AI analysis: empty response from Gemini")
 
     except Exception as e:
         log.warning(f"AI analysis failed: {e}")
@@ -400,16 +422,17 @@ def _slim_position(pos: dict) -> dict:
 
 
 def analyze_positions(positions: list, config) -> dict:
-    """Analyze active positions with Groq AI. Returns {pos_id: {signal, confidence, analysis}}.
+    """Analyze active positions with Gemini AI. Returns {pos_id: {signal, confidence, analysis}}.
 
     Gracefully degrades: returns empty dict on any failure.
     """
-    api_key = _get_groq_key(config)
+    api_key = _get_gemini_key(config)
     if not api_key or not positions:
         return {}
 
     try:
-        from groq import Groq
+        from google import genai
+        from google.genai import types
 
         slim_data = [_slim_position(p) for p in positions]
         user_content = (
@@ -419,22 +442,22 @@ def analyze_positions(positions: list, config) -> dict:
             f"Da una recomendacion clara con razonamiento:\n"
             + json.dumps(slim_data, separators=(",", ":"), ensure_ascii=False)
         )
-        messages = [
-            {"role": "system", "content": POSITION_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ]
 
-        client = Groq(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.3,
-            max_tokens=3000,
-            timeout=TIMEOUT,
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=TIMEOUT * 1000),
+        )
+        resp = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_content,
+            config=types.GenerateContentConfig(
+                system_instruction=POSITION_SYSTEM_PROMPT,
+                temperature=0.3,
+                response_mime_type="application/json",
+            ),
         )
 
-        raw = resp.choices[0].message.content or ""
+        raw = resp.text or ""
         result = _parse_ai_response(
             raw, ("MANTENER", "CERRAR", "VIGILAR"), "VIGILAR"
         )
