@@ -422,6 +422,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     **pos,
                     "current_fr": cfr,
                     "current_price": cp,
+                    "price_change_pct": (
+                        (cp - pos["entry_price"]) / pos["entry_price"] * 100
+                        if pos.get("entry_price") else 0
+                    ),
                     "elapsed_h": el_h,
                     "intervals": int(el_h / ih),
                     "est_earned": earned,
