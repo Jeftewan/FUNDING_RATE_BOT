@@ -30,6 +30,11 @@ POST_SETTLEMENT_DELAY_SECS = 3 * 60
 # Tolerance (in seconds) when matching a settlement timestamp against
 # historical entries returned by the exchange / DB snapshots.
 SETTLEMENT_RATE_TOLERANCE_SECS = 120
+# Liquidación: fracción de la distancia a liquidación del short que, al
+# consumirse, dispara la alarma LIQUIDATION_PROXIMITY. Con margen aislado la
+# liquidación del short está ~1/leverage por encima de la entrada; 0.70 avisa
+# al consumir el 70% de ese recorrido (deja colchón vs. el maintenance-margin).
+LIQ_PROXIMITY_THRESHOLD = 0.70
 # Low, fixed floor used when scanning the opportunity universe. Per-user
 # volume filtering is done client-side from the Filtros panel, so the scan
 # itself only drops genuinely illiquid noise. DeFi venues that report
@@ -1380,12 +1385,38 @@ class ScannerWorker:
                             "message": f"Proximo pago en {mins_next:.0f}min — tasa desfavorable: {cfr*100:.4f}%",
                         })
 
+            # ── Proximidad a liquidación del short (precio sube vs. entrada) ──
+            short_price = (short_d.get("price", 0) if is_cross else cur.get("price", 0)) or 0
+            entry_price = pos.get("entry_price", 0) or 0
+            leverage = pos.get("leverage", 1) or 1
+            if entry_price > 0 and short_price > 0 and leverage > 0:
+                rise = (short_price - entry_price) / entry_price  # solo subidas importan
+                liq_consumed = leverage * rise
+                if rise > 0 and liq_consumed >= LIQ_PROXIMITY_THRESHOLD:
+                    key = f"LIQUIDATION_PROXIMITY_{sym}_{display_ex}_{uid}"
+                    active_keys.add(key)
+                    if key not in self._notified_alerts:
+                        liq_price = entry_price * (1 + 1.0 / leverage)
+                        alerts.append({
+                            "type": "LIQUIDATION_PROXIMITY", "severity": "CRITICAL",
+                            "position_idx": i, "symbol": sym, "exchange": display_ex,
+                            "user_id": pos.get("user_id"),
+                            "dedup_key": key,
+                            "message": (
+                                f"Precio del short subio {rise*100:.1f}% vs entrada "
+                                f"(${entry_price:.4f} -> ${short_price:.4f}). Consumido "
+                                f"{liq_consumed*100:.0f}% de la distancia a liquidacion "
+                                f"(x{leverage:g}, liq.~${liq_price:.4f})."
+                            ),
+                        })
+
         # Allow alerts to re-fire when the condition has cleared on the
         # current scan (e.g. funding flipped back to favorable).  Only
         # touches keys for the currently-active alert types/funding windows
         # — leaves daily-bucket keys (EXCEPTIONAL/SWITCH) untouched.
         stale = [k for k in self._notified_alerts if (
-            k.startswith(("RATE_REVERSAL_", "RATE_DROP_", "PRE_PAYMENT_UNFAVORABLE_"))
+            k.startswith(("RATE_REVERSAL_", "RATE_DROP_",
+                          "PRE_PAYMENT_UNFAVORABLE_", "LIQUIDATION_PROXIMITY_"))
             and k not in active_keys
         )]
         if stale:

@@ -1286,6 +1286,7 @@ function renderPositions(data) {
         <div class="pos-field"><span class="label">FR entrada</span><span class="value">${(p.entry_fr*100).toFixed(4)}%</span></div>
         <div class="pos-field"><span class="label">FR actual</span><span class="value" style="color:${frColor}">${(p.current_fr*100).toFixed(4)}%</span></div>
         <div class="pos-field"><span class="label">APR</span><span class="value" style="color:${frColor}">${p.current_apr?.toFixed(1)}%</span></div>
+        <div class="pos-field"><span class="label">Precio vs entrada</span><span class="value" style="color:${p.price_change_pct > 0 ? 'var(--red)' : p.price_change_pct < 0 ? 'var(--green)' : 'var(--text-secondary)'}" title="Subida del precio acerca la liquidacion del short">${p.price_change_pct != null ? (p.price_change_pct >= 0 ? '+' : '') + p.price_change_pct.toFixed(2) + '%' : '—'}</span></div>
         <div class="pos-field"><span class="label">Prom</span><span class="value">${p.avg_rate ? (p.avg_rate*100).toFixed(4) + '%' : '—'}</span></div>
         <div class="pos-field"><span class="label">Ganancia</span><span class="value fees-clickable" onclick="editPosEarnings('${posId}')" title="Editar ganancia acumulada (si tu exchange muestra otro total)" style="color:var(--green); cursor:pointer; text-decoration:underline dotted">$${p.est_earned?.toFixed(2)}</span></div>
         <div class="pos-field pos-field-fees">

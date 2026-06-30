@@ -193,6 +193,8 @@ class EmailNotifier:
             lines.append("\n\U0001f7e1 Tasa desfavorable antes del pago")
         elif alert_type == "SL_TP_REVIEW":
             lines.append("\n\U0001f535 *REVISAR STOP LOSS / TAKE PROFIT*")
+        elif alert_type == "LIQUIDATION_PROXIMITY":
+            lines.append("\n\U0001f6a8 *SHORT CERCA DE LIQUIDACION — revisar margen*")
         elif alert_type == "EXCEPTIONAL_OPPORTUNITY":
             lines.append("\n\u2b50 *OPORTUNIDAD EXCEPCIONAL — Revisar ahora*")
         elif alert_type == "SWITCH_OPPORTUNITY":
