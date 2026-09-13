@@ -11,6 +11,7 @@ portfolio_state.json
 # Backtest cache (auto-generated)
 cache/fr_snapshots.csv
 cache/score_snapshots.csv
+cache/ml_exp_*
 
 # Backtest report CSVs (large generated artifacts)
 reports/backtest_*.csv
@@ -21,3 +22,5 @@ reports/scoring_candidate_*.py
 
 # Profit simulation per-window CSVs (datos generados; el .md es el resumen)
 reports/profit_sim_*.csv
+# Added by code-review-graph
+.code-review-graph/
