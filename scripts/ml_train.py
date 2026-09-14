@@ -28,6 +28,7 @@ Output:
 import argparse
 import statistics
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,7 +39,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import numpy as np
 import pandas as pd
 import joblib
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
 
 import scoring_optimizer as opt
 from ml_diagnostic import TARGET, md_table, reconstruct_v11_params, spearman
@@ -49,10 +50,16 @@ REPORT_DIR = ROOT / "reports"
 MODELS_DIR = ROOT / "models"
 CACHE_FR = ROOT / "cache" / "fr_snapshots.csv"
 
-TRAIN_SAMPLE = 200_000          # subsample para entrenar el GBR (perf)
+TRAIN_SAMPLE = None             # HistGB entrena con TODAS las filas (el GBR usaba 200k)
 LIVE_VALIDATION_MIN_AGE_DAYS = 14   # antigüedad mínima de una predicción para validarla
-GBR_PARAMS = dict(n_estimators=300, max_depth=3, learning_rate=0.05,
-                  subsample=0.7, random_state=42)
+# HistGB elegido en reports/ml_experiments_20260913.md: bate al GBR 300x depth3
+# (uplift IC +0.126 vs +0.112, Δtop10 +4.9 vs +4.1, 6/6 folds) y entrena ~7x más rápido.
+MODEL_PARAMS = dict(max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
+                    min_samples_leaf=200, l2_regularization=0.0,
+                    early_stopping=False, random_state=42)
+# Calibración sobre las predicciones de los últimos N días: con todo el train los
+# scores fuera de muestra salían inflados (mediana ~74, 55% ≥70); con 14d ~34% ≥70.
+CALIB_WINDOW_DAYS = 14
 
 
 # ── Feature matrix vía el builder COMPARTIDO (paridad con prod) ──────────────
@@ -89,10 +96,15 @@ def validate_live_predictions(feat: pd.DataFrame) -> dict:
     predicción logueada contra el net_apr REAL realizado (recomputado desde los
     features que ya extrajimos para esos symbol/exchange/captured_at).
 
-    Devuelve {status, n, ic, version, ...}. status='no_data' si no hay
+    Devuelve {status, n, ic, version, by_mode}. status='no_data' si no hay
     predicciones previas suficientes (caso normal en los primeros 14 días).
+
+    El IC principal es SOLO spot_perp: el label offline es el net_apr de una
+    tasa única, que para cross_exchange no aplica (score_snapshots guarda ahí la
+    pierna short). Cross se reporta aparte en by_mode como referencia.
     """
-    out = {"status": "no_data", "n": 0, "ic": float("nan"), "version": None}
+    out = {"status": "no_data", "n": 0, "ic": float("nan"), "version": None,
+           "by_mode": {}}
     try:
         from _scoring_data import get_engine
         from sqlalchemy import text
@@ -118,52 +130,51 @@ def validate_live_predictions(feat: pd.DataFrame) -> dict:
         return out
 
     # Empareja cada predicción con el net_apr real de la fila de features más
-    # cercana (mismo symbol/exchange, captured_at dentro de ±1 intervalo de scan).
+    # cercana (mismo symbol/exchange, captured_at dentro de 6h).
     preds["captured_at"] = pd.to_datetime(preds["captured_at"], utc=True)
-    feat = feat.copy()
-    feat["captured_at"] = pd.to_datetime(feat["captured_at"], utc=True)
+    preds["mode"] = preds["mode"].fillna("spot_perp")
+    right = feat[["symbol", "exchange", "captured_at", TARGET]].copy()
+    right["captured_at"] = pd.to_datetime(right["captured_at"], utc=True)
+    matched = pd.merge_asof(
+        preds.sort_values("captured_at"), right.sort_values("captured_at"),
+        on="captured_at", by=["symbol", "exchange"], direction="nearest",
+        tolerance=pd.Timedelta(hours=6),
+    ).dropna(subset=[TARGET, "model_prediction"])
 
-    matched = []
-    for ex, grp in preds.groupby("exchange"):
-        fsub = feat[feat["exchange"] == ex]
-        if fsub.empty:
-            continue
-        for sym, sgrp in grp.groupby("symbol"):
-            fpair = fsub[fsub["symbol"] == sym].sort_values("captured_at")
-            if fpair.empty:
-                continue
-            ft = fpair["captured_at"].values
-            for row in sgrp.itertuples(index=False):
-                idx = np.searchsorted(ft, np.datetime64(row.captured_at))
-                # tolerancia: la fila de features más cercana en el tiempo
-                best = None
-                for cand in (idx, idx - 1):
-                    if 0 <= cand < len(fpair):
-                        dt = abs((fpair.iloc[cand]["captured_at"] - row.captured_at).total_seconds())
-                        if best is None or dt < best[0]:
-                            best = (dt, cand)
-                if best and best[0] <= 6 * 3600:   # dentro de 6h
-                    matched.append((row.model_prediction,
-                                    fpair.iloc[best[1]][TARGET]))
+    for mode, g in matched.groupby("mode"):
+        ic = spearman(g["model_prediction"], g[TARGET]) if len(g) >= 30 else float("nan")
+        out["by_mode"][mode] = {"n": int(len(g)), "ic": round(float(ic), 3)}
 
-    if len(matched) < 30:
+    spot = matched[matched["mode"] == "spot_perp"]
+    out["n"] = int(len(spot))
+    if len(spot) < 30:
         out["status"] = "insufficient"
-        out["n"] = len(matched)
         return out
 
-    mp = pd.Series([m[0] for m in matched])
-    real = pd.Series([m[1] for m in matched])
     out["status"] = "ok"
-    out["n"] = len(matched)
-    out["ic"] = round(float(spearman(mp, real)), 3)
+    out["ic"] = round(float(spearman(spot["model_prediction"], spot[TARGET])), 3)
     out["version"] = preds["model_version"].dropna().iloc[-1] if preds["model_version"].notna().any() else None
     return out
 
 
 # ── Paso 5: walk-forward (modelo nuevo vs heurístico v11.0) ──────────────────
 
+def make_default_model():
+    """Estimador de producción (lo reusa scripts/ml_experiments.py como control)."""
+    return HistGradientBoostingRegressor(**MODEL_PARAMS)
+
+
+def recency_weights(ts: pd.Series, ref, half_life_days: float) -> np.ndarray:
+    """sample_weight exponencial: una fila de `half_life_days` antes de `ref` pesa 0.5."""
+    age_days = ((ref - ts).dt.total_seconds() / 86400).clip(lower=0)
+    return np.power(0.5, age_days / half_life_days).values
+
+
 def walk_forward(feat: pd.DataFrame, fmat: pd.DataFrame, heur_scores: pd.Series,
-                 min_train_days: int, test_days: int) -> list:
+                 min_train_days: int, test_days: int, make_model=make_default_model,
+                 train_sample=TRAIN_SAMPLE, half_life_days=None) -> list:
+    """train_sample=None entrena con todo el train; half_life_days activa el
+    peso por recencia (relativo al inicio del fold de test)."""
     folds = []
     dmin, dmax = feat["captured_at"].min(), feat["captured_at"].max()
     ws = dmin + timedelta(days=min_train_days)
@@ -175,12 +186,17 @@ def walk_forward(feat: pd.DataFrame, fmat: pd.DataFrame, heur_scores: pd.Series,
         if n_tr < 5000 or n_te < 2000:
             ws = we
             continue
-        tr_idx = feat[tr_mask].sample(n=min(TRAIN_SAMPLE, n_tr), random_state=42).index
-        gbr = GradientBoostingRegressor(**GBR_PARAMS)
+        n_fit = n_tr if train_sample is None else min(train_sample, n_tr)
+        tr_idx = feat[tr_mask].sample(n=n_fit, random_state=42).index
+        model = make_model()
+        sw = (recency_weights(feat.loc[tr_idx, "captured_at"], ws, half_life_days)
+              if half_life_days else None)
         # Fit/predict sobre .values (sin nombres de columna): el modelo rankea por
         # POSICIÓN, igual que el vector-lista que le pasa prod (analysis/ml_scorer).
-        gbr.fit(fmat.loc[tr_idx].values, feat.loc[tr_idx, TARGET])
-        pred = gbr.predict(fmat.loc[te_mask].values)
+        t0 = time.time()
+        model.fit(fmat.loc[tr_idx].values, feat.loc[tr_idx, TARGET], sample_weight=sw)
+        fit_secs = round(time.time() - t0, 1)
+        pred = model.predict(fmat.loc[te_mask].values)
         test_df = feat.loc[te_mask]
         heur_te = heur_scores[te_mask].values
         h_ic = spearman(pd.Series(heur_te, index=test_df.index), test_df[TARGET])
@@ -196,7 +212,7 @@ def walk_forward(feat: pd.DataFrame, fmat: pd.DataFrame, heur_scores: pd.Series,
                           uplift=round(m_ic - h_ic, 3),
                           h_d10=h_d10, m_d10=m_d10, d10_lift=round(m_d10 - h_d10, 1),
                           h_t1=h_t1, m_t1=m_t1, t1_lift=round(m_t1 - h_t1, 1),
-                          m_d10p=m_d10p))
+                          m_d10p=m_d10p, fit_secs=fit_secs))
         print(f"  {folds[-1]['win']}: IC heur={h_ic:.3f} ml={m_ic:.3f} "
               f"uplift={m_ic - h_ic:+.3f} | net_apr top10 heur={h_d10} ml={m_d10} "
               f"(Δ{m_d10 - h_d10:+.1f})")
@@ -212,6 +228,8 @@ def main():
     ap.add_argument("--test-days", type=int, default=7)
     ap.add_argument("--no-validate-live", action="store_true",
                     help="salta la validación del modelo en producción")
+    ap.add_argument("--refresh-cache", action="store_true",
+                    help="re-descarga funding_rate_snapshots (90d) antes de entrenar")
     args = ap.parse_args()
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -223,6 +241,11 @@ def main():
     print("\n" + "=" * 60)
     print("  ML TRAIN (local) — entrena/valida/exporta el modelo de scoring")
     print("=" * 60 + "\n")
+
+    if args.refresh_cache:
+        from _scoring_data import load_fr_snapshots
+        print("[0/6] Refrescando cache desde la DB...")
+        load_fr_snapshots(force_reload=True)
 
     print("[1/6] Cargando cache + extrayendo features...")
     if not CACHE_FR.exists():
@@ -268,14 +291,18 @@ def main():
     stable = all_pos and mean_up >= 0.05 and sd_up <= 0.05 and econ_ok
 
     print("[6/6] Entrenando modelo FINAL + calibrando + exportando...")
-    fit_idx = feat.sample(n=min(TRAIN_SAMPLE, len(feat)), random_state=42).index
-    model = GradientBoostingRegressor(**GBR_PARAMS)
+    fit_idx = (feat.index if TRAIN_SAMPLE is None
+               else feat.sample(n=min(TRAIN_SAMPLE, len(feat)), random_state=42).index)
+    model = make_default_model()
     model.fit(fmat.loc[fit_idx].values, feat.loc[fit_idx, TARGET])
 
-    # Calibración: percentiles p0..p100 de las predicciones de train → mapear
-    # cualquier predicción a un score 0–100 estable e interpretable en prod.
+    # Calibración: percentiles p0..p100 de las predicciones de los últimos
+    # CALIB_WINDOW_DAYS → mapear cualquier predicción a un score 0–100 relativo
+    # al régimen reciente (el que más se parece a lo que verá prod).
     train_preds = model.predict(fmat.loc[fit_idx].values)
-    calibration_pcts = [float(v) for v in np.percentile(train_preds, np.arange(0, 101))]
+    calib_from = feat["captured_at"].max() - timedelta(days=CALIB_WINDOW_DAYS)
+    recent = (feat.loc[fit_idx, "captured_at"] >= calib_from).values
+    calibration_pcts = [float(v) for v in np.percentile(train_preds[recent], np.arange(0, 101))]
 
     today = datetime.now().strftime("%Y%m%d")
     bundle = {
@@ -288,6 +315,8 @@ def main():
             "to": str(feat["captured_at"].max().date()),
             "n_rows": int(len(feat)),
             "n_fit": int(len(fit_idx)),
+            "calib_window_days": CALIB_WINDOW_DAYS,
+            "n_calib": int(recent.sum()),
         },
         "val_metrics": {
             "wf_folds": len(folds),
@@ -306,7 +335,12 @@ def main():
 
     # ── Reporte ──
     import sklearn
-    imp = sorted(zip(FEATURE_NAMES, model.feature_importances_), key=lambda x: -x[1])
+    # HistGB no expone feature_importances_ → importancia por permutación (ΔR²).
+    from sklearn.inspection import permutation_importance
+    pi_idx = feat.sample(n=min(50_000, len(feat)), random_state=0).index
+    pi = permutation_importance(model, fmat.loc[pi_idx].values, feat.loc[pi_idx, TARGET],
+                                n_repeats=3, random_state=0)
+    imp = sorted(zip(FEATURE_NAMES, pi.importances_mean), key=lambda x: -x[1])
     if stable:
         verdict = ("PROMOVER — el modelo bate al heurístico de forma estable (IC) Y "
                    "eleva el net_apr del top (económico); commit + push.")
@@ -319,18 +353,25 @@ def main():
     else:
         verdict = "REVISAR — uplift positivo pero marginal/ruidoso; decidir según el detalle."
     live_line = {
-        "ok": f"IC en vivo {live['ic']} sobre {live['n']} predicciones (modelo {live['version']}). "
+        "ok": f"IC en vivo spot_perp {live['ic']} sobre {live['n']} predicciones (modelo {live['version']}). "
               "Compará contra el uplift esperado; una caída fuerte = drift.",
         "no_data": "Sin predicciones previas de ≥14d (normal en el primer ciclo o tras un reset).",
         "insufficient": f"Solo {live['n']} predicciones emparejadas (<30) — aún no concluyente.",
         "skipped": "Saltada (--no-validate-live).",
     }.get(live["status"], f"No disponible: {live['status']}.")
+    if live.get("by_mode"):
+        live_line += "\n\n" + md_table(
+            ["mode", "n emparejadas", "IC"],
+            [[m, v["n"], v["ic"]] for m, v in sorted(live["by_mode"].items())])
+        live_line += ("\n\n> cross_exchange es solo referencia: su label offline es el "
+                      "net_apr de la pierna short, no del diferencial.")
 
     out = f"""# ML train — modelo de scoring para producción — {datetime.now():%Y-%m-%d %H:%M}
 
 **Artefacto:** `models/scoring_model.joblib` (version `{today}`, {size_mb:.2f} MB).
 **Datos:** {len(feat):,} filas, {bundle['train_window']['from']} → {bundle['train_window']['to']}.
-**Modelo:** GradientBoostingRegressor{GBR_PARAMS}. **Target:** `net_apr`.
+**Modelo:** {type(model).__name__}{MODEL_PARAMS}, fit sobre {len(fit_idx):,} filas. **Target:** `net_apr`.
+**Calibración:** percentiles de las predicciones de los últimos {CALIB_WINDOW_DAYS}d ({int(recent.sum()):,} filas).
 **scikit-learn:** {sklearn.__version__} (debe coincidir EXACTO con requirements.txt de prod).
 
 > Local-only. Entrena + valida + exporta; NO despliega. Para promover:
@@ -364,7 +405,7 @@ tradeás las mejores oportunidades rankeadas por el modelo en vez de por el scor
 Umbral PROMOVER: uplift IC>0 en todos los folds, medio ≥0.05, σ≤0.05, **y**
 Δ net_apr top-decil medio > 0 (la mejora estadística se traduce en ganancia).
 
-## 3. Feature importances (modelo final)
+## 3. Feature importances (modelo final, permutación ΔR² sobre 50k filas)
 
 {md_table(["feature", "importance"], [[f, f"{v:.3f}"] for f, v in imp])}
 

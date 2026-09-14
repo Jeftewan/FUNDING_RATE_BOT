@@ -172,6 +172,15 @@ La adopción (Opción B): **entrenar local, servir en prod**. El modelo **manda 
 ranking**; el heurístico v11.0 queda como **fallback** si el modelo no carga o
 falla.
 
+**Estimador actual (desde 2026-09-13):** `HistGradientBoostingRegressor` (31 hojas,
+300 iter, lr 0.05, `min_samples_leaf=200`) entrenado con **todas** las filas,
+reemplazando al GBR 300×depth3 sobre 200k. Elegido en
+`reports/ml_experiments_20260913.md` (10 candidatos, mismo walk-forward): uplift IC
++0.126 vs +0.112, Δtop10 +4.9 vs +4.1, ~7× más rápido. Peso por recencia, huber y
+GBR más profundo no aportaron. **Calibración** con las predicciones de los últimos
+14 d (`CALIB_WINDOW_DAYS`): con todo el train los scores fuera de muestra salían
+inflados (mediana ~74, 55% ≥70).
+
 ### Riesgo #1 y su solución — PARIDAD de features
 
 El modelo se entrena offline y predice online; si los features difieren, se rompe
@@ -200,6 +209,7 @@ mom_points, pctl_percentile, pctl_points`. **No reordenar sin re-entrenar** (el
 | `analysis/ml_features.py` | Feature-builder compartido (stdlib, sin sklearn). Única fuente del vector. |
 | `analysis/ml_scorer.py` | **Prod**: `load_model()` (singleton al startup), `predict_score(params, indicators) → (score 0–100, pred) | None`. Import perezoso de joblib; cualquier fallo → `None` → heurístico. |
 | `scripts/ml_train.py` | **Local**: entrena/valida/exporta. Corre cada ~15 días. |
+| `scripts/ml_experiments.py` | **Local**: compara variantes de estimador con el mismo walk-forward (cachea features en `cache/ml_exp_*`). No exporta. |
 | `models/scoring_model.joblib` | Artefacto commiteado (`{model, calibration_pcts, feature_names, model_version, train_window, val_metrics}`). Viaja con el deploy (no en `.gitignore`). |
 
 ### Flujo en el scan (`analysis/arbitrage.py`)
@@ -207,7 +217,7 @@ mom_points, pctl_percentile, pctl_points`. **No reordenar sin re-entrenar** (el
 En `_analyze_spot_perp` y `_analyze_cross_exchange`, tras `opportunity_score`
 (que deja los indicadores en `params["_indicators"]`),
 `ArbitrageScanner._resolve_score(sc, params)` consulta el modelo: si predice,
-`score = model_score` (calibrado 0–100 vía percentiles de train),
+`score = model_score` (calibrado 0–100 vía percentiles de las predicciones de los últimos 14 d de train),
 `score_heuristic = sc`, `model_prediction = pred`. Si no, los tres caen al
 heurístico. El scan ya ordena por `score` → rankea por modelo. `grade`,
 filtros `min_score` y todo lo demás operan sobre `score` (sin cambios). Campos
@@ -224,9 +234,11 @@ validación de predicciones previas de `ml_train.py`.
 ### Loop operativo de re-entreno (~cada 15 días, lo corre el usuario)
 
 1. `pip install -r requirements-dev.txt` (local).
-2. `python scripts/ml_train.py` → valida el modelo vivo contra el net_apr real de
-   sus predicciones de ≥14d atrás, entrena uno nuevo (GBR sobre 90d), walk-forward
-   vs heurístico v11.0, calibra el score, exporta `models/scoring_model.joblib`.
+2. `python -u scripts/ml_train.py --refresh-cache` → re-descarga 90d de snapshots,
+   valida el modelo vivo contra el net_apr real de sus predicciones de ≥14d atrás
+   (IC principal solo `spot_perp`; cross se desglosa aparte porque su label offline
+   no aplica), entrena uno nuevo (HistGB sobre 90d), walk-forward vs heurístico
+   v11.0, calibra el score, exporta `models/scoring_model.joblib`. Tarda ~15 min.
 3. Revisar `reports/ml_train_YYYYMMDD.md`: ¿el IC en vivo se sostuvo? ¿el nuevo
    modelo bate al heurístico en walk-forward (uplift>0 en todos los folds, medio
    ≥0.05, σ≤0.05)?
@@ -573,7 +585,8 @@ crudos por ventana), reusada por ambos scripts.
 | `scripts/scoring_backtest.py` | **Evalúa** el scoring v10.5 actual: correlación score↔forward returns por componente, decay, mean-reversion z, valor del accel bonus. Importa el `opportunity_score` real (sin duplicar). Output: `reports/backtest_YYYYMMDD.md`. |
 | `scripts/scoring_optimizer.py` | **Re-optimiza** los pesos vía Optuna sobre un scoring paramétrico que espeja v10.5. Split train/val temporal, gate de monotonicity, guard de overfitting. **Solo genera candidato + reporte; nunca toca `analysis/scoring.py`.** Alcance v1: spot_perp. Output: `reports/optimizer_YYYYMMDD.md`, `reports/scoring_candidate_YYYYMMDD.py`, `_trials.csv`. |
 | `scripts/ml_diagnostic.py` / `scripts/ml_stability.py` | **Diagnóstico** (Etapa 3): ¿el ML supera el techo del heurístico? IC y walk-forward. Soporte de decisión, no producción. |
-| `scripts/ml_train.py` | **Entrena/valida/exporta el modelo de producción** (loop de ~15d): valida predicciones previas, entrena GBR, walk-forward, calibra, exporta `models/scoring_model.joblib`. NO despliega (imprime las instrucciones git). Ver sección "Scoring ML en producción". |
+| `scripts/ml_train.py` | **Entrena/valida/exporta el modelo de producción** (loop de ~15d): valida predicciones previas, entrena HistGB, walk-forward, calibra, exporta `models/scoring_model.joblib`. NO despliega (imprime las instrucciones git). Ver sección "Scoring ML en producción". |
+| `scripts/ml_experiments.py` | **Compara estimadores** (GBR/HistGB, hiperparámetros, recencia, loss) con el walk-forward de `ml_train` + diagnóstico de calibración. Output: `reports/ml_experiments_YYYYMMDD.md`. |
 
 **Flujo de adopción:** correr el optimizer → leer el veredicto del reporte
 (ADOPTAR / REVISAR / MANTENER) → si convence, copiar a mano la función del
