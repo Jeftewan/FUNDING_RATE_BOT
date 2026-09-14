@@ -28,7 +28,13 @@ class ArbitrageScanner:
         Si el modelo ML está cargado y predice, el MODELO manda el ranking; el
         score heurístico v11.0 se conserva para fallback/comparación en vivo.
         Si no hay modelo o falla, se usa el heurístico (model_prediction=None).
+
+        Solo spot_perp: el modelo se entrena con series de tasa única y en
+        cross_exchange/defi no hay label válido para validarlo (IC en vivo
+        −0.105, reports/ml_train_20260913.md) → esos modos usan el heurístico.
         """
+        if score_params.get("mode", "spot_perp") != "spot_perp":
+            return heuristic_score, heuristic_score, None
         ms = ml_scorer.predict_score(score_params, score_params.get("_indicators"))
         if ms is not None:
             model_score, model_pred = ms
