@@ -216,7 +216,10 @@ mom_points, pctl_percentile, pctl_points`. **No reordenar sin re-entrenar** (el
 
 En `_analyze_spot_perp` y `_analyze_cross_exchange`, tras `opportunity_score`
 (que deja los indicadores en `params["_indicators"]`),
-`ArbitrageScanner._resolve_score(sc, params)` consulta el modelo: si predice,
+`ArbitrageScanner._resolve_score(sc, params)` consulta el modelo **solo si
+`mode == "spot_perp"`** (desde 2026-09-13: el modelo se entrena con series de tasa
+única y en cross/defi no hay label válido — IC en vivo −0.105; esos modos usan el
+heurístico con `model_prediction=None`). Si predice,
 `score = model_score` (calibrado 0–100 vía percentiles de las predicciones de los últimos 14 d de train),
 `score_heuristic = sc`, `model_prediction = pred`. Si no, los tres caen al
 heurístico. El scan ya ordena por `score` → rankea por modelo. `grade`,
