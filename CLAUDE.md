@@ -559,7 +559,7 @@ El `frontend/site/index.html` es un shell de 28 líneas — solo meta tags y el 
 4. Copiar output:
    - `dist/index.html` → `frontend/site/index.html`
    - `dist/assets/*` → `frontend/site/static/landing/assets/`
-5. Commit + push en `funding_rate_bot` → Railway redeploya **solo** el servicio `web` (watch path `/frontend/**`).
+5. Commit + push en `funding_rate_bot` → Railway redeploya `web` (y el bot).
 
 El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **deprecado** — ya no se usa para deploy. El source de referencia vive en el sandbox.
 
@@ -569,11 +569,12 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 
 | Servicio | Fuente | Rol |
 |---|---|---|
-| `FUNDING_RATE_BOT` | repo raíz, Railpack + `Procfile` | API Flask + scanner. Healthcheck `/health`, watch paths `["/**", "!/frontend/**"]`. Sin dominio público necesario (lo consume `web` por red privada). |
-| `web` | `rootDirectory=/frontend`, `Dockerfile` | Caddy en `basyo.app`. Healthcheck `/`, watch path `/frontend/**`. Var `BACKEND_URL=http://${{FUNDING_RATE_BOT.RAILWAY_PRIVATE_DOMAIN}}:${{FUNDING_RATE_BOT.PORT}}`. |
+| `FUNDING_RATE_BOT` | repo raíz, Railpack + `Procfile` | API Flask + scanner. Healthcheck `/health`. Sin dominio público necesario (lo consume `web` por red privada). |
+| `web` | `rootDirectory=/frontend`, `Dockerfile` | Caddy en `basyo.app`. Healthcheck `/`. Var `BACKEND_URL=http://${{FUNDING_RATE_BOT.RAILWAY_PRIVATE_DOMAIN}}:${{FUNDING_RATE_BOT.PORT}}`. |
 | `Postgres` | plugin | `DATABASE_URL` |
 
-- Healthcheck, root dir y watch paths viven en la **configuración del servicio** (no en `railway.json`: Railway deprecó Config as Code el 2026-12-01).
+- Healthcheck y root dir viven en la **configuración del servicio** (no en `railway.json`: Railway deprecó Config as Code el 2026-12-01).
+- **Sin watch paths**: con ellos Railway marcó el merge del PR #98 como `SKIPPED` ("No changes to watched files") en ambos servicios. Todo push a `main` redeploya los dos (Caddy tarda segundos).
 - Bot: `PORT=8080` (lo referencia `web`) y `MALLOC_ARENA_MAX=2` (glibc + threads fragmenta; RAM base era ~0.78 GB).
 - RAM ccxt: las instancias de solo lectura de `exchanges/manager.py` cargan solo spot + linear/swap y descartan `market['info']` (`_ensure_markets`); el spot check reusa esos mercados. `trade_executor` usa clientes propios, no afectados.
 - CLI: `railway ... -p 7dc7767e-983c-45a6-afc0-be5210dee632 -e production -s <servicio>` (el repo no está linkeado).
