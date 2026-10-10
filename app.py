@@ -79,10 +79,14 @@ scanner_worker = ScannerWorker(
 )
 
 # ── Flask App ─────────────────────────────────────────────────
-app = Flask(__name__,
-            template_folder="templates",
-            static_folder="static")
+# API pura: el HTML/JS/CSS lo sirve el servicio "web" (frontend/, Caddy), que
+# hace proxy de /api, /auth y /health hasta aquí por la red privada.
+app = Flask(__name__, static_folder=None)
 app.secret_key = Config.SECRET_KEY
+
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # ── Database + Auth (SaaS mode — required) ────────────────────
 db_enabled = False

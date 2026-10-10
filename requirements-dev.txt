@@ -7,7 +7,7 @@
 # (psycopg2-binary y cryptography ya vienen en requirements.txt)
 optuna
 pandas
-sqlalchemy
+SQLAlchemy>=2.0,<2.1
 numpy==2.4.6
 # scikit-learn DEBE coincidir EXACTO con requirements.txt (prod): el .joblib
 # que genera ml_train.py se carga en Railway con esa misma versión o joblib.load

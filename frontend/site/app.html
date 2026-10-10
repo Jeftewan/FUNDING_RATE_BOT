@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
+<link rel="stylesheet" href="/static/style.css">
 <link rel="icon" type="image/svg+xml" href="/static/landing/favicon.svg">
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
 <link rel="apple-touch-icon" sizes="180x180" href="/static/landing/apple-touch-icon.png">
@@ -22,19 +22,17 @@
         <span class="logo-text">BASYO</span>
         <span class="v">v10</span>
       </h1>
-      {% if db_enabled and user_email %}
       <div class="user-info">
-        <span>{{ user_email }}</span>
+        <span class="js-user-email"></span>
         <button class="btn" onclick="doLogout()">Salir</button>
       </div>
-      {% endif %}
     </div>
 
     <div class="tabs">
       <button class="tab active" onclick="switchTab('opportunities')" id="tab-opportunities">Oportunidades</button>
       <button class="tab" onclick="switchTab('positions')" id="tab-positions">Posiciones</button>
       <button class="tab" onclick="switchTab('config')" id="tab-config">Config</button>
-      {% if db_enabled %}<button class="tab" onclick="switchTab('account')" id="tab-account">Cuenta</button>{% endif %}
+      <button class="tab" onclick="switchTab('account')" id="tab-account">Cuenta</button>
       <button class="tab" onclick="switchTab('help')" id="tab-help">Ayuda</button>
     </div>
 
@@ -149,13 +147,12 @@
     </div>
   </div>
 
-  {% if db_enabled %}
   <!-- ═══ ACCOUNT TAB ═══ -->
   <div id="page-account" class="page">
     <div class="cfg-section">
       <h3>Perfil</h3>
       <div style="font-size:12px;color:var(--text-secondary);margin:8px 0">
-        Email: <strong style="color:#fff">{{ user_email }}</strong>
+        Email: <strong class="js-user-email" style="color:#fff"></strong>
       </div>
     </div>
     <div class="cfg-section">
@@ -168,7 +165,6 @@
       <button class="btn btn-danger" onclick="deleteAccount()">Eliminar cuenta</button>
     </div>
   </div>
-  {% endif %}
 
   <!-- ═══ HELP TAB ═══ -->
   <div id="page-help" class="page">
@@ -310,12 +306,10 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
     <span>Config</span>
   </button>
-  {% if db_enabled %}
   <button class="nav-item" id="bnav-account" onclick="switchTab('account')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>
     <span>Cuenta</span>
   </button>
-  {% endif %}
   <button class="nav-item" id="bnav-help" onclick="switchTab('help')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><path d="M9 9a3 3 0 015.12 1c0 2-3 3-3 3"/><circle cx="12" cy="17" r=".5" fill="currentColor"/></svg>
     <span>Ayuda</span>
@@ -324,5 +318,5 @@
 
 <div id="toast-container" class="toast-container"></div>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
-<script src="/static/app.js?v={{ asset_v }}"></script>
+<script src="/static/app.js"></script>
 </body></html>

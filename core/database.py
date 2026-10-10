@@ -16,9 +16,12 @@ def init_db(app):
         log.warning("DATABASE_URL not set — DB features disabled")
         return False
 
-    # Railway uses postgres:// but SQLAlchemy needs postgresql://
-    if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql://", 1)
+    # Railway uses postgres:// / postgresql://. Force the psycopg2 driver
+    # explicitly: SQLAlchemy 2.1 changed the default to psycopg (v3).
+    for prefix in ("postgres://", "postgresql://"):
+        if database_url.startswith(prefix):
+            database_url = "postgresql+psycopg2://" + database_url[len(prefix):]
+            break
 
     app.config["SQLALCHEMY_DATABASE_URI"] = database_url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False

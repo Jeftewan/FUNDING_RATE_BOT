@@ -1,32 +1,16 @@
 """Flask API routes — v10.0 unified."""
-import os
 import time
 import threading
 import logging
 from datetime import datetime
 from functools import wraps
-from flask import Blueprint, jsonify, request as flask_req, render_template, redirect, send_from_directory
+from flask import Blueprint, jsonify, request as flask_req, redirect
 from portfolio.manager import get_capital_summary, open_position, close_position
 from portfolio.actions import calculate_position_estimate
 
 log = logging.getLogger("bot")
 
 api = Blueprint("api", __name__)
-
-
-def _asset_version(app) -> int:
-    """Cache-busting token para los assets estáticos (app.js/style.css).
-
-    Usa el mtime más reciente de los dos archivos. Cambia en cada deploy (los
-    archivos se reescriben), forzando al navegador a recargar el JS/CSS nuevo en
-    vez de servir una versión vieja cacheada. Fallback a time() si falla el stat.
-    """
-    try:
-        sf = app.static_folder
-        return int(max(os.path.getmtime(os.path.join(sf, "app.js")),
-                       os.path.getmtime(os.path.join(sf, "style.css"))))
-    except OSError:
-        return int(time.time())
 
 
 def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, db_enabled=False):
@@ -93,10 +77,14 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @app.route("/health")
     def health():
         s = state_manager.state
+        # DB requerida pero no inicializada → 503 para que el healthcheck de
+        # Railway no promueva un deploy sin login (caso SQLAlchemy 2.1/psycopg).
+        db_ok = db_enabled or not config.USE_DB
         return jsonify({
-            "ok": True, "scans": s["scan_count"],
+            "ok": db_ok, "scans": s["scan_count"],
             "status": s["status"], "version": "10.0",
-        })
+            "db": "connected" if db_enabled else "not configured",
+        }), (200 if db_ok else 503)
 
     # ── Config ─────────────────────────────────────────────────
     @app.route("/api/config", methods=["GET", "POST"])
@@ -1379,35 +1367,3 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             _db.session.commit()
             logout_user()
             return jsonify({"ok": True, "msg": "Cuenta eliminada"})
-
-    # ── Public landing ─────────────────────────────────────────
-    @app.route("/")
-    def landing():
-        return render_template("landing.html")
-
-    # ── Authenticated dashboard ────────────────────────────────
-    @app.route("/app")
-    @auth_required
-    def app_dashboard():
-        user_email = ""
-        if db_enabled:
-            from flask_login import current_user
-            user_email = current_user.email if current_user.is_authenticated else ""
-        return render_template("index.html", db_enabled=db_enabled,
-                               user_email=user_email, asset_v=_asset_version(app))
-
-    # ── Favicon at root — required for Google Search crawler ─────────
-    @app.route("/favicon.ico")
-    def favicon_root():
-        return send_from_directory(
-            app.root_path + "/static/landing",
-            "favicon.ico",
-            mimetype="image/vnd.microsoft.icon",
-        )
-
-    # ── SPA catch-all: serve landing.html for client-side routes ──
-    # React-router handles /terms, /privacy and any future public route.
-    # /api/, /auth/, /app, /static/, /health and / take priority by specificity.
-    @app.route("/<path:_spa_path>")
-    def landing_catchall(_spa_path):
-        return render_template("landing.html")

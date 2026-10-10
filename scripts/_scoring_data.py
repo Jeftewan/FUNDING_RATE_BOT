@@ -34,8 +34,10 @@ def get_engine():
     url = os.environ.get("DATABASE_URL", "")
     if not url:
         sys.exit("ERROR: DATABASE_URL no está configurada.")
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://"):]
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            url = "postgresql+psycopg2://" + url[len(prefix):]
+            break
     return create_engine(url, pool_pre_ping=True)
 
 
