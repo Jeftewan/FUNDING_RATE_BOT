@@ -9,18 +9,19 @@ Estado del proyecto al **2026-04-28**, rama activa `claude/integrate-landing-aut
 | Capa | Tecnología |
 |------|-----------|
 | Backend | Python 3 + Flask |
-| Servidor | Gunicorn (Procfile) |
-| Base de datos | PostgreSQL via SQLAlchemy (flask-sqlalchemy) |
+| Servidor | Gunicorn (Procfile, `--bind [::]:$PORT`, 1 worker × 2 threads) |
+| Base de datos | PostgreSQL via SQLAlchemy (flask-sqlalchemy). **SQLAlchemy pinneado `<2.1`** y URL forzada a `postgresql+psycopg2://` (2.1 usa psycopg v3 por defecto → tumbó el login el 2026-10-09) |
 | Migraciones | `core/database.py._run_migrations()` — ALTER TABLE ADD COLUMN IF NOT EXISTS, sin Flask-Migrate |
 | Exchange CEX | ccxt (Binance, Bybit, OKX, Bitget) |
 | Exchange DeFi | REST APIs propias (Hyperliquid, GMX, Aster, Lighter, Extended) |
 | IA / LLM | Gemini 3.1 Flash-Lite (`google-genai`, 3 API keys rotadas para evitar rate limits) |
 | Notificaciones | Telegram Bot API (POST JSON, sin dependencias externas) |
 | Cifrado | Fernet simétrico (`core/encryption.py`) para tokens y API keys |
-| Frontend (dashboard) | Vanilla JS + CSS3, sin frameworks (`static/app.js`, `static/style.css`) |
-| Frontend (landing) | React + Vite — compilado en `static/landing/assets/`. Source original en [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) (Lovable, **deprecado**). Editar via recompilación en este repo. |
+| Frontend (servicio `web`) | Caddy (`frontend/Caddyfile`) sirve estáticos y hace proxy de `/api`, `/auth`, `/health` al backend por red privada |
+| Frontend (dashboard) | Vanilla JS + CSS3, sin frameworks (`frontend/site/static/app.js`, `style.css`) |
+| Frontend (landing) | React + Vite — compilado en `frontend/site/static/landing/assets/`. Source original en [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) (Lovable, **deprecado**). Editar via recompilación en este repo. |
 
-**El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing es un bundle Vite estático servido por Flask — el contenido visible vive en `static/landing/assets/index-*.js`, no en `templates/landing.html`.
+**El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing es un bundle Vite estático servido por Caddy — el contenido visible vive en `frontend/site/static/landing/assets/index-*.js`, no en `frontend/site/index.html`. **Flask ya no sirve HTML** (`static_folder=None`): es API pura.
 
 ---
 
@@ -61,14 +62,16 @@ portfolio/
   actions.py            # Detalles de acción para UI
 notifications/
   email.py              # EmailNotifier (nombre legacy) → Telegram Bot API
-static/
-  app.js                # SPA frontend (~1500 líneas)
-  style.css             # Responsive mobile-first
-  landing/              # Assets Vite de la landing (dist/assets/) — generados, no editar a mano
-templates/
-  index.html            # Tabs: Oportunidades, Posiciones, Config, Cuenta (ruta /app)
-  landing.html          # Landing pública (ruta /) — actualmente placeholder, se reemplaza con dist/index.html del repo basyo
-  login.html            # DEPRECADO — sin uso, pendiente de borrar
+frontend/               # Servicio Railway "web" (rootDirectory=/frontend)
+  Caddyfile             # Estáticos + proxy /api /auth /health → $BACKEND_URL
+  Dockerfile            # caddy:2.10-alpine
+  site/
+    index.html          # Landing pública (ruta /, /terms, /privacy) — dist/index.html de basyo
+    app.html            # Dashboard (ruta /app). HTML estático: email y gate de login vía GET /auth/me en app.js
+    static/
+      app.js            # SPA frontend
+      style.css         # Responsive mobile-first
+      landing/          # Assets Vite de la landing (dist/assets/) — generados, no editar a mano
 ```
 
 ---
@@ -301,7 +304,7 @@ El historial DeFi se construye desde `funding_rate_snapshots` (no hay API histó
 Encima del listado de posiciones, la tab "Posiciones" muestra:
 
 - **Capital bar** (existente): Total, En uso, Disponible, Ganancia, contador de posiciones, botón IA.
-- **KPI widgets** (`#earnings-kpis`): Hoy (con delta vs ayer), 7 días (con APR realizado), 30 días, Total (activas + cerradas all-time). Verde/rojo según signo. `static/app.js:loadDailyEarnings()` y `renderEarningsKpis()`.
+- **KPI widgets** (`#earnings-kpis`): Hoy (con delta vs ayer), 7 días (con APR realizado), 30 días, Total (activas + cerradas all-time). Verde/rojo según signo. `frontend/site/static/app.js:loadDailyEarnings()` y `renderEarningsKpis()`.
 - **Gráfica con toggle** (`#earnings-chart`): 
   - **Cumulativo activas** (default): líneas multi-color por posición sobre `payments_json[].cumulative`, ignora entries con `kind:"manual_adjust"` para no romper la curva. 
   - **Diario total**: bar chart sobre `series[]` del endpoint, una barra por día (verde si neto≥0, rojo si <0). Incluye cerradas.
@@ -322,7 +325,7 @@ Datos provistos por `GET /api/earnings/daily?days=30` → `DBPersistence.aggrega
 - Cada edición se appendea a `user_history.notes` con timestamp para auditoría.
 - En el UI, las filas editadas muestran un mark `✎`.
 
-UI: `editPosEarnings(posId)` / `editHistEarnings(histId)` en `static/app.js`, mirror del patrón existente `editPosFees`.
+UI: `editPosEarnings(posId)` / `editHistEarnings(histId)` en `frontend/site/static/app.js`, mirror del patrón existente `editPosFees`.
 
 ---
 
@@ -350,7 +353,7 @@ Coloca y ejecuta las órdenes reales de ambas piernas usando las API keys del us
 - `DBPersistence.load_user_exchange_keys(user_id, exchange)` descifra las keys (Fernet) para el executor.
 - Columna nueva `user_positions.auto_executed BOOLEAN` (migración en `core/database.py`, modelo en `db_models.py`, expuesta en `_pos_to_dict`).
 
-### Frontend (`static/app.js`, `style.css`, `templates/index.html`)
+### Frontend (`frontend/site/static/app.js`, `style.css`, `frontend/site/app.html`)
 - Opp card: botón **"Ejecutar"** (`.btn-exec`) junto a "Entrar". Deshabilitado con tooltip si: DeFi/no-CEX, `has_spot=false`, o faltan keys (`_cexKeys` cargado vía `loadUserKeys`).
 - Positions: botón **"Cerrar (auto)"** (solo si `posIsCex`) + badge **AUTO**.
 - Modal de confirmación de riesgo (`showExecConfirm`) con 3 acciones: Cancelar / **Simular** (dry-run) / **Ejecutar órdenes reales**. Modal de resultado (`showExecResult`) con tabla de fills; desde una simulación se puede promover a ejecución real.
@@ -402,13 +405,13 @@ Coloca y ejecuta las órdenes reales de ambas piernas usando las API keys del us
 ### Filtros unificados de oportunidades (panel Filtros)
 
 Todos los filtros de la lista viven en **un solo panel "Filtros"** en la pestaña
-Oportunidades (`templates/index.html`, `static/app.js`), aplicados **en vivo
+Oportunidades (`frontend/site/app.html`, `frontend/site/static/app.js`), aplicados **en vivo
 client-side** sobre la lista completa que devuelve el backend, válidos tanto para
 CEX como DeFi. Antes estaban dispersos: los inputs APR/Score del toolbar estaban
 muertos (disparaban un reload pero su valor nunca se leía) y los reales vivían en
 la pestaña Config filtrando server-side.
 
-- `static/app.js:sortAndFilter()` filtra por `apr` / `score` / `estimated_hold_days`
+- `frontend/site/static/app.js:sortAndFilter()` filtra por `apr` / `score` / `estimated_hold_days`
   / `volume_24h` / exchange + búsqueda por símbolo. El volumen `0`/desconocido
   (DeFi) **no oculta** la oportunidad.
 - Los valores se persisten en `user_configs` vía `/api/config` (debounced) y se
@@ -511,16 +514,15 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 
 | URL | Auth | Template / handler |
 |-----|------|--------------------|
-| `GET /` | Pública | `templates/landing.html` (landing + modal login/registro) |
-| `GET /app` | `@auth_required` | `templates/index.html` (dashboard SPA) |
-| `GET /terms`, `/privacy` | Pública | `templates/landing.html` — react-router monta `<TermsOfService />` o `<PrivacyPolicy />` en cliente |
-| `GET /<otra-ruta-SPA>` | Pública | catch-all en `api/routes.py:landing_catchall` → `landing.html` (futuras rutas SPA) |
+| `GET /` | Pública | **web (Caddy)** → `frontend/site/index.html` (landing + modal login/registro) |
+| `GET /app` | Pública (gate en cliente) | **web (Caddy)** → `frontend/site/app.html`; `app.js:loadMe()` llama `/auth/me` y si 401 → `/?login=1` |
+| `GET /terms`, `/privacy`, `/<otra-ruta-SPA>` | Pública | **web (Caddy)** `try_files {path} /index.html` — react-router monta la página en cliente |
 | `POST /auth/login` | Pública | JSON `{ok, msg}` — Flask-Login cookie |
 | `POST /auth/register` | Pública | JSON — requiere `terms_accepted: true` en body; setea `users.terms_accepted_at` |
 | `POST /auth/logout` | Autenticado | JSON — redirigir a `/` tras logout |
 | `GET /auth/me` | Autenticado | JSON `{ok, user}` — devuelve 401 JSON si no auth |
 | `GET /auth/page` | Pública | `301 → /?login=1` (compat deep-links) |
-| `GET /health` | Pública | JSON (healthcheck Railway) |
+| `GET /health` | Pública | JSON (healthcheck Railway). **503** si `USE_DB` y la DB no inicializó → Railway no promueve el deploy |
 | `GET /api/*` | `@auth_required` | JSON — 401 JSON si no auth |
 | `GET /api/opportunities` | `@auth_required` | Lista **completa** (sin filtrar para display); los filtros se aplican client-side en el panel Filtros. Recalcula `mins_to_next` y enriquece con `score_trend`. |
 | `GET /api/earnings/daily?days=N` | `@auth_required` | Rollup diario combinando activas + cerradas: `{today, yesterday, last_7d, last_30d, all_time, realized_apr_7d, series:[{date, earned, fees, net}]}` |
@@ -530,13 +532,13 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 | `POST /api/execute_open` | `@auth_required` | Body `{opportunity_id, capital, leverage?, dry_run?}` — coloca las órdenes reales (CEX only) vía `trade_executor`, guarda la posición con `auto_executed=True` y fills reales. `dry_run:true` simula sin enviar. |
 | `POST /api/execute_close` | `@auth_required` | Body `{position_id, dry_run?}` — coloca las órdenes inversas a market y cierra con `exit_fees_real` reales. |
 
-**Flujo unauthenticated:** `GET /app` → `unauthorized_handler` → `302 /?login=1` → landing abre modal login.  
-**Flujo logout:** `POST /auth/logout` → `window.location = '/'` (en `static/app.js:doLogout`).  
+**Flujo unauthenticated:** `GET /app` (estático) → `loadMe()` recibe 401 de `/auth/me` → `location = '/?login=1'` → landing abre modal login.  
+**Flujo logout:** `POST /auth/logout` → `window.location = '/'` (en `frontend/site/static/app.js:doLogout`).  
 **Flujo delete-account:** `DELETE /api/account` → éxito → `window.location = '/'`.
 
 ### Páginas legales (Términos y Privacidad)
 
-`/terms` y `/privacy` son rutas del SPA React (no de Flask). Flask las atrapa con `@app.route("/<path:_spa_path>")` en `api/routes.py` y sirve `landing.html`; react-router monta `<TermsOfService />` o `<PrivacyPolicy />` desde `src/pages/`. El layout legal compartido vive en `src/components/legal/LegalLayout.tsx`.
+`/terms` y `/privacy` son rutas del SPA React (no de Flask). Caddy las atrapa con `try_files {path} /index.html` y sirve la landing; react-router monta `<TermsOfService />` o `<PrivacyPolicy />` desde `src/pages/`. El layout legal compartido vive en `src/components/legal/LegalLayout.tsx`.
 
 El registro en `/auth/register` exige `terms_accepted: true` en el body o devuelve 400. Persistimos la marca de tiempo en `users.terms_accepted_at` para auditoría legal. El frontend muestra un checkbox en `AuthModal.tsx` (tab Registro) con links a `/terms` y `/privacy` en `target="_blank"`.
 
@@ -544,22 +546,37 @@ Para editar los textos legales: modificar `src/pages/TermsOfService.tsx` y `src/
 
 ### Cómo editar la landing
 
-El `templates/landing.html` es un shell de 28 líneas — solo meta tags y el `<div id="root">`. El contenido visible está en el bundle JS (`static/landing/assets/index-*.js`).
+El `frontend/site/index.html` es un shell de 28 líneas — solo meta tags y el `<div id="root">`. El contenido visible está en el bundle JS (`frontend/site/static/landing/assets/index-*.js`).
 
 **Cambios editables directamente:**
-- Meta tags SEO (título, description, og:image) → `templates/landing.html`
-- Favicon → reemplazar `static/landing/favicon.png`
+- Meta tags SEO (título, description, og:image) → `frontend/site/index.html`
+- Favicon → reemplazar `frontend/site/static/landing/favicon.png`
 
 **Cambios de contenido (textos, secciones, colores, CTAs)** requieren recompilar el source React:
 1. El source está en `/home/user/basyo` (clonado en el sandbox, rama `claude/integrate-landing-auth`).
 2. Editar los `.tsx` correspondientes.
 3. `cd /home/user/basyo && npm run build`
 4. Copiar output:
-   - `dist/index.html` → `templates/landing.html`
-   - `dist/assets/*` → `static/landing/assets/`
-5. Commit + push en `funding_rate_bot` → Railway redeploy.
+   - `dist/index.html` → `frontend/site/index.html`
+   - `dist/assets/*` → `frontend/site/static/landing/assets/`
+5. Commit + push en `funding_rate_bot` → Railway redeploya **solo** el servicio `web` (watch path `/frontend/**`).
 
 El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **deprecado** — ya no se usa para deploy. El source de referencia vive en el sandbox.
+
+---
+
+## Despliegue Railway (proyecto `practical-magic`)
+
+| Servicio | Fuente | Rol |
+|---|---|---|
+| `FUNDING_RATE_BOT` | repo raíz, Railpack + `Procfile` | API Flask + scanner. Healthcheck `/health`, watch paths `["/**", "!/frontend/**"]`. Sin dominio público necesario (lo consume `web` por red privada). |
+| `web` | `rootDirectory=/frontend`, `Dockerfile` | Caddy en `basyo.app`. Healthcheck `/`, watch path `/frontend/**`. Var `BACKEND_URL=http://${{FUNDING_RATE_BOT.RAILWAY_PRIVATE_DOMAIN}}:${{FUNDING_RATE_BOT.PORT}}`. |
+| `Postgres` | plugin | `DATABASE_URL` |
+
+- Healthcheck, root dir y watch paths viven en la **configuración del servicio** (no en `railway.json`: Railway deprecó Config as Code el 2026-12-01).
+- Bot: `PORT=8080` (lo referencia `web`) y `MALLOC_ARENA_MAX=2` (glibc + threads fragmenta; RAM base era ~0.78 GB).
+- RAM ccxt: las instancias de solo lectura de `exchanges/manager.py` cargan solo spot + linear/swap y descartan `market['info']` (`_ensure_markets`); el spot check reusa esos mercados. `trade_executor` usa clientes propios, no afectados.
+- CLI: `railway ... -p 7dc7767e-983c-45a6-afc0-be5210dee632 -e production -s <servicio>` (el repo no está linkeado).
 
 ---
 
