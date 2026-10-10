@@ -41,19 +41,22 @@ class ExchangeManager:
         exchange_configs = {
             "binance": {
                 "class": ccxt.binance,
-                "options": {"defaultType": "swap"},
+                "options": {"defaultType": "swap",
+                            "fetchMarkets": {"types": ["spot", "linear"]}},
                 "api_key": self.config.BINANCE_API_KEY,
                 "secret": self.config.BINANCE_API_SECRET,
             },
             "bybit": {
                 "class": ccxt.bybit,
-                "options": {"defaultType": "swap"},
+                "options": {"defaultType": "swap",
+                            "fetchMarkets": {"types": ["spot", "linear"]}},
                 "api_key": self.config.BYBIT_API_KEY,
                 "secret": self.config.BYBIT_API_SECRET,
             },
             "okx": {
                 "class": ccxt.okx,
-                "options": {"defaultType": "swap"},
+                "options": {"defaultType": "swap",
+                            "fetchMarkets": {"types": ["spot", "swap"]}},
                 "api_key": self.config.OKX_API_KEY,
                 "secret": self.config.OKX_API_SECRET,
                 "password": self.config.OKX_PASSPHRASE,
@@ -100,6 +103,22 @@ class ExchangeManager:
 
     def get_exchange(self, name: str):
         return self._exchanges.get(name.lower())
+
+    @staticmethod
+    def _ensure_markets(ex):
+        """load_markets una vez y descarta el JSON crudo de cada mercado.
+
+        `market['info']` (respuesta cruda del exchange) es ~70% de la RAM de
+        los mercados (Binance: ~105 MB → ~30 MB). Estas instancias son de solo
+        lectura; ccxt solo lo usa al crear órdenes, que van por
+        trade_executor con clientes propios. Se deja {} para que los
+        safe_* de ccxt sigan funcionando.
+        """
+        if ex.markets:
+            return
+        ex.load_markets()
+        for m in ex.markets.values():
+            m["info"] = {}
 
     def fetch_all_funding_rates(self, force: bool = False) -> dict:
         """Fetch funding rates from all exchanges in parallel.
@@ -186,9 +205,7 @@ class ExchangeManager:
         rates = []
 
         try:
-            # Load markets if not loaded
-            if not ex.markets:
-                ex.load_markets()
+            self._ensure_markets(ex)
 
             # For Binance: fetch funding intervals (separate API call)
             # since fetch_funding_rates() doesn't include interval info
@@ -377,8 +394,7 @@ class ExchangeManager:
         pair = f"{symbol}/USDT:USDT"
 
         try:
-            if not ex.markets:
-                ex.load_markets()
+            self._ensure_markets(ex)
 
             history = ex.fetch_funding_rate_history(pair, limit=limit)
             if not history:
@@ -472,23 +488,12 @@ class ExchangeManager:
             return False
 
         try:
-            # Create a spot exchange instance
-            import ccxt
-            spot_configs = {
-                "binance": ccxt.binance,
-                "bybit": ccxt.bybit,
-                "okx": ccxt.okx,
-                "bitget": ccxt.bitget,
-            }
-            cls = spot_configs.get(exchange_name_lower)
-            if not cls:
-                return True  # Assume available if unknown
-
-            spot_ex = cls({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-            spot_ex.load_markets()
+            # Reusa los mercados de la instancia principal (ya incluyen spot)
+            # en vez de crear y cargar una segunda instancia completa.
+            self._ensure_markets(ex)
 
             spot_symbols = set()
-            for sym, info in spot_ex.markets.items():
+            for sym, info in ex.markets.items():
                 if info.get("quote") == "USDT" and info.get("active", True):
                     spot_symbols.add(info.get("base", ""))
 
@@ -513,8 +518,7 @@ class ExchangeManager:
 
         pair = f"{symbol}/USDT:USDT"
         try:
-            if not ex.markets:
-                ex.load_markets()
+            self._ensure_markets(ex)
             ohlcv = ex.fetch_ohlcv(pair, timeframe=interval, limit=limit)
             return ohlcv if ohlcv else []
         except Exception as e:

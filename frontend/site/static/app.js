@@ -2106,8 +2106,21 @@ async function doLogout() {
   window.location.href = '/';
 }
 
+// Sesión: el HTML es estático (servicio web), así que el gate de login y el
+// email se resuelven aquí. Sin sesión → landing con el modal de login abierto.
+async function loadMe() {
+  try {
+    const res = await fetch('/auth/me');
+    if (res.status === 401) { window.location.href = '/?login=1'; return; }
+    const data = await res.json();
+    const email = (data.user && data.user.email) || '';
+    document.querySelectorAll('.js-user-email').forEach(el => { el.textContent = email; });
+  } catch (e) { /* non-fatal */ }
+}
+
 // ── Init ──────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  loadMe();
   refresh();
   // Mark first render done after initial load completes
   setTimeout(() => { _isFirstRender = false; }, 2000);

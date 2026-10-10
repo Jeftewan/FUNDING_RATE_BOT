@@ -1,0 +1,51 @@
+# Servicio "web": sirve la landing (React/Vite compilado) y el dashboard
+# (vanilla JS) como estáticos, y hace proxy de /api, /auth y /health al
+# backend Flask por la red privada de Railway (mismo origen → sin CORS, la
+# cookie de sesión de Flask-Login funciona igual que antes).
+{
+	admin off
+	auto_https off
+	servers {
+		# El único cliente es el edge de Railway: conservar su
+		# X-Forwarded-For / X-Forwarded-Proto hacia el backend.
+		trusted_proxies static 0.0.0.0/0 ::/0
+	}
+}
+
+:{$PORT:8080} {
+	encode zstd gzip
+	root * /srv
+
+	@backend path /api/* /auth/* /health
+	handle @backend {
+		reverse_proxy {$BACKEND_URL}
+	}
+
+	# Assets con hash de Vite: inmutables. Todo lo demás se revalida por
+	# ETag (reemplaza el ?v=<mtime> que inyectaba Flask en app.js/style.css).
+	@immutable path /static/landing/assets/*
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+	@revalidate not path /static/landing/assets/* /api/* /auth/* /health
+	header @revalidate Cache-Control "no-cache"
+
+	handle /app {
+		rewrite * /app.html
+		file_server
+	}
+
+	handle /favicon.ico {
+		rewrite * /static/landing/favicon.ico
+		file_server
+	}
+
+	handle /robots.txt {
+		rewrite * /static/landing/robots.txt
+		file_server
+	}
+
+	# SPA de la landing: react-router resuelve /terms, /privacy, etc.
+	handle {
+		try_files {path} /index.html
+		file_server
+	}
+}
