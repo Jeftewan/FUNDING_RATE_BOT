@@ -93,10 +93,14 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @app.route("/health")
     def health():
         s = state_manager.state
+        # DB requerida pero no inicializada → 503 para que el healthcheck de
+        # Railway no promueva un deploy sin login (caso SQLAlchemy 2.1/psycopg).
+        db_ok = db_enabled or not config.USE_DB
         return jsonify({
-            "ok": True, "scans": s["scan_count"],
+            "ok": db_ok, "scans": s["scan_count"],
             "status": s["status"], "version": "10.0",
-        })
+            "db": "connected" if db_enabled else "not configured",
+        }), (200 if db_ok else 503)
 
     # ── Config ─────────────────────────────────────────────────
     @app.route("/api/config", methods=["GET", "POST"])
