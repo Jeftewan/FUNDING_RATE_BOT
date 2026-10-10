@@ -45,6 +45,7 @@ import scoring_optimizer as opt
 from ml_diagnostic import TARGET, md_table, reconstruct_v11_params, spearman
 from ml_stability import top_stats   # net_apr medio + %rent del top por ranking
 from analysis.ml_features import build_feature_vector, FEATURE_NAMES
+from _scoring_data import split_on_gaps, strip_gap_segments
 
 REPORT_DIR = ROOT / "reports"
 MODELS_DIR = ROOT / "models"
@@ -60,6 +61,9 @@ MODEL_PARAMS = dict(max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
 # Calibración sobre las predicciones de los últimos N días: con todo el train los
 # scores fuera de muestra salían inflados (mediana ~74, 55% ≥70); con 14d ~34% ≥70.
 CALIB_WINDOW_DAYS = 14
+# Purging del walk-forward = horizonte máximo del label (HOLD_MAX_HOURS = 336h).
+PURGE_DAYS = 14
+CACHE_MAX_AGE_DAYS = 3
 
 
 # ── Feature matrix vía el builder COMPARTIDO (paridad con prod) ──────────────
@@ -108,7 +112,7 @@ def validate_live_predictions(feat: pd.DataFrame) -> dict:
     try:
         from _scoring_data import get_engine
         from sqlalchemy import text
-        engine = get_engine()
+        engine = get_engine()   # sys.exit si falta DATABASE_URL → capturado abajo
         cutoff = datetime.now(timezone.utc) - timedelta(days=LIVE_VALIDATION_MIN_AGE_DAYS)
         with engine.connect() as conn:
             preds = pd.read_sql(
@@ -122,7 +126,7 @@ def validate_live_predictions(feat: pd.DataFrame) -> dict:
                 """),
                 conn, params={"cutoff": cutoff},
             )
-    except Exception as e:
+    except (Exception, SystemExit) as e:
         out["status"] = f"unavailable ({type(e).__name__})"
         return out
 
@@ -135,6 +139,9 @@ def validate_live_predictions(feat: pd.DataFrame) -> dict:
     preds["mode"] = preds["mode"].fillna("spot_perp")
     right = feat[["symbol", "exchange", "captured_at", TARGET]].copy()
     right["captured_at"] = pd.to_datetime(right["captured_at"], utc=True)
+    for k in ("symbol", "exchange"):   # merge_asof exige el mismo dtype en las claves
+        preds[k] = preds[k].astype(str)
+        right[k] = right[k].astype(str)
     matched = pd.merge_asof(
         preds.sort_values("captured_at"), right.sort_values("captured_at"),
         on="captured_at", by=["symbol", "exchange"], direction="nearest",
@@ -172,15 +179,21 @@ def recency_weights(ts: pd.Series, ref, half_life_days: float) -> np.ndarray:
 
 def walk_forward(feat: pd.DataFrame, fmat: pd.DataFrame, heur_scores: pd.Series,
                  min_train_days: int, test_days: int, make_model=make_default_model,
-                 train_sample=TRAIN_SAMPLE, half_life_days=None) -> list:
+                 train_sample=TRAIN_SAMPLE, half_life_days=None,
+                 purge_days=PURGE_DAYS) -> list:
     """train_sample=None entrena con todo el train; half_life_days activa el
-    peso por recencia (relativo al inicio del fold de test)."""
+    peso por recencia (relativo al inicio del fold de test).
+
+    Purging (López de Prado): el label mira hasta HOLD_MAX_HOURS (14d) adelante,
+    así que las filas de train con captured_at ≥ ws − purge_days tienen labels
+    que observan el periodo de test → se excluyen del train. purge_days=0
+    reproduce el walk-forward anterior (sin purging)."""
     folds = []
     dmin, dmax = feat["captured_at"].min(), feat["captured_at"].max()
     ws = dmin + timedelta(days=min_train_days)
     while ws + timedelta(days=test_days) <= dmax + timedelta(days=1):
         we = ws + timedelta(days=test_days)
-        tr_mask = feat["captured_at"] < ws
+        tr_mask = feat["captured_at"] < ws - timedelta(days=purge_days)
         te_mask = (feat["captured_at"] >= ws) & (feat["captured_at"] < we)
         n_tr, n_te = int(tr_mask.sum()), int(te_mask.sum())
         if n_tr < 5000 or n_te < 2000:
@@ -230,6 +243,8 @@ def main():
                     help="salta la validación del modelo en producción")
     ap.add_argument("--refresh-cache", action="store_true",
                     help="re-descarga funding_rate_snapshots (90d) antes de entrenar")
+    ap.add_argument("--purge-days", type=int, default=PURGE_DAYS,
+                    help="días de train excluidos antes de cada fold (0 = sin purging)")
     args = ap.parse_args()
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -250,8 +265,13 @@ def main():
     print("[1/6] Cargando cache + extrayendo features...")
     if not CACHE_FR.exists():
         sys.exit(f"Falta {CACHE_FR}. Corre el optimizer una vez para generar el cache.")
+    cache_age_d = (time.time() - CACHE_FR.stat().st_mtime) / 86400
+    if cache_age_d > CACHE_MAX_AGE_DAYS:
+        print(f"  ⚠ cache de {cache_age_d:.0f}d: entrenás sobre datos viejos y la "
+              "validación live empareja contra labels incompletos. Usá --refresh-cache.")
     fr = pd.read_csv(CACHE_FR, parse_dates=["captured_at"])
-    feat = opt.extract_features(fr).dropna(subset=FEATURE_BASE_COLS + [TARGET])
+    fr = split_on_gaps(fr)   # huecos del scanner → series aparte (labels limpios)
+    feat = strip_gap_segments(opt.extract_features(fr)).dropna(subset=FEATURE_BASE_COLS + [TARGET])
     feat = feat.sort_values("captured_at").reset_index(drop=True)
     print(f"  {len(feat):,} filas")
 
@@ -270,7 +290,8 @@ def main():
     heur_scores = feat.apply(lambda r: opt.parametric_score_candidate(r, v11p), axis=1)
 
     print("[5/6] Walk-forward (modelo nuevo vs heurístico)...")
-    folds = walk_forward(feat, fmat, heur_scores, args.min_train_days, args.test_days)
+    folds = walk_forward(feat, fmat, heur_scores, args.min_train_days, args.test_days,
+                         purge_days=args.purge_days)
     if not folds:
         sys.exit("Sin folds válidos para walk-forward. Ajustá --min-train-days/--test-days.")
     ups = [f["uplift"] for f in folds]
@@ -383,6 +404,8 @@ def main():
 
 ## 2. Walk-forward — modelo nuevo vs heurístico v11.0 ({len(folds)} folds)
 
+**Purging:** {args.purge_days}d de train excluidos antes de cada fold (el label mira
+hasta 14d adelante). Series cortadas en huecos de recolección (`split_on_gaps`).
 Por fold: rank-IC (robustez estadística) + net_apr medio del top-10% por ranking
 (robustez ECONÓMICA — cuánta plata gana ordenar por modelo vs por heurístico).
 

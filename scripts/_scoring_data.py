@@ -78,6 +78,32 @@ def load_fr_snapshots(force_reload: bool = False, days: int = 90) -> pd.DataFram
     return fr
 
 
+GAP_SEP = "|seg"
+
+
+def split_on_gaps(fr: pd.DataFrame, min_gap_hours: float = 12.0) -> pd.DataFrame:
+    """Parte cada serie symbol+exchange donde falten snapshots (scanner inactivo).
+
+    El scanner es event-driven: sin posiciones abiertas deja de escribir
+    snapshots (p. ej. 2026-09-14→09-21). extract_features recorre las tasas por
+    POSICIÓN, así que un hueco se leía como pagos consecutivos y contaminaba
+    labels e indicadores. Cada tramo contiguo pasa a ser una serie aparte
+    (exchange + GAP_SEP + n); `strip_gap_segments` restaura el exchange.
+    """
+    fr = fr.sort_values(["symbol", "exchange", "captured_at"]).copy()
+    ts = pd.to_datetime(fr["captured_at"], utc=True)
+    gap_h = ts.groupby([fr["symbol"], fr["exchange"]]).diff().dt.total_seconds() / 3600
+    limit = (3 * fr["interval_hours"].fillna(8)).clip(lower=min_gap_hours)
+    seg = (gap_h > limit).astype(int).groupby([fr["symbol"], fr["exchange"]]).cumsum()
+    fr["exchange"] = fr["exchange"].where(seg == 0, fr["exchange"] + GAP_SEP + seg.astype(str))
+    return fr
+
+
+def strip_gap_segments(df: pd.DataFrame) -> pd.DataFrame:
+    df["exchange"] = df["exchange"].str.split(GAP_SEP, regex=False).str[0]
+    return df
+
+
 # ── Feature helpers ───────────────────────────────────────────────────────────
 
 def estimate_fee_drag(settlement_avg: float, ppd: float,

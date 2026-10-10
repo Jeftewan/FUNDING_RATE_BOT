@@ -237,6 +237,12 @@ validación de predicciones previas de `ml_train.py`.
 ### Loop operativo de re-entreno (~cada 15 días, lo corre el usuario)
 
 1. `pip install -r requirements-dev.txt` (local).
+1b. `python scripts/ml_health.py --refresh-cache` → salud del modelo VIVO fuera de
+   muestra (filas posteriores a su train): IC modelo vs heurístico con CI bootstrap,
+   label realista (sale tras el primer pago ≤0), IC semanal, PSI, calibración y PnL
+   de `user_history`. Read-only → `reports/ml_health_YYYYMMDD.md`. Es la validación
+   en vivo confiable: la de `score_snapshots` tiene sesgo de supervivencia (recorte
+   a 30 filas/par).
 2. `python -u scripts/ml_train.py --refresh-cache` → re-descarga 90d de snapshots,
    valida el modelo vivo contra el net_apr real de sus predicciones de ≥14d atrás
    (IC principal solo `spot_perp`; cross se desglosa aparte porque su label offline
@@ -247,6 +253,14 @@ validación de predicciones previas de `ml_train.py`.
    ≥0.05, σ≤0.05)?
 4. Si convence: `git add models/scoring_model.joblib && commit && push` → Railway
    redeploya. Si no: investigar drift antes de promover.
+
+**Rigor del walk-forward (desde 2026-10-09):** purging de `PURGE_DAYS=14` (el
+label mira hasta 14d adelante; `--purge-days 0` reproduce el método viejo) y
+series cortadas en huecos de recolección (`scripts/_scoring_data.py:split_on_gaps`).
+El scanner es event-driven: **sin posiciones abiertas no escribe snapshots**
+(hueco 2026-09-14→09-21), y sin el corte esos saltos se leían como pagos
+consecutivos (~22% de filas afectadas). Ver `reports/ml_health_20261009.md`,
+`reports/research_funding_ml_20261009.md`, `reports/business_profitability_20261009.md`.
 
 ### ⚠️ Pinning crítico de scikit-learn
 
