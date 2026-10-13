@@ -13,7 +13,8 @@ log = logging.getLogger("bot")
 api = Blueprint("api", __name__)
 
 
-def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, db_enabled=False):
+def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, db_enabled=False,
+                job_runner=None, account_syncer=None):
     """Register all routes on the Flask app."""
 
     # DB persistence helper (lazy init)
@@ -73,6 +74,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     @app.before_request
     def _before():
         scanner_worker.start()
+        if job_runner:
+            job_runner.start()
+        if account_syncer:
+            account_syncer.start()
 
     @app.route("/health")
     def health():
@@ -106,6 +111,9 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "tg_chat_id": us.get("tg_chat_id", ""),
                     "tg_bot_token": us.get("tg_bot_token", ""),
                     "allowed_exchanges": us.get("allowed_exchanges", ""),
+                    "capital_source": us.get("capital_source", "manual"),
+                    "real_balances": us.get("real_balances"),
+                    "auto_transfer": us.get("auto_transfer", False),
                 })
             # Fallback defaults if no DB
             return jsonify({
@@ -121,7 +129,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         data = flask_req.json or {}
         if uid and get_db_persist():
             db_data = {}
-            if "total_capital" in data:
+            # Con cuenta conectada el capital es REAL (sync); el manual se ignora.
+            if "total_capital" in data and get_db_persist().real_free_usdt(uid) is None:
                 db_data["total_capital"] = float(data["total_capital"])
             if "min_volume" in data:
                 db_data["min_volume"] = float(data["min_volume"])
@@ -327,9 +336,21 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "max_positions": user_state.get("max_positions", 5),
                 }
                 summary = get_capital_summary(merged)
+                summary["capital_source"] = user_state.get("capital_source", "manual")
+                summary["real_balances"] = user_state.get("real_balances")
+                bsnap = get_db_persist().get_account_snapshot(uid, "binance")
+                bdata = (bsnap or {}).get("data") or {}
+                real_by_sym = {(p.get("symbol") or "").upper(): p for p in bdata.get("positions", [])
+                               if p.get("side") == "short"}
+                drift_by_pos = {}
+                for d in bdata.get("drift", []):
+                    drift_by_pos.setdefault(str(d.get("position_id")), []).append(d)
+                summary["importable"] = len(bdata.get("importable", []))
+                summary["synced_at"] = (bsnap or {}).get("synced_at")
             else:
                 positions_list = []
                 summary = {"total": 1000, "used": 0, "available": 1000, "count": 0, "max_positions": 5}
+                real_by_sym, drift_by_pos = {}, {}
 
             pdata = []
             now = time.time()
@@ -426,6 +447,9 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "fr_reversed": fr_reversed,
                     "mins_next": mins_next,
                     "switch_analysis": switch_data,
+                    "real": (real_by_sym.get((pos.get("symbol") or "").upper())
+                             if (pos.get("exchange") or "").lower() == "binance" else None),
+                    "drift": drift_by_pos.get(str(pos.get("id")), []),
                 })
 
             # Calculate total_earned from active positions
@@ -631,14 +655,48 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         return jsonify({"ok": True, "result": result})
 
     # ── Auto-execution: place REAL orders via the user's API keys ──
+    def _find_opp(opp_id):
+        with state_manager.lock:
+            s = state_manager.state
+            opp = next((o for o in s.get("opportunities", []) if o.get("_id") == opp_id), None)
+            if not opp:
+                opp = next((o for o in s.get("defi_opportunities", []) if o.get("_id") == opp_id), None)
+            return dict(opp) if opp else None
+
+    def _resolve_spot_venue(opp, creds_by_exchange):
+        """("cex", None) si hay spot centralizado operable; ("bsc", token) si el
+        spot solo existe on-chain (Alpha BSC) y está habilitado; (None, None) si no."""
+        from exchanges import trade_executor as texec
+        ex = opp.get("exchange", "")
+        if texec.spot_tradeable(ex, creds_by_exchange[ex.lower()], opp.get("symbol", "")):
+            return "cex", None
+        if ex.lower() == "binance":
+            from exchanges import onchain_bsc
+            if onchain_bsc.enabled():
+                token = onchain_bsc.alpha_token(opp.get("symbol", ""))
+                if token:
+                    return "bsc", token
+        return None, None
+
+    def _parse_twap(raw):
+        if not raw:
+            return None
+        return {"slices": max(1, min(96, int(raw.get("slices", 1)))),
+                "duration_s": max(0, min(86400, int(raw.get("duration_s", 0))))}
+
+    def _bsc_leg_factory(wallet, token):
+        from exchanges import onchain_bsc
+        return lambda pc, ps, ctx: onchain_bsc.BscSpotLeg(wallet, token, ctx, pc, ps)
+
     @app.route("/api/execute_open", methods=["POST"])
     @auth_required
     def api_execute_open():
-        """Open a position by placing real orders (CEX only).
+        """Open a position by placing real orders (CEX perp + spot CEX/BSC).
 
-        Body: {opportunity_id, capital, leverage?, dry_run?}.
-        Mirrors /api/open_position's lookup + capital validation, then routes
-        the real orders through exchanges/trade_executor.
+        Body: {opportunity_id, capital, leverage, dry_run?, twap?:{slices,duration_s},
+               allow_market_fallback?}.
+        dry_run → simulación síncrona (rápida). Real → crea un ExecutionJob y
+        devuelve {job_id}; el frontend hace polling de /api/exec/jobs/<id>.
         """
         from exchanges import trade_executor as texec
         data = flask_req.json or {}
@@ -646,24 +704,19 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         capital = float(data.get("capital", 0))
         leverage = max(1, int(data.get("leverage", 1)))
         dry_run = bool(data.get("dry_run", False))
+        twap = _parse_twap(data.get("twap"))
 
         uid = get_current_user_id()
         if not uid or not get_db_persist():
             return jsonify({"ok": False, "msg": "DB no disponible"}), 400
         dbp = get_db_persist()
 
-        with state_manager.lock:
-            s = state_manager.state
-            opp = next((o for o in s.get("opportunities", []) if o.get("_id") == opp_id), None)
-            if not opp:
-                opp = next((o for o in s.get("defi_opportunities", []) if o.get("_id") == opp_id), None)
-            if not opp:
-                return jsonify({"ok": False, "msg": "Oportunidad no encontrada"})
-            opp = dict(opp)  # detach from shared state before releasing the lock
-
+        opp = _find_opp(opp_id)
+        if not opp:
+            return jsonify({"ok": False, "msg": "Oportunidad no encontrada"})
         mode = opp.get("mode", "spot_perp")
+        is_binance_sp = mode == "spot_perp" and opp.get("exchange", "").lower() == "binance"
 
-        # Guard 1 — CEX-only. Identify the exchange(s) each leg needs.
         if mode == "spot_perp":
             needed = [opp.get("exchange", "")]
         elif mode == "cross_exchange":
@@ -674,7 +727,6 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             if not texec.is_cex(ex):
                 return jsonify({"ok": False, "msg": f"{ex} no es un CEX soportado para auto-ejecución"})
 
-        # Load + decrypt the user's keys for every needed exchange.
         creds_by_exchange = {}
         for ex in needed:
             c = dbp.load_user_exchange_keys(uid, ex)
@@ -682,15 +734,24 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 return jsonify({"ok": False, "msg": f"Configura las API keys de {ex} en la pestaña Cuenta"})
             creds_by_exchange[ex.lower()] = c
 
-        # Guard 2 — spot_perp needs a CCXT-tradeable centralized spot market
-        # (excludes Binance Alpha / Bitget Onchain / Web3-only pairs).
+        spot_venue, token = ("cex", None)
         if mode == "spot_perp":
-            ex = opp.get("exchange", "")
-            if not texec.spot_tradeable(ex, creds_by_exchange[ex.lower()], opp.get("symbol", "")):
-                return jsonify({"ok": False, "msg": "El spot de este par no es operable por API (Alpha/Onchain/Web3). Usa el flujo manual."})
+            spot_venue, token = _resolve_spot_venue(opp, creds_by_exchange)
+            if not spot_venue:
+                return jsonify({"ok": False, "msg": "El spot de este par no es operable por API "
+                                "(solo Alpha/Web3). Usa el flujo manual."})
+            if spot_venue == "bsc" and not dbp.load_user_wallet(uid, "bsc"):
+                return jsonify({"ok": False, "code": "NO_WALLET",
+                                "msg": "Este token solo tiene spot on-chain (BSC). Configura tu wallet "
+                                       "BSC dedicada en Cuenta para operarlo."})
 
-        # Capital + max_positions validation, reusing the bookkeeping path.
         user_state = dbp.load_user_state(uid)
+        # Una posición basyo por símbolo en Binance (one-way aislado agrega por símbolo).
+        if is_binance_sp and any(
+                p.get("symbol") == opp.get("symbol") and (p.get("exchange") or "").lower() == "binance"
+                for p in user_state.get("positions", [])):
+            return jsonify({"ok": False, "msg": f"Ya tienes una posición en {opp.get('symbol')} en "
+                            "Binance; ciérrala antes de abrir otra en el mismo símbolo."})
         merged = {
             "total_capital": user_state.get("total_capital", 1000),
             "max_positions": user_state.get("max_positions", 5),
@@ -702,54 +763,103 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         if not ok:
             return jsonify({"ok": False, "msg": result})
 
-        # Place the real orders.
-        exec_res = texec.execute_open(creds_by_exchange, opp, capital, leverage, dry_run=dry_run)
-        if not exec_res.get("ok"):
-            # If a leg filled during a failed open, that's a critical event.
-            if "unwound" in exec_res:
-                _exec_alert(uid, opp.get("symbol", ""),
-                            f"Fallo al abrir {opp.get('symbol','')} (auto): {exec_res.get('msg','')}")
-            return jsonify({"ok": False, "msg": exec_res.get("msg", "Ejecución fallida"), "exec": exec_res})
-
         if dry_run:
+            leg_factory = None
+            if spot_venue == "bsc":
+                leg_factory = _bsc_leg_factory(dbp.load_user_wallet(uid, "bsc"), token)
+            exec_res = texec.execute_open(creds_by_exchange, opp, capital, leverage, dry_run=True,
+                                          twap=twap, spot_leg_factory=leg_factory)
+            if not exec_res.get("ok"):
+                return jsonify({"ok": False, "msg": exec_res.get("msg", "Simulación fallida"),
+                                "code": exec_res.get("code"), "exec": exec_res})
+            if is_binance_sp:
+                exec_res["wallets"] = _wallet_check(uid, creds_by_exchange["binance"], capital,
+                                                    leverage, spot_venue, user_state)
             return jsonify({"ok": True, "dry_run": True, "exec": exec_res,
                             "estimated_daily": result["estimated_daily"],
                             "fees_total": result["fees_total"]})
 
-        # Overwrite the bookkeeping record with the REAL fills, mark it auto,
-        # and audit the order ids in payments_json.
-        import time as _t
-        pos = result["position"]
-        pos["entry_price"] = exec_res.get("entry_price") or pos.get("entry_price")
-        pos["entry_fees_real"] = exec_res.get("entry_fees_usd")
-        pos["auto_executed"] = True
-        pos["payments_json"] = [{
-            "ts": _t.time(),
-            "kind": "auto_open",
-            "order_ids": exec_res.get("order_ids", []),
-            "legs": exec_res.get("legs", []),
-            "note": "Auto-ejecutado",
-        }]
-        db_id = dbp.save_position(uid, pos)
-        pos["db_id"] = db_id
-        log.info(f"Auto-open saved: id={db_id} user={uid} {pos['symbol']} fees=${exec_res.get('entry_fees_usd')}")
-        return jsonify({
-            "ok": True, "exec": exec_res, "position": pos,
-            "estimated_daily": result["estimated_daily"],
-            "fees_total": exec_res.get("entry_fees_usd"),
-        })
+        if not job_runner:
+            return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
+        if job_runner.active_job(uid):
+            return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
+
+        # Fondos en la wallet correcta (y transfer automático si está habilitado).
+        if is_binance_sp:
+            wc = _wallet_check(uid, creds_by_exchange["binance"], capital, leverage, spot_venue,
+                               user_state, do_transfer=True)
+            if not wc.get("ok"):
+                return jsonify({"ok": False, "msg": wc.get("msg"), "code": "FUNDS"})
+
+        params = {
+            "symbol": opp.get("symbol"), "opportunity": opp, "capital": capital,
+            "leverage": leverage, "twap": twap,
+            "allow_market_fallback": bool(data.get("allow_market_fallback", True)),
+            "spot_venue": "bsc" if spot_venue == "bsc" else "", "token": token or {},
+        }
+        jid = job_runner.submit(uid, "open", params)
+        log.info(f"Exec job #{jid} open {opp.get('symbol')} user={uid} cap={capital} lev={leverage} twap={twap}")
+        return jsonify({"ok": True, "job_id": jid})
+
+    def _wallet_check(uid, creds, capital, leverage, spot_venue, user_state, do_transfer=False):
+        """Verifica USDT en spot (o wallet BSC) y margen en futuros; transfiere si procede."""
+        try:
+            from exchanges.binance_account import BinanceAccount
+            acct = BinanceAccount(creds)
+            bal = acct.balances()
+        except Exception as e:
+            return {"ok": True, "msg": f"No se pudo verificar saldos: {e}", "unchecked": True}
+        margin = capital / (leverage + 1)
+        spot_need = capital - margin
+        spot_have = bal["spot_usdt_free"]
+        if spot_venue == "bsc":
+            spot_have = (user_state.get("real_balances") or {}).get("wallet", 0)
+        fut_have = bal["futures_available"]
+        out = {"ok": True, "spot_need": round(spot_need, 2), "spot_have": round(spot_have, 2),
+               "futures_need": round(margin, 2), "futures_have": round(fut_have, 2),
+               "transfers": []}
+        short_fut = max(0.0, margin * 1.02 - fut_have)
+        short_spot = max(0.0, spot_need * 1.003 - spot_have)
+        if short_fut <= 0 and short_spot <= 0:
+            return out
+        auto = bool(user_state.get("auto_transfer"))
+        if spot_venue != "bsc" and auto:
+            if short_fut > 0 and spot_have - spot_need >= short_fut:
+                out["transfers"].append({"to": "future", "amount": round(short_fut, 2)})
+                short_fut = 0
+            elif short_spot > 0 and fut_have - margin * 1.02 >= short_spot:
+                out["transfers"].append({"to": "spot", "amount": round(short_spot, 2)})
+                short_spot = 0
+        if short_fut > 0 or short_spot > 0:
+            where = []
+            if short_spot > 0:
+                where.append(f"faltan ${short_spot:.2f} USDT en "
+                             + ("la wallet BSC" if spot_venue == "bsc" else "Spot"))
+            if short_fut > 0:
+                where.append(f"faltan ${short_fut:.2f} USDT de margen en Futuros USDⓈ-M")
+            out.update(ok=False, msg="Fondos insuficientes: " + "; ".join(where)
+                       + ("" if auto else ". Activa 'Transferir automáticamente' o mueve los fondos."))
+            return out
+        if do_transfer:
+            for t in out["transfers"]:
+                r = acct.transfer_usdt(t["amount"], t["to"])
+                if not r.get("ok"):
+                    return {"ok": False, "msg": r.get("msg")}
+                log.info(f"Auto-transfer user={uid} {t}")
+        return out
 
     @app.route("/api/execute_close", methods=["POST"])
     @auth_required
     def api_execute_close():
-        """Close a position by placing the reverse orders (CEX only).
+        """Close a position by placing the reverse orders (background job).
 
-        Body: {position_id, dry_run?}.
+        Body: {position_id, dry_run?, twap?}.
         """
         from exchanges import trade_executor as texec
         data = flask_req.json or {}
         pos_id = data.get("position_id", "")
         dry_run = bool(data.get("dry_run", False))
+        twap = _parse_twap(data.get("twap"))
 
         uid = get_current_user_id()
         if not uid or not get_db_persist():
@@ -762,11 +872,13 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             return jsonify({"ok": False, "msg": "Posicion no encontrada"})
 
         from core.db_models import UserPosition
-        from core.database import db as _db
         pos_row = UserPosition.query.filter_by(id=db_pos_id, user_id=uid, status="active").first()
         if not pos_row:
             return jsonify({"ok": False, "msg": "Posicion no encontrada"})
         pos = dbp._pos_to_dict(pos_row)
+        if pos.get("source") not in ("auto", "imported"):
+            return jsonify({"ok": False, "msg": "Solo las posiciones abiertas o importadas desde el "
+                            "exchange se pueden cerrar en automático."})
 
         mode = pos.get("mode", "spot_perp")
         needed = ([pos.get("exchange", "")] if mode == "spot_perp"
@@ -780,59 +892,61 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 return jsonify({"ok": False, "msg": f"Sin API keys para {ex}"})
             creds_by_exchange[ex.lower()] = c
 
-        exec_res = texec.execute_close(creds_by_exchange, pos, dry_run=dry_run)
-        if not exec_res.get("ok"):
-            _exec_alert(uid, pos.get("symbol", ""),
-                        f"Fallo al cerrar {pos.get('symbol','')} (auto): {exec_res.get('msg','')}")
-            return jsonify({"ok": False, "msg": exec_res.get("msg", "Cierre fallido"), "exec": exec_res})
+        token = {}
+        if pos.get("spot_venue") == "bsc":
+            from exchanges import onchain_bsc
+            token = onchain_bsc.alpha_token(pos.get("symbol", "")) or {}
+            if not token or not dbp.load_user_wallet(uid, "bsc"):
+                return jsonify({"ok": False, "msg": "Wallet BSC o token no disponible"})
+
         if dry_run:
+            leg_factory = (_bsc_leg_factory(dbp.load_user_wallet(uid, "bsc"), token)
+                           if pos.get("spot_venue") == "bsc" else None)
+            exec_res = texec.execute_close(creds_by_exchange, pos, dry_run=True,
+                                           spot_leg_factory=leg_factory)
+            if not exec_res.get("ok"):
+                return jsonify({"ok": False, "msg": exec_res.get("msg", "Simulación fallida"), "exec": exec_res})
             return jsonify({"ok": True, "dry_run": True, "exec": exec_res})
 
-        # Record the real exit fees, then close via the bookkeeping path.
-        exit_fees = exec_res.get("exit_fees_usd")
-        if exit_fees is not None:
-            try:
-                pos_row.exit_fees_real = float(exit_fees)
-                _db.session.commit()
-            except (TypeError, ValueError):
-                pass
+        if not job_runner:
+            return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
+        if job_runner.active_job(uid):
+            return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
+        jid = job_runner.submit(uid, "close", {"position_id": db_pos_id, "symbol": pos.get("symbol"),
+                                               "twap": twap, "token": token})
+        log.info(f"Exec job #{jid} close pos={db_pos_id} user={uid}")
+        return jsonify({"ok": True, "job_id": jid})
 
-        el_h = (time.time() - pos_row.entry_time / 1000) / 3600
-        earned = pos_row.earned_real or 0
-        from portfolio.manager import position_fees as _pf
-        _e, _x, fees, _ = _pf({
-            "entry_fees": pos_row.entry_fees or 0,
-            "exit_fees_est": pos_row.exit_fees_est or 0,
-            "entry_fees_real": pos_row.entry_fees_real,
-            "exit_fees_real": pos_row.exit_fees_real,
-        })
-        net_earned = earned - fees
-        dbp.close_position(db_pos_id, {
-            "reason": "auto", "hours": el_h, "fees": fees, "net_earned": net_earned,
-        })
+    # ── Execution jobs ─────────────────────────────────────────
+    @app.route("/api/exec/jobs/<int:job_id>")
+    @auth_required
+    def api_exec_job(job_id):
+        from core.db_models import ExecutionJob
+        uid = get_current_user_id()
+        job = ExecutionJob.query.filter_by(id=job_id, user_id=uid).first()
+        if not job or not job_runner:
+            return jsonify({"ok": False, "msg": "Job no encontrado"}), 404
+        return jsonify({"ok": True, "job": job_runner.to_dict(job)})
 
-        # Audit the close order ids on the freshly-created history row.
-        try:
-            from core.db_models import UserHistory
-            hist = (UserHistory.query.filter_by(user_id=uid, symbol=pos_row.symbol)
-                    .order_by(UserHistory.id.desc()).first())
-            if hist:
-                ids = ", ".join(str(i) for i in exec_res.get("order_ids", []))
-                hist.notes = (hist.notes or "") + f"Auto-cierre orders=[{ids}] @ {datetime.now().isoformat()}\n"
-                _db.session.commit()
-        except Exception as e:
-            log.debug(f"close audit note skipped: {e}")
+    @app.route("/api/exec/jobs/active")
+    @auth_required
+    def api_exec_job_active():
+        uid = get_current_user_id()
+        job = job_runner.active_job(uid) if job_runner and uid else None
+        return jsonify({"ok": True, "job": job_runner.to_dict(job) if job else None})
 
-        # Clear notified-alert keys for this symbol (parity with manual close).
-        for k in [k for k in scanner_worker._notified_alerts if pos_row.symbol in k]:
-            scanner_worker._notified_alerts.pop(k, None)
-
-        result = {
-            "symbol": pos_row.symbol, "earned": earned, "fees": fees,
-            "net_earned": net_earned, "hours": el_h, "payments": pos_row.payment_count or 0,
-        }
-        log.info(f"Auto-close done: id={db_pos_id} user={uid} {pos_row.symbol} net=${net_earned:.4f}")
-        return jsonify({"ok": True, "exec": exec_res, "result": result})
+    @app.route("/api/exec/jobs/<int:job_id>/cancel", methods=["POST"])
+    @auth_required
+    def api_exec_job_cancel(job_id):
+        from core.database import db as _db
+        from core.db_models import ExecutionJob
+        uid = get_current_user_id()
+        job = ExecutionJob.query.filter_by(id=job_id, user_id=uid).first()
+        if not job or job.status not in ("queued", "running"):
+            return jsonify({"ok": False, "msg": "El job no está activo"})
+        job.cancel_requested = True
+        _db.session.commit()
+        return jsonify({"ok": True, "msg": "Cancelación solicitada: se cubre lo ejecutado y se detiene"})
 
     # ── Update real fees on an open position ───────────────────
     @app.route("/api/positions/<pos_id>/fees", methods=["PATCH", "POST"])
@@ -1309,7 +1423,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             from flask_login import current_user
             from core.database import db as _db
             from core.db_models import UserExchangeKey
-            from core.encryption import encrypt_value
+            from core.encryption import encrypt_value, EncryptionUnavailable
 
             data = flask_req.get_json() or {}
             exchange = data.get("exchange", "").strip()
@@ -1328,23 +1442,44 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 if existing:
                     _db.session.delete(existing)
                     _db.session.commit()
+                from core.db_models import UserAccountSnapshot
+                UserAccountSnapshot.query.filter_by(user_id=current_user.id,
+                                                    exchange=exchange.lower()).delete()
+                _db.session.commit()
                 return jsonify({"ok": True, "msg": f"Keys de {exchange} eliminadas"})
+
+            # Binance: validar permisos ANTES de guardar (rechaza keys con retiros).
+            check = None
+            if exchange.lower() == "binance":
+                from exchanges.binance_account import BinanceAccount
+                check = BinanceAccount({"api_key": api_key, "api_secret": api_secret}).check()
+                perm = check.get("permissions") or {}
+                if not check.get("ok") and (perm.get("errors") or not perm):
+                    return jsonify({"ok": False, "msg": check.get("msg"), "check": check})
+
+            try:
+                enc = (encrypt_value(api_key, required=True), encrypt_value(api_secret, required=True),
+                       encrypt_value(passphrase, required=True) if passphrase else None)
+            except EncryptionUnavailable as e:
+                return jsonify({"ok": False, "msg": str(e)}), 500
 
             if not existing:
                 existing = UserExchangeKey(user_id=current_user.id, exchange_name=exchange)
                 _db.session.add(existing)
-
-            existing.api_key_encrypted = encrypt_value(api_key) if api_key else ""
-            existing.api_secret_encrypted = encrypt_value(api_secret) if api_secret else ""
-            existing.passphrase_encrypted = encrypt_value(passphrase) if passphrase else ""
+            existing.api_key_encrypted, existing.api_secret_encrypted = enc[0], enc[1]
+            if enc[2] is not None or not existing.passphrase_encrypted:
+                existing.passphrase_encrypted = enc[2] or ""
             _db.session.commit()
 
-            return jsonify({"ok": True, "msg": f"Keys de {exchange} guardadas"})
+            if exchange.lower() == "binance" and account_syncer:
+                threading.Thread(target=account_syncer.sync_user, args=(current_user.id,),
+                                 daemon=True).start()
+            return jsonify({"ok": True, "msg": f"Keys de {exchange} guardadas", "check": check})
 
         @app.route("/api/account/exchange_keys/test", methods=["POST"])
         @auth_required
         def api_test_exchange_keys():
-            """Validate stored API keys for an exchange by hitting the balance API."""
+            """Validate stored API keys (Binance: permisos + modo de cuenta + saldos)."""
             from exchanges import trade_executor as texec
             uid = get_current_user_id()
             if not uid or not get_db_persist():
@@ -1357,6 +1492,153 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             if not creds or not creds.get("api_key"):
                 return jsonify({"ok": False, "msg": f"No hay keys guardadas para {exchange}"})
             return jsonify(texec.test_connection(exchange, creds))
+
+        # ── Binance: cuenta real ─────────────────────────────
+        def _binance_creds(uid):
+            dbp = get_db_persist()
+            return dbp.load_user_exchange_keys(uid, "Binance") or dbp.load_user_exchange_keys(uid, "binance")
+
+        @app.route("/api/account/binance")
+        @auth_required
+        def api_binance_status():
+            """Último snapshot sincronizado (saldos, posiciones, permisos, importables, drift)."""
+            uid = get_current_user_id()
+            dbp = get_db_persist()
+            snap = dbp.get_account_snapshot(uid, "binance")
+            wsnap = dbp.get_account_snapshot(uid, "bsc_wallet")
+            return jsonify({"ok": True, "connected": bool(_binance_creds(uid)),
+                            "snapshot": snap, "wallet": wsnap,
+                            "real_balances": dbp.real_free_usdt(uid)})
+
+        @app.route("/api/account/binance/sync", methods=["POST"])
+        @auth_required
+        def api_binance_sync():
+            uid = get_current_user_id()
+            if not account_syncer:
+                return jsonify({"ok": False, "msg": "Sync no disponible"}), 503
+            if not _binance_creds(uid) and not get_db_persist().load_user_wallet(uid, "bsc"):
+                return jsonify({"ok": False, "msg": "Configura tus API keys de Binance"})
+            snap = account_syncer.sync_user(uid)
+            if snap and snap.get("ok") is False:
+                return jsonify({"ok": False, "msg": f"Sync falló: {snap.get('error')}"})
+            return jsonify({"ok": True, "snapshot": get_db_persist().get_account_snapshot(uid, "binance")})
+
+        @app.route("/api/account/binance/multi_assets_off", methods=["POST"])
+        @auth_required
+        def api_binance_multi_assets_off():
+            """Desactiva Multi-Assets (requiere confirmación explícita del usuario)."""
+            uid = get_current_user_id()
+            data = flask_req.get_json() or {}
+            if data.get("confirm") is not True:
+                return jsonify({"ok": False, "msg": "Confirmación requerida"}), 400
+            creds = _binance_creds(uid)
+            if not creds:
+                return jsonify({"ok": False, "msg": "Configura tus API keys de Binance"})
+            from exchanges.binance_account import BinanceAccount
+            res = BinanceAccount(creds).disable_multi_assets()
+            log.info(f"multi_assets_off user={uid}: {res}")
+            if res.get("ok") and account_syncer:
+                account_syncer.request()
+            return jsonify(res)
+
+        @app.route("/api/account/binance/import", methods=["POST"])
+        @auth_required
+        def api_binance_import():
+            """Importa un short USDⓈ-M existente (+ spot si lo hay) como posición basyo."""
+            uid = get_current_user_id()
+            dbp = get_db_persist()
+            data = flask_req.get_json() or {}
+            symbol = (data.get("symbol") or "").upper()
+            snap = dbp.get_account_snapshot(uid, "binance")
+            imp = next((p for p in ((snap or {}).get("data") or {}).get("importable", [])
+                        if p.get("symbol", "").upper() == symbol), None)
+            if not imp:
+                return jsonify({"ok": False, "msg": "Posición no encontrada entre las importables; sincroniza primero"})
+            state = dbp.load_user_state(uid)
+            if any(p.get("symbol") == symbol and (p.get("exchange") or "").lower() == "binance"
+                   for p in state.get("positions", [])):
+                return jsonify({"ok": False, "msg": f"{symbol} ya está registrada en basyo"})
+            # Datos de mercado del scan (tasa, intervalo) si existen.
+            with state_manager.lock:
+                cur = next((d for d in state_manager.state.get("all_data", [])
+                            if d.get("symbol") == symbol and str(d.get("exchange", "")).lower() == "binance"), {})
+            qty = float(imp["qty"])
+            spot_held = float(imp.get("spot_held") or 0)
+            entry = float(imp.get("entry_price") or imp.get("mark_price") or 0)
+            lev = int(round(float(imp.get("leverage") or 1)))
+            margin = float(imp.get("isolated_margin") or (qty * entry / max(1, lev)))
+            pos = {
+                "symbol": symbol, "exchange": "Binance", "mode": "spot_perp",
+                "entry_fr": cur.get("fr", 0), "entry_price": entry,
+                "entry_time": int(imp.get("update_time") or time.time() * 1000),
+                "capital_used": round(min(spot_held, qty) * entry + margin, 4),
+                "leverage": max(1, lev), "exposure": round(qty * entry, 4),
+                "ih": cur.get("ih", 8), "entry_fees": 0, "exit_fees_est": 0,
+                "auto_executed": False, "source": "imported",
+                "spot_qty": spot_held, "perp_qty": qty, "spot_venue": "binance",
+                "earnings_source": "real",
+                "payments_json": [{"ts": time.time(), "kind": "import",
+                                   "note": f"Importada de Binance: short {qty:g}, spot {spot_held:g}"}],
+            }
+            pid = dbp.save_position(uid, pos)
+            if account_syncer:
+                account_syncer.request()
+            msg = f"{symbol} importada"
+            if spot_held < qty * 0.95:
+                msg += f" — ojo: spot {spot_held:g} no cubre el short {qty:g} (posición no delta-neutral)"
+            return jsonify({"ok": True, "msg": msg, "position_id": pid})
+
+        @app.route("/api/account/settings", methods=["POST"])
+        @auth_required
+        def api_account_settings():
+            uid = get_current_user_id()
+            data = flask_req.get_json() or {}
+            upd = {}
+            if "auto_transfer" in data:
+                upd["auto_transfer"] = bool(data["auto_transfer"])
+            if upd:
+                get_db_persist().save_user_config(uid, upd)
+            return jsonify({"ok": True})
+
+        # ── Wallet BSC dedicada ──────────────────────────────
+        @app.route("/api/account/wallet", methods=["GET", "POST", "DELETE"])
+        @auth_required
+        def api_wallet():
+            from core.database import db as _db
+            from core.db_models import UserWallet
+            uid = get_current_user_id()
+            row = UserWallet.query.filter_by(user_id=uid, chain="bsc").first()
+            if flask_req.method == "GET":
+                snap = get_db_persist().get_account_snapshot(uid, "bsc_wallet")
+                return jsonify({"ok": True, "wallet": {"address": row.address} if row else None,
+                                "snapshot": snap})
+            if flask_req.method == "DELETE":
+                if row:
+                    _db.session.delete(row)
+                    _db.session.commit()
+                return jsonify({"ok": True, "msg": "Wallet eliminada de basyo"})
+            data = flask_req.get_json() or {}
+            if data.get("accept_risk") is not True:
+                return jsonify({"ok": False, "msg": "Debes aceptar el aviso de riesgo"}), 400
+            from exchanges import onchain_bsc
+            from core.encryption import encrypt_value, EncryptionUnavailable
+            try:
+                address = onchain_bsc.address_from_key(data.get("private_key", ""))
+            except Exception:
+                return jsonify({"ok": False, "msg": "Private key inválida (64 hex)"}), 400
+            try:
+                enc = encrypt_value(onchain_bsc.normalize_key(data["private_key"]), required=True)
+            except EncryptionUnavailable as e:
+                return jsonify({"ok": False, "msg": str(e)}), 500
+            if not row:
+                row = UserWallet(user_id=uid, chain="bsc", address=address, pk_encrypted=enc)
+                _db.session.add(row)
+            else:
+                row.address, row.pk_encrypted = address, enc
+            _db.session.commit()
+            if account_syncer:
+                threading.Thread(target=account_syncer.sync_user, args=(uid,), daemon=True).start()
+            return jsonify({"ok": True, "msg": "Wallet BSC guardada", "address": address})
 
         @app.route("/api/account", methods=["DELETE"])
         @auth_required

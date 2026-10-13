@@ -336,6 +336,23 @@ body {
 
 .pos-header-actions { display: flex; gap: 8px; align-items: center; }
 .badge-auto { background: rgba(245,158,11,0.18); color: var(--orange); border: 1px solid #f59e0b55; }
+.badge-real { background: rgba(34,197,94,0.15); color: var(--green); border: 1px solid #22c55e55; }
+.badge-onchain { background: rgba(59,130,246,0.15); color: var(--blue); border: 1px solid #3b82f655; }
+
+/* Binance live: datos reales, drift, TWAP, progreso de jobs */
+.pos-real { display: flex; flex-wrap: wrap; gap: 6px 14px; font-family: var(--font-ui); font-size: 11px; color: var(--text-secondary); margin: 4px 0 8px; }
+.pos-real strong { color: var(--text-primary); }
+.pos-drift { background: rgba(245,158,11,0.15); color: var(--orange); }
+.exec-twap { display: flex; align-items: center; gap: 6px; font-family: var(--font-ui); font-size: 12px; color: var(--text-primary); margin: 6px 0; cursor: pointer; }
+.exec-twap-cfg { gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.exec-twap-cfg label { font-family: var(--font-ui); font-size: 11px; color: var(--text-secondary); display: flex; flex-direction: column; gap: 3px; }
+.exec-twap-cfg input { width: 110px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; color: var(--text-white); padding: 5px 8px; }
+.job-box { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 8px 0; }
+.job-progress { font-family: var(--font-ui); font-size: 13px; color: var(--text-primary); text-align: center; }
+.bn-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 8px; }
+.bn-grid > div { display: flex; flex-direction: column; gap: 2px; background: rgba(255,255,255,0.03); border-radius: 8px; padding: 8px 10px; font-family: var(--font-ui); font-size: 13px; color: var(--text-white); }
+.bn-grid .label { font-size: 10px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .03em; }
+.cfg-real-capital { font-family: var(--font-ui); font-size: 12px; color: var(--text-primary); display: flex; flex-direction: column; gap: 3px; }
 
 /* Risk-confirmation modal (wider than the plain confirm box) */
 .exec-box { max-width: 460px; text-align: left; }

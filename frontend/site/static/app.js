@@ -957,21 +957,28 @@ function posIsCex(p) {
   return legs.every(e => CEX_EXCHANGES.includes((e || '').toLowerCase()));
 }
 
+function posIsAutoClosable(p) {
+  return posIsCex(p) && (p.source === 'auto' || p.source === 'imported');
+}
+
 function execEligibility(meta) {
   // meta: {mode, exchange, long_exchange, short_exchange, has_spot}
   const isCross = meta.mode === 'cross_exchange';
   const legs = isCross ? [meta.long_exchange, meta.short_exchange] : [meta.exchange];
   if (meta.mode === 'defi' || !legs.every(e => CEX_EXCHANGES.includes((e || '').toLowerCase()))) {
-    return { ok: false, tip: 'Solo CEX (DeFi / on-chain → flujo manual)' };
-  }
-  if (!isCross && meta.has_spot === false) {
-    return { ok: false, tip: 'Spot no operable por API (Alpha/Onchain/Web3) → manual' };
+    return { ok: false, tip: 'Solo CEX (DeFi → flujo manual)' };
   }
   if (_cexKeysLoaded) {
     const missing = legs.filter(e => !_cexKeys.has((e || '').toLowerCase()));
     if (missing.length) {
       return { ok: false, tip: `Configura las API keys de ${missing.join(', ')} en la pestaña Cuenta` };
     }
+  }
+  if (!isCross && meta.has_spot === false) {
+    if ((meta.exchange || '').toLowerCase() === 'binance') {
+      return { ok: true, tip: 'Spot solo on-chain (Alpha BSC): requiere tu wallet BSC dedicada' };
+    }
+    return { ok: false, tip: 'Spot no operable por API (Onchain/Web3) → manual' };
   }
   return { ok: true, tip: 'Coloca las órdenes reales por API' };
 }
@@ -997,44 +1004,52 @@ async function autoExecuteOpen(oppId, idx) {
   if (!cap || cap <= 0) { showToast('Ingresa capital primero', 'warning'); return; }
 
   const meta = { ..._oppMeta[oppId], capital: cap, leverage: lev };
-  const choice = await showExecConfirm('open', meta);
-  if (choice === 'cancel') return;
+  const ans = await showExecConfirm('open', meta);
+  if (ans.choice === 'cancel') return;
   await runExec('/api/execute_open',
-    { opportunity_id: oppId, capital: cap, leverage: lev, dry_run: choice === 'dry' },
-    choice === 'dry', 'open', `Apertura ${meta.symbol}`);
+    { opportunity_id: oppId, capital: cap, leverage: lev, dry_run: ans.choice === 'dry', twap: ans.twap },
+    ans.choice === 'dry', 'open', `Apertura ${meta.symbol}`);
 }
 
 async function autoExecuteClose(posId, symbol) {
   const p = (_lastPosData?.positions || []).find(x => String(x.id) === String(posId)) || {};
   const meta = {
-    symbol, mode: p.mode, exchange: p.exchange,
+    symbol, mode: p.mode, exchange: p.exchange, spot_venue: p.spot_venue,
     long_exchange: p.long_exchange, short_exchange: p.short_exchange, _close: true,
+    spot_qty: p.spot_qty, perp_qty: p.perp_qty,
   };
-  const choice = await showExecConfirm('close', meta);
-  if (choice === 'cancel') return;
+  const ans = await showExecConfirm('close', meta);
+  if (ans.choice === 'cancel') return;
   await runExec('/api/execute_close',
-    { position_id: posId, dry_run: choice === 'dry' },
-    choice === 'dry', 'close', `Cierre ${symbol}`);
+    { position_id: posId, dry_run: ans.choice === 'dry', twap: ans.twap },
+    ans.choice === 'dry', 'close', `Cierre ${symbol}`);
 }
+
+function _fmtQty(v) { return v == null ? '—' : (+v).toPrecision(5); }
 
 function showExecConfirm(kind, meta) {
   const isCross = meta.mode === 'cross_exchange';
   const sym = meta.symbol;
+  const onchain = !isCross && meta.has_spot === false;
   let legsHtml;
   if (kind === 'open') {
     legsHtml = isCross
       ? `<li><strong>Long PERP</strong> ${sym} en <strong>${meta.long_exchange}</strong> · límite</li>
-         <li><strong>Short PERP</strong> ${sym} en <strong>${meta.short_exchange}</strong> · límite (90s, aborta si solo 1 llena)</li>`
-      : `<li><strong>Long SPOT</strong> ${sym} en <strong>${meta.exchange}</strong> · límite al mid (60s)</li>
-         <li><strong>Short PERP</strong> ${sym} en <strong>${meta.exchange}</strong> · market al llenarse el spot</li>`;
+         <li><strong>Short PERP</strong> ${sym} en <strong>${meta.short_exchange}</strong> · límite (90s; se igualan las piernas)</li>`
+      : onchain
+        ? `<li><strong>Compra SPOT on-chain</strong> ${sym} en <strong>BSC</strong> (tu wallet dedicada) · swap con slippage máx.</li>
+           <li><strong>Short PERP</strong> ${sym} en <strong>${meta.exchange}</strong> · market por la cantidad recibida</li>`
+        : `<li><strong>Long SPOT</strong> ${sym} en <strong>${meta.exchange}</strong> · maker post-only al mejor bid (re-precio), taker solo si el basis lo permite</li>
+           <li><strong>Short PERP</strong> ${sym} en <strong>${meta.exchange}</strong> · market por cada fill del spot (siempre cubierto)</li>`;
   } else {
     legsHtml = isCross
-      ? `<li>Cerrar <strong>Long</strong> en ${meta.long_exchange} y <strong>Short</strong> en ${meta.short_exchange} · market</li>`
-      : `<li>Vender <strong>SPOT</strong> y cerrar <strong>SHORT perp</strong> en ${meta.exchange} · market</li>`;
+      ? `<li>Cerrar <strong>Long</strong> en ${meta.long_exchange} y <strong>Short</strong> en ${meta.short_exchange} · market reduceOnly</li>`
+      : `<li>Vender <strong>${_fmtQty(meta.spot_qty)} ${sym}</strong> ${meta.spot_venue === 'bsc' ? 'on-chain (BSC)' : 'spot (maker → market)'} </li>
+         <li>Recomprar <strong>${_fmtQty(meta.perp_qty)}</strong> del short perp por cada fill · market reduceOnly</li>`;
   }
   const head = kind === 'open'
-    ? `Vas a abrir una posición real x${meta.leverage} con $${meta.capital} de capital.`
-    : `Vas a cerrar la posición real de ${sym}.`;
+    ? `Vas a abrir una posición real con <strong>$${meta.capital}</strong> de capital y leverage <strong>x${meta.leverage}</strong> (margen aislado).`
+    : `Vas a cerrar la posición real de ${sym} usando las cantidades registradas.`;
 
   return new Promise(resolve => {
     const overlay = document.createElement('div');
@@ -1044,7 +1059,13 @@ function showExecConfirm(kind, meta) {
         <div class="exec-title">${kind === 'open' ? 'Ejecutar órdenes' : 'Cerrar posición'} — ${sym}</div>
         <div class="exec-sub">${head}</div>
         <ul class="exec-legs">${legsHtml}</ul>
-        ${kind === 'open' ? `<div class="exec-note">Asegúrate de tener fondos en la wallet correcta (spot y futures). El bot no transfiere entre wallets.</div>` : ''}
+        ${isCross ? '' : `
+        <label class="exec-twap"><input type="checkbox" id="exec-twap-on"> TWAP pareado (montos grandes)</label>
+        <div class="exec-twap-cfg" id="exec-twap-cfg" style="display:none">
+          <label>Tramos <input type="number" id="exec-twap-slices" min="2" max="96" value="6"></label>
+          <label>Duración (min) <input type="number" id="exec-twap-min" min="5" max="1440" value="30"></label>
+        </div>`}
+        ${kind === 'open' ? `<div class="exec-note">Usa <em>Simular</em> para ver liquidación estimada, fondos por wallet y si conviene TWAP.</div>` : ''}
         <div class="exec-warn">⚠ Esto coloca órdenes con dinero real en tu cuenta.</div>
         <div class="confirm-actions exec-actions">
           <button class="btn btn-secondary" data-action="cancel">Cancelar</button>
@@ -1052,7 +1073,27 @@ function showExecConfirm(kind, meta) {
           <button class="btn btn-danger" data-action="real">${kind === 'open' ? 'Ejecutar órdenes reales' : 'Cerrar de verdad'}</button>
         </div>
       </div>`;
-    const close = (val) => { overlay.remove(); document.removeEventListener('keydown', onEsc); resolve(val); };
+    const twapOn = overlay.querySelector('#exec-twap-on');
+    if (twapOn) {
+      twapOn.onchange = () => { overlay.querySelector('#exec-twap-cfg').style.display = twapOn.checked ? 'flex' : 'none'; };
+      if (meta._twap) {
+        twapOn.checked = true;
+        overlay.querySelector('#exec-twap-cfg').style.display = 'flex';
+        overlay.querySelector('#exec-twap-slices').value = meta._twap.slices;
+        overlay.querySelector('#exec-twap-min').value = Math.max(5, Math.round(meta._twap.duration_s / 60));
+      }
+    }
+    const readTwap = () => {
+      if (!twapOn || !twapOn.checked) return null;
+      const slices = parseInt(overlay.querySelector('#exec-twap-slices').value) || 1;
+      const mins = parseInt(overlay.querySelector('#exec-twap-min').value) || 5;
+      return slices > 1 ? { slices, duration_s: mins * 60 } : null;
+    };
+    const close = (choice) => {
+      const twap = readTwap();
+      overlay.remove(); document.removeEventListener('keydown', onEsc);
+      resolve({ choice, twap });
+    };
     overlay.querySelector('[data-action="cancel"]').onclick = () => close('cancel');
     overlay.querySelector('[data-action="dry"]').onclick = () => close('dry');
     overlay.querySelector('[data-action="real"]').onclick = () => close('real');
@@ -1067,7 +1108,7 @@ function showExecConfirm(kind, meta) {
 async function runExec(url, body, isDry, kind, title) {
   const ov = document.createElement('div');
   ov.className = 'exec-loading';
-  ov.innerHTML = `<div class="exec-spinner"></div><div class="exec-loading-txt">${isDry ? 'Simulando…' : 'Ejecutando órdenes…'}</div>`;
+  ov.innerHTML = `<div class="exec-spinner"></div><div class="exec-loading-txt">${isDry ? 'Simulando…' : 'Enviando…'}</div>`;
   document.body.appendChild(ov);
   try {
     const res = await fetch(url, {
@@ -1075,16 +1116,20 @@ async function runExec(url, body, isDry, kind, title) {
       body: JSON.stringify(body),
     });
     const data = await res.json();
-    if (data.ok) {
-      // A dry run can be promoted to a real run from the result modal.
-      _execContinue = isDry ? () => runExec(url, { ...body, dry_run: false }, false, kind, title) : null;
-      showExecResult(title, data, isDry);
-      if (!isDry) {
-        if (kind === 'open') loadCurrentOpps();
-        if (kind === 'close') loadPositions();
+    if (!data.ok) {
+      if (data.code === 'MULTI_ASSETS' || data.exec?.code === 'MULTI_ASSETS') {
+        showToast(data.msg + ' Ve a Cuenta → Binance para desactivarlo.', 'error', 9000);
+      } else {
+        showToast(data.msg || 'Ejecución fallida', 'error', 8000);
       }
-    } else {
-      showToast(data.msg || 'Ejecución fallida', 'error', 7000);
+      return;
+    }
+    if (isDry) {
+      // A dry run can be promoted to a real run from the result modal.
+      _execContinue = () => runExec(url, { ...body, dry_run: false }, false, kind, title);
+      showExecResult(title, data, true);
+    } else if (data.job_id) {
+      watchJob(data.job_id, title, kind);
     }
   } catch (e) {
     showToast('Error de red al ejecutar', 'error');
@@ -1093,35 +1138,132 @@ async function runExec(url, body, isDry, kind, title) {
   }
 }
 
-function showExecResult(title, data, isDry) {
+// ── Job de ejecución en background: progreso en vivo ──────────
+let _jobTimer = null;
+
+function watchJob(jobId, title, kind) {
+  if (_jobTimer) clearTimeout(_jobTimer);
+  document.getElementById('modal-title').textContent = `${title} · en curso`;
+  document.getElementById('modal-body').innerHTML = `
+    <div class="job-box" id="job-box">
+      <div class="exec-spinner"></div>
+      <div id="job-progress" class="job-progress">Iniciando…</div>
+      <button class="btn btn-secondary" style="width:100%;margin-top:10px" onclick="cancelJob(${jobId})">Detener (cubre lo ejecutado)</button>
+      <div class="exec-note" style="margin-top:8px">Puedes cerrar esta ventana: la ejecución sigue en el servidor y recibirás el resultado por Telegram.</div>
+    </div>`;
+  document.getElementById('modal').classList.add('open');
+  const poll = async () => {
+    try {
+      const res = await fetch(`/api/exec/jobs/${jobId}`);
+      const data = await res.json();
+      if (!data.ok) return;
+      const j = data.job;
+      const pr = j.progress || {};
+      const el = document.getElementById('job-progress');
+      if (el) {
+        el.innerHTML = pr.phase === 'close'
+          ? `Spot vendido: <strong>${_fmtQty(pr.spot_sold)}</strong> · Short recomprado: <strong>${_fmtQty(pr.perp_closed)}</strong>`
+          : pr.phase === 'open'
+            ? `Spot neto: <strong>${_fmtQty(pr.spot_net)}</strong> · Short cubierto: <strong>${_fmtQty(pr.perp_hedged)}</strong>${pr.slices_done != null && j.params?.twap ? ` · tramo ${pr.slices_done + 1}/${j.params.twap.slices}` : ''}`
+            : `Estado: ${j.status}`;
+      }
+      if (['done', 'failed', 'canceled', 'interrupted'].includes(j.status)) {
+        _jobTimer = null;
+        const r = j.result || {};
+        if (j.status === 'done') {
+          showExecResult(title, { exec: r }, false, j);
+        } else {
+          document.getElementById('modal-title').textContent = `${title} · ${j.status === 'failed' ? 'falló' : j.status}`;
+          document.getElementById('modal-body').innerHTML = `
+            <div class="exec-warn">${j.error || r.msg || 'La ejecución no se completó'}</div>
+            ${r.partial ? '<div class="exec-note">Se guardó la parte ejecutada y cubierta como posición.</div>' : ''}`;
+        }
+        loadPositions();
+        if (kind === 'open') loadCurrentOpps();
+        return;
+      }
+    } catch (e) { /* reintento */ }
+    _jobTimer = setTimeout(poll, 2000);
+  };
+  poll();
+}
+
+async function cancelJob(jobId) {
+  try {
+    const res = await fetch(`/api/exec/jobs/${jobId}/cancel`, { method: 'POST' });
+    const data = await res.json();
+    showToast(data.msg || 'Cancelación solicitada', data.ok ? 'info' : 'warning');
+  } catch (e) { showToast('Error de red', 'error'); }
+}
+
+async function resumeActiveJob() {
+  try {
+    const res = await fetch('/api/exec/jobs/active');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.ok && data.job) {
+      const j = data.job;
+      watchJob(j.id, `${j.kind === 'open' ? 'Apertura' : 'Cierre'} ${j.params?.symbol || ''}`, j.kind);
+    }
+  } catch (e) { /* non-fatal */ }
+}
+
+function showExecResult(title, data, isDry, job) {
   const ex = data.exec || {};
   const legs = ex.legs || [];
   const rows = legs.map(l => `
     <tr>
       <td>${l.side === 'buy' ? 'Compra' : 'Venta'} ${l.kind || ''}</td>
       <td>${l.exchange || ''} ${l.symbol || ''}</td>
-      <td>${l.amount != null ? (+l.amount).toPrecision(4) : '—'}</td>
+      <td>${_fmtQty(l.amount)}</td>
       <td>${l.price != null ? '$' + (+l.price).toPrecision(6) : (l.type || '—')}</td>
-      <td>${l.fee_usd != null ? '$' + (+l.fee_usd).toFixed(4) : '—'}</td>
+      <td>${l.fee_usd != null ? '$' + (+l.fee_usd).toFixed(4) : (l.type && l.price != null ? l.type : '—')}</td>
     </tr>`).join('');
   const fees = ex.entry_fees_usd != null ? ex.entry_fees_usd
     : (ex.exit_fees_usd != null ? ex.exit_fees_usd : null);
   const ids = (ex.order_ids || []).filter(Boolean).join(', ');
+  const liq = ex.liquidation;
+  const w = ex.wallets;
+  const tw = ex.twap;
+
+  let extra = '';
+  if (ex.leverage) {
+    extra += `<div class="est-row"><span>Leverage (aislado)</span><span class="est-val">x${ex.leverage}${ex.max_leverage ? ` <span style="font-size:10px;color:var(--text-secondary)">máx x${ex.max_leverage}</span>` : ''}</span></div>`;
+  }
+  if (liq && liq.liq_price) {
+    extra += `<div class="est-row"><span>Liquidación est. del short</span><span class="est-val" style="color:${liq.warning ? 'var(--red)' : 'inherit'}">$${(+liq.liq_price).toPrecision(6)} (+${liq.liq_distance_pct}%)</span></div>`;
+    if (liq.warning) extra += `<div class="exec-warn" style="margin:6px 0">Distancia a liquidación &lt; 33%: un rally moderado puede liquidar el short. Considera menos leverage.</div>`;
+  }
+  if (ex.basis_pct != null) {
+    extra += `<div class="est-row"><span>Basis (perp − spot)</span><span class="est-val" style="color:${ex.basis_pct >= 0 ? 'var(--green)' : 'var(--red)'}">${(+ex.basis_pct).toFixed(3)}%</span></div>`;
+  }
+  if (w && !w.unchecked) {
+    extra += `<div class="est-row"><span>${ex.spot_venue === 'bsc' ? 'USDT wallet BSC' : 'USDT Spot'}</span><span class="est-val">$${w.spot_have} / necesita $${w.spot_need}</span></div>
+              <div class="est-row"><span>Margen Futuros</span><span class="est-val">$${w.futures_have} / necesita $${w.futures_need}</span></div>`;
+    if (!w.ok) extra += `<div class="exec-warn" style="margin:6px 0">${w.msg}</div>`;
+    else if ((w.transfers || []).length) extra += `<div class="exec-note">Se transferirá automáticamente: ${w.transfers.map(t => `$${t.amount} → ${t.to === 'future' ? 'Futuros' : 'Spot'}`).join(', ')}</div>`;
+  }
+  if (tw && tw.suggest) {
+    extra += `<div class="exec-note">Sugerido TWAP: ${tw.slices} tramos en ~${Math.round(tw.duration_s / 60)} min (profundidad ±0.2%: ${tw.depth_usd_0_2pct ? '$' + Math.round(tw.depth_usd_0_2pct) : 'n/d'}).</div>`;
+  }
+  if (ex.drift) extra += `<div class="exec-warn" style="margin:6px 0">${ex.drift}</div>`;
+  if (ex.partial_note) extra += `<div class="exec-warn" style="margin:6px 0">${ex.partial_note}</div>`;
 
   document.getElementById('modal-title').textContent =
     `${title} ${isDry ? '· SIMULACIÓN' : '· Ejecutado'}`;
   document.getElementById('modal-body').innerHTML = `
     ${isDry ? '<div class="exec-warn" style="margin-bottom:8px">Simulación — no se enviaron órdenes.</div>'
-            : '<div class="exec-ok">✓ Órdenes colocadas correctamente.</div>'}
+            : '<div class="exec-ok">✓ Ejecución completada.</div>'}
     <table class="exec-table">
       <thead><tr><th>Lado</th><th>Mercado</th><th>Cant.</th><th>Precio</th><th>Fee</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="5">Sin detalle de piernas</td></tr>'}</tbody>
     </table>
     <div class="est-summary">
-      ${fees != null ? `<div class="est-row"><span>Fees ${data.exec.exit_fees_usd != null ? 'de salida' : 'de entrada'}</span><span class="est-val">$${(+fees).toFixed(4)}</span></div>` : ''}
+      ${extra}
+      ${fees != null ? `<div class="est-row"><span>Fees ${ex.exit_fees_usd != null ? 'de salida' : 'de entrada'}${isDry ? ' (est.)' : ' (reales)'}</span><span class="est-val">$${(+fees).toFixed(4)}</span></div>` : ''}
       ${ids ? `<div class="est-row"><span>Órdenes</span><span style="font-size:10px">${ids}</span></div>` : ''}
     </div>
-    ${isDry && _execContinue ? `<button class="btn btn-danger" style="width:100%;margin-top:10px" onclick="(window._runExecContinue&&window._runExecContinue())">Ejecutar órdenes reales</button>` : ''}`;
+    ${isDry && _execContinue && !(w && !w.ok) ? `<button class="btn btn-danger" style="width:100%;margin-top:10px" onclick="(window._runExecContinue&&window._runExecContinue())">Ejecutar órdenes reales</button>` : ''}`;
   document.getElementById('modal').classList.add('open');
 }
 
@@ -1201,12 +1343,17 @@ function renderPositions(data) {
 
   // Capital bar
   document.getElementById('capital-bar').innerHTML = `
-    <div class="cap-item"><div class="cap-val">$${summary.total?.toFixed(0) || 0}</div><div class="cap-label">Total</div></div>
+    <div class="cap-item"><div class="cap-val">$${summary.total?.toFixed(0) || 0}</div><div class="cap-label">${summary.capital_source === 'real' ? `<span title="Saldo real sincronizado ${summary.synced_at ? new Date(summary.synced_at * 1000).toLocaleTimeString() : ''}">Total (real)</span>` : 'Total'}</div></div>
     <div class="cap-item"><div class="cap-val" style="color:var(--blue)">$${summary.used?.toFixed(0) || 0}</div><div class="cap-label">En uso</div></div>
     <div class="cap-item"><div class="cap-val" style="color:var(--green)">$${summary.available?.toFixed(0) || 0}</div><div class="cap-label">Disponible</div></div>
     <div class="cap-item"><div class="cap-val" style="color:var(--green)">$${data.total_earned?.toFixed(2) || 0}</div><div class="cap-label">Ganancia</div></div>
     <div class="cap-item"><div class="cap-val">${summary.count || 0}/${summary.max_positions || 5}</div><div class="cap-label">Pos</div></div>
     <div class="cap-item"><button class="pos-ai-btn" id="pos-ai-btn" onclick="analyzePositionsAI()"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/></svg> Analizar con IA</button></div>`;
+
+  if (summary.importable) {
+    document.getElementById('capital-bar').insertAdjacentHTML('beforeend',
+      `<div class="cap-item"><button class="pos-ai-btn" onclick="switchTab('account')" title="Hay posiciones en tu Binance que basyo no está siguiendo">${summary.importable} por importar</button></div>`);
+  }
 
   // Alerts
   document.getElementById('alerts-bar').innerHTML = alerts.map(a => `
@@ -1238,6 +1385,18 @@ function renderPositions(data) {
     if (p.fr_reversed) {
       alertHtml = '<div class="pos-alert">FR CAMBIO DE SIGNO — CERRAR</div>';
     }
+    (p.drift || []).forEach(d => {
+      alertHtml += `<div class="pos-alert pos-drift">Desajuste con Binance: ${d.msg}</div>`;
+    });
+    const real = p.real;
+    const realHtml = real ? `
+      <div class="pos-real">
+        <span title="Cantidad real del short en Binance">Short real: <strong>${_fmtQty(real.qty)}</strong></span>
+        <span>Mark: <strong>$${(+real.mark_price).toPrecision(6)}</strong></span>
+        ${real.liq_price ? `<span title="Precio de liquidación real (positionRisk)">Liq.: <strong style="color:var(--red)">$${(+real.liq_price).toPrecision(6)}</strong> (${real.mark_price ? '+' + ((real.liq_price / real.mark_price - 1) * 100).toFixed(1) + '%' : ''})</span>` : ''}
+        <span>x${real.leverage || '—'} ${real.margin_mode || ''}</span>
+        ${p.spot_qty != null ? `<span>Spot: <strong>${_fmtQty(p.spot_qty)}</strong></span>` : ''}
+      </div>` : (p.spot_qty != null ? `<div class="pos-real"><span>Spot: <strong>${_fmtQty(p.spot_qty)}</strong></span><span>Short: <strong>${_fmtQty(p.perp_qty)}</strong></span></div>` : '');
 
     const payments = (p.payments || []).filter(pay => !pay.kind);
     const lastPayments = payments.slice(-5).reverse();
@@ -1270,14 +1429,18 @@ function renderPositions(data) {
           <span class="pos-symbol">${p.symbol}</span>
           <span class="opp-mode">${mode}</span>
           <span class="opp-exchange">${exchange}</span>
-          ${p.auto_executed ? '<span class="ind-badge badge-auto" title="Posición abierta automáticamente por API">AUTO</span>' : ''}
+          ${p.source === 'auto' ? '<span class="ind-badge badge-auto" title="Posición abierta automáticamente por API">AUTO</span>' : ''}
+          ${p.source === 'imported' ? '<span class="ind-badge badge-auto" title="Importada desde tu cuenta de Binance">IMPORTADA</span>' : ''}
+          ${p.spot_venue === 'bsc' ? '<span class="ind-badge badge-onchain" title="Pierna spot en tu wallet BSC">BSC</span>' : ''}
+          ${p.earnings_source === 'real' ? '<span class="ind-badge badge-real" title="Funding real leído del income de Binance">FUNDING REAL</span>' : ''}
         </div>
         <div class="pos-header-actions">
-          ${posIsCex(p) ? `<button class="btn btn-exec" onclick="autoExecuteClose('${posId}','${p.symbol}')" title="Cerrar colocando órdenes reales">Cerrar (auto)</button>` : ''}
+          ${posIsAutoClosable(p) ? `<button class="btn btn-exec" onclick="autoExecuteClose('${posId}','${p.symbol}')" title="Cerrar colocando órdenes reales">Cerrar (auto)</button>` : ''}
           <button class="btn btn-danger" onclick="closePos('${posId}','${p.symbol}')">Cerrar</button>
         </div>
       </div>
 
+      ${realHtml}
       <div class="pos-grid">
         <div class="pos-field"><span class="label">Capital</span><span class="value">$${p.capital_used.toFixed(0)}</span></div>
         <div class="pos-field"><span class="label">Tiempo</span><span class="value">${p.elapsed_h?.toFixed(1)}h</span></div>
@@ -1865,6 +2028,15 @@ async function loadConfig() {
     const res = await fetch('/api/config');
     const cfg = await res.json();
     document.getElementById('cfg-capital').value = cfg.total_capital;
+    const real = cfg.capital_source === 'real';
+    document.getElementById('cfg-capital-wrap').style.display = real ? 'none' : '';
+    const rc = document.getElementById('cfg-capital-real');
+    rc.style.display = real ? '' : 'none';
+    if (real) {
+      const rb = cfg.real_balances || {};
+      rc.innerHTML = `Capital real (sincronizado): <strong>$${(+cfg.total_capital).toFixed(2)}</strong>
+        <span style="font-size:10px;color:var(--text-secondary)">Spot $${(+rb.spot || 0).toFixed(2)} · Futuros $${(+rb.futures || 0).toFixed(2)}${rb.wallet ? ` · Wallet BSC $${(+rb.wallet).toFixed(2)}` : ''} + capital en posiciones</span>`;
+    }
     document.getElementById('cfg-max-pos').value = cfg.max_positions;
     document.getElementById('cfg-alert-min').value = cfg.alert_minutes_before;
     document.getElementById('cfg-email-on').checked = cfg.email_enabled;
@@ -1877,13 +2049,15 @@ async function loadConfig() {
 
 async function saveConfig() {
   const data = {
-    total_capital: parseFloat(document.getElementById('cfg-capital').value),
     max_positions: parseInt(document.getElementById('cfg-max-pos').value),
     alert_minutes_before: parseInt(document.getElementById('cfg-alert-min').value),
     email_enabled: document.getElementById('cfg-email-on').checked,
     tg_bot_token: document.getElementById('cfg-tg-token').value,
     tg_chat_id: document.getElementById('cfg-tg-chatid').value,
   };
+  if (document.getElementById('cfg-capital-wrap').style.display !== 'none') {
+    data.total_capital = parseFloat(document.getElementById('cfg-capital').value);
+  }
 
   try {
     const res = await fetch('/api/config', {
@@ -2024,6 +2198,8 @@ async function loadAccount() {
     _cexKeys = new Set((data.exchange_keys || [])
       .filter(k => k.has_key).map(k => (k.exchange || '').toLowerCase()));
     _cexKeysLoaded = true;
+    loadBinancePanel();
+    loadWalletPanel();
   } catch (e) {
     console.error('loadAccount error:', e);
   }
@@ -2041,8 +2217,9 @@ async function saveExchangeKey(exchange) {
       body: JSON.stringify({ exchange, api_key: key, api_secret: secret, passphrase: pass }),
     });
     const data = await res.json();
-    showToast(data.msg, data.ok ? 'success' : 'error');
-    if (data.ok) loadAccount();
+    const warns = (data.check?.permissions?.warnings || []).join(' ');
+    showToast(data.msg + (warns ? ' — ' + warns : ''), data.ok ? (warns ? 'warning' : 'success') : 'error', warns ? 9000 : 4000);
+    if (data.ok) { loadAccount(); setTimeout(loadBinancePanel, 4000); }
   } catch (e) {
     showToast('Error al guardar keys', 'error');
   }
@@ -2062,8 +2239,9 @@ async function testExchangeKey(exchange) {
       const bal = data.usdt_balance != null ? ` · USDT: ${(+data.usdt_balance).toFixed(2)}` : '';
       statusEl.textContent = (data.ok ? '✓ ' : '✗ ') + (data.msg || '') + (data.ok ? bal : '');
     }
-    showToast(data.msg || (data.ok ? 'Conexión OK' : 'Conexión fallida'),
-      data.ok ? 'success' : 'error', 6000);
+    const warns = (data.permissions?.warnings || []).join(' ');
+    showToast((data.msg || (data.ok ? 'Conexión OK' : 'Conexión fallida')) + (warns ? ' — ' + warns : ''),
+      data.ok ? (warns ? 'warning' : 'success') : 'error', warns ? 9000 : 6000);
   } catch (e) {
     if (statusEl) { statusEl.style.color = '#ef4444'; statusEl.textContent = '✗ Error de red'; }
     showToast('Error al probar conexión', 'error');
@@ -2084,6 +2262,178 @@ async function deleteExchangeKey(exchange) {
   } catch (e) {
     showToast('Error al eliminar keys', 'error');
   }
+}
+
+// ── Binance: cuenta real (sync, permisos, importar) ──────────
+function _usd(v) { return v == null ? '—' : '$' + (+v).toLocaleString(undefined, { maximumFractionDigits: 2 }); }
+
+async function loadBinancePanel() {
+  const el = document.getElementById('binance-panel');
+  if (!el) return;
+  try {
+    const res = await fetch('/api/account/binance');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.connected) {
+      el.innerHTML = '<span style="font-size:11px;color:#555">Configura tus API keys de Binance arriba para sincronizar tu cuenta.</span>';
+      return;
+    }
+    const snap = data.snapshot;
+    const d = (snap && snap.data) || {};
+    const perm = d.permissions || {};
+    const mode = d.account_mode || {};
+    const bal = d.balances || {};
+    const imp = d.importable || [];
+    const drift = d.drift || [];
+    const cfg = await (await fetch('/api/config')).json();
+    const when = snap && snap.synced_at ? new Date(snap.synced_at * 1000).toLocaleString() : 'nunca';
+
+    let modeHtml = '';
+    if (mode.portfolio_margin) {
+      modeHtml += '<div class="exec-warn">Cuenta en Portfolio Margin: basyo no opera PM (usa endpoints distintos). Desactívalo en Binance para usar la auto-ejecución.</div>';
+    }
+    if (mode.multi_assets) {
+      modeHtml += `<div class="exec-warn">Futuros en modo Multi-Assets: solo admite margen cruzado y basyo opera en <strong>aislado</strong>.
+        <button class="btn btn-danger" style="font-size:11px;padding:3px 10px;margin-left:6px" onclick="disableMultiAssets()">Desactivar Multi-Assets</button></div>`;
+    }
+    const permRows = (perm.errors || []).map(e => `<div class="exec-warn">${e}</div>`).join('')
+      + (perm.warnings || []).map(w => `<div class="exec-note">⚠ ${w}</div>`).join('');
+
+    el.innerHTML = `
+      ${snap && !snap.ok ? `<div class="exec-warn">Último sync falló: ${snap.error || ''}</div>` : ''}
+      <div class="bn-grid">
+        <div><span class="label">USDT Spot libre</span><strong>${_usd(bal.spot_usdt_free)}</strong></div>
+        <div><span class="label">Futuros disponible</span><strong>${_usd(bal.futures_available)}</strong></div>
+        <div><span class="label">Futuros wallet</span><strong>${_usd(bal.futures_wallet)}</strong></div>
+        <div><span class="label">PnL no realizado</span><strong style="color:${(bal.futures_unrealized || 0) >= 0 ? 'var(--green)' : 'var(--red)'}">${_usd(bal.futures_unrealized)}</strong></div>
+        <div><span class="label">Modo posición</span><strong>${mode.hedge_mode == null ? '—' : (mode.hedge_mode ? 'Hedge' : 'One-way')}</strong></div>
+        <div><span class="label">Último sync</span><strong style="font-size:11px">${when}</strong></div>
+      </div>
+      ${modeHtml}${permRows}
+      <label class="exec-twap" style="margin-top:8px"><input type="checkbox" id="bn-auto-transfer" ${cfg.auto_transfer ? 'checked' : ''} onchange="saveAutoTransfer(this.checked)">
+        Transferir USDT automáticamente entre Spot y Futuros antes de abrir (requiere permiso "Universal Transfer")</label>
+      ${drift.length ? `<div style="margin-top:8px">${drift.map(x => `<div class="exec-warn">${x.symbol}: ${x.msg}</div>`).join('')}</div>` : ''}
+      ${imp.length ? `
+        <div style="margin-top:10px;font-size:12px;color:#fff">Posiciones en Binance no seguidas por basyo</div>
+        <table class="exec-table" style="margin-top:4px">
+          <thead><tr><th>Símbolo</th><th>Short</th><th>Spot</th><th>Cobertura</th><th>Lev.</th><th></th></tr></thead>
+          <tbody>${imp.map(p => `<tr>
+            <td>${p.symbol}</td><td>${_fmtQty(p.qty)}</td><td>${_fmtQty(p.spot_held)}</td>
+            <td style="color:${p.hedged_pct >= 95 ? 'var(--green)' : 'var(--red)'}">${p.hedged_pct}%</td>
+            <td>x${p.leverage || '—'} ${p.margin_mode || ''}</td>
+            <td><button class="btn btn-primary" style="font-size:10px;padding:2px 8px" onclick="importBinancePos('${p.symbol}')">Importar</button></td>
+          </tr>`).join('')}</tbody>
+        </table>` : ''}
+      <div style="margin-top:10px"><button class="btn btn-calc" style="font-size:11px;padding:4px 12px" onclick="syncBinance(this)">Sincronizar ahora</button></div>`;
+  } catch (e) {
+    console.error('loadBinancePanel error:', e);
+  }
+}
+
+async function syncBinance(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Sincronizando…'; }
+  try {
+    const res = await fetch('/api/account/binance/sync', { method: 'POST' });
+    const data = await res.json();
+    showToast(data.ok ? 'Cuenta sincronizada' : (data.msg || 'Sync falló'), data.ok ? 'success' : 'error');
+  } catch (e) { showToast('Error de red', 'error'); }
+  loadBinancePanel();
+}
+
+async function disableMultiAssets() {
+  if (!await showConfirm('Desactivar Multi-Assets en tus futuros de Binance? Pasará a Single-Asset (USDT como margen). Requiere no tener posiciones de futuros abiertas.')) return;
+  try {
+    const res = await fetch('/api/account/binance/multi_assets_off', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    });
+    const data = await res.json();
+    showToast(data.msg, data.ok ? 'success' : 'error', 7000);
+    if (data.ok) setTimeout(loadBinancePanel, 1500);
+  } catch (e) { showToast('Error de red', 'error'); }
+}
+
+async function importBinancePos(symbol) {
+  if (!await showConfirm(`Importar ${symbol} desde Binance? basyo empezará a seguirla con funding real y podrás cerrarla en automático.`)) return;
+  try {
+    const res = await fetch('/api/account/binance/import', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol }),
+    });
+    const data = await res.json();
+    showToast(data.msg, data.ok ? 'success' : 'error', 7000);
+    if (data.ok) { loadBinancePanel(); loadPositions(); }
+  } catch (e) { showToast('Error de red', 'error'); }
+}
+
+async function saveAutoTransfer(on) {
+  try {
+    await fetch('/api/account/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ auto_transfer: !!on }),
+    });
+    showToast(on ? 'Transferencia automática activada' : 'Transferencia automática desactivada', 'info');
+  } catch (e) { showToast('Error de red', 'error'); }
+}
+
+// ── Wallet BSC dedicada ──────────────────────────────────────
+async function loadWalletPanel() {
+  const el = document.getElementById('wallet-panel');
+  if (!el) return;
+  try {
+    const res = await fetch('/api/account/wallet');
+    if (!res.ok) return;
+    const data = await res.json();
+    const w = data.wallet;
+    const sd = (data.snapshot && data.snapshot.data) || {};
+    if (w) {
+      el.innerHTML = `
+        <div class="bn-grid">
+          <div><span class="label">Dirección</span><strong style="font-size:10px;word-break:break-all">${w.address}</strong></div>
+          <div><span class="label">USDT</span><strong>${_usd(sd.usdt)}</strong></div>
+          <div><span class="label">BNB (gas)</span><strong>${sd.bnb != null ? (+sd.bnb).toFixed(4) : '—'}</strong></div>
+        </div>
+        ${sd.bnb != null && sd.bnb < 0.005 ? '<div class="exec-warn">Poco BNB para gas: deposita al menos 0.01 BNB.</div>' : ''}
+        <div style="margin-top:8px"><button class="btn btn-danger" style="font-size:11px;padding:4px 12px" onclick="deleteWallet()">Quitar wallet de basyo</button></div>`;
+      return;
+    }
+    el.innerHTML = `
+      <p style="font-size:11px;color:var(--text-secondary);line-height:1.6">
+        Muchos tokens con perpetuo en Binance solo tienen spot en <strong>Binance Alpha</strong> (on-chain). Binance no ofrece API para operar Alpha,
+        así que basyo compra el spot en BSC con una <strong>wallet dedicada</strong> y abre el short en Binance.</p>
+      <div class="exec-warn" style="margin:6px 0">Usa una wallet NUEVA solo para basyo, con el saldo que estés dispuesto a arriesgar. Nunca tu wallet principal.
+        La llave se guarda cifrada y basyo firma swaps por ti. Tú depositas y retiras los fondos.</div>
+      <label style="font-size:11px">Private key (hex)<input type="password" id="wallet-pk" class="inp" placeholder="0x…"></label>
+      <label class="exec-twap"><input type="checkbox" id="wallet-accept"> Entiendo el riesgo y es una wallet dedicada</label>
+      <div style="margin-top:8px"><button class="btn btn-primary" style="font-size:11px;padding:4px 12px" onclick="saveWallet()">Guardar wallet</button></div>`;
+  } catch (e) {
+    console.error('loadWalletPanel error:', e);
+  }
+}
+
+async function saveWallet() {
+  const pk = document.getElementById('wallet-pk')?.value || '';
+  const accept = document.getElementById('wallet-accept')?.checked;
+  if (!accept) { showToast('Debes aceptar el aviso de riesgo', 'warning'); return; }
+  try {
+    const res = await fetch('/api/account/wallet', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ private_key: pk, accept_risk: true }),
+    });
+    const data = await res.json();
+    showToast(data.msg, data.ok ? 'success' : 'error');
+    if (data.ok) loadWalletPanel();
+  } catch (e) { showToast('Error de red', 'error'); }
+}
+
+async function deleteWallet() {
+  if (!await showConfirm('Quitar la wallet de basyo? Los fondos siguen en tu wallet; basyo dejará de poder operar la pierna on-chain.')) return;
+  try {
+    const res = await fetch('/api/account/wallet', { method: 'DELETE' });
+    const data = await res.json();
+    showToast(data.msg, data.ok ? 'success' : 'error');
+    loadWalletPanel();
+  } catch (e) { showToast('Error de red', 'error'); }
 }
 
 async function deleteAccount() {
@@ -2127,6 +2477,7 @@ document.addEventListener('DOMContentLoaded', () => {
   startRefresh();
   loadFilters();
   loadUserKeys();
+  resumeActiveJob();
   loadExchangeStatus();
   setInterval(loadExchangeStatus, 300000);
   document.addEventListener('keydown', (e) => {

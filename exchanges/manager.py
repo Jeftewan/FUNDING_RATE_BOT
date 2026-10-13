@@ -492,9 +492,12 @@ class ExchangeManager:
             # en vez de crear y cargar una segunda instancia completa.
             self._ensure_markets(ex)
 
+            # Solo mercados SPOT: los linear swaps también tienen quote USDT y
+            # antes marcaban has_spot=True para tokens sin spot (solo Alpha/Web3).
             spot_symbols = set()
             for sym, info in ex.markets.items():
-                if info.get("quote") == "USDT" and info.get("active", True):
+                if (info.get("spot") and info.get("quote") == "USDT"
+                        and info.get("active", True)):
                     spot_symbols.add(info.get("base", ""))
 
             self._spot_caches[exchange_name_lower] = spot_symbols
@@ -502,8 +505,11 @@ class ExchangeManager:
             return symbol in spot_symbols
 
         except Exception as e:
+            # Sin cache: el próximo scan reintenta. El gate real de ejecución es
+            # trade_executor.spot_tradeable, así que asumir disponible solo afecta
+            # el display y no hace operable un par que no lo es.
             log.warning(f"Spot check failed for {exchange_name}: {e}")
-            return True  # Assume available on error
+            return True
 
     def fetch_klines(self, symbol: str, exchange_name: str,
                      interval: str = "1d", limit: int = 16) -> list:

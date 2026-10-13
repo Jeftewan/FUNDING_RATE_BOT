@@ -53,6 +53,8 @@ class UserConfig(db.Model):
     tg_bot_token_encrypted = db.Column(db.String(512), default="")
     # CSV of exchange names to show in the opportunities list ("" = all).
     allowed_exchanges = db.Column(db.String(256), default="")
+    # Auto-transfer USDT spot↔futuros (Binance) antes de abrir, si la key lo permite.
+    auto_transfer = db.Column(db.Boolean, default=False)
     # Legacy WhatsApp columns kept for migration; unused by new code.
     wa_phone = db.Column(db.String(20), default="")
     wa_apikey_encrypted = db.Column(db.String(512), default="")
@@ -112,12 +114,88 @@ class UserPosition(db.Model):
     # True when the position was opened by placing REAL orders via the user's
     # API keys (trade_executor), vs manual bookkeeping. Drives the AUTO badge.
     auto_executed = db.Column(db.Boolean, default=False)
+    # Cantidades reales por pierna (base). El cierre auto usa SOLO estas
+    # cantidades — nunca exposure/precio — para no tocar saldo ajeno.
+    spot_qty = db.Column(db.Float, nullable=True)
+    perp_qty = db.Column(db.Float, nullable=True)
+    spot_venue = db.Column(db.String(20), default="")  # "binance" | "bsc" | ""
+    entry_basis_pct = db.Column(db.Float, nullable=True)
+    entry_mode = db.Column(db.String(30), default="")
+    source = db.Column(db.String(20), default="manual")  # manual | auto | imported
+    job_id = db.Column(db.Integer, nullable=True)
+    # "real" = earnings desde el income FUNDING_FEE del exchange (sync);
+    # "estimated" = exposure × tasa pública (scanner).
+    earnings_source = db.Column(db.String(20), default="estimated")
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at = db.Column(db.DateTime, nullable=True)
     close_reason = db.Column(db.String(50), default="")
 
 
     user = db.relationship("User", back_populates="positions")
+
+
+class UserAccountSnapshot(db.Model):
+    """Último estado real sincronizado de la cuenta de un exchange (o wallet).
+
+    Una fila por (user, exchange). data_json guarda saldos, posiciones,
+    permisos, modo de cuenta, importables y drift. Lo escribe el sync.
+    """
+    __tablename__ = "user_account_snapshots"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    exchange = db.Column(db.String(50), nullable=False)
+    data_json = db.Column(db.JSON, default=dict)
+    ok = db.Column(db.Boolean, default=True)
+    error = db.Column(db.Text, nullable=True)
+    synced_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "exchange", name="uq_snapshot_user_exchange"),
+    )
+
+
+class ExecutionJob(db.Model):
+    """Ejecución de órdenes reales en background (open/close, TWAP pareado).
+
+    Corre fuera del request (gunicorn --timeout 120) y es reconciliable tras
+    un reinicio vía clientOrderId = bsy{id}-...
+    """
+    __tablename__ = "execution_jobs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    kind = db.Column(db.String(10), nullable=False)  # open | close
+    status = db.Column(db.String(20), default="queued", index=True)
+    # queued | running | done | failed | canceled | interrupted
+    params_json = db.Column(db.JSON, default=dict)
+    progress_json = db.Column(db.JSON, default=dict)
+    result_json = db.Column(db.JSON, default=dict)
+    error = db.Column(db.Text, nullable=True)
+    position_id = db.Column(db.Integer, nullable=True)
+    cancel_requested = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class UserWallet(db.Model):
+    """Wallet on-chain DEDICADA del usuario (BSC) para la pierna spot Alpha.
+
+    La private key se guarda cifrada (Fernet, fail-closed) y nunca vuelve al
+    frontend. Riesgo acotado al saldo de esa wallet.
+    """
+    __tablename__ = "user_wallets"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    chain = db.Column(db.String(20), nullable=False, default="bsc")
+    address = db.Column(db.String(64), nullable=False)
+    pk_encrypted = db.Column(db.String(512), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "chain", name="uq_user_wallet_chain"),
+    )
 
 
 class UserHistory(db.Model):

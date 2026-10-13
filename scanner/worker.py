@@ -113,10 +113,36 @@ class ScannerWorker:
                 if not db_persist:
                     return []
                 db_positions = db_persist.get_all_active_positions()
-                return [self._db_pos_to_dict(p) for p in db_positions]
+                out = [self._db_pos_to_dict(p) for p in db_positions]
+                self._attach_real_liquidation(out)
+                return out
         except Exception as e:
             log.error(f"Failed to load positions from DB: {e}")
             return []
+
+    @staticmethod
+    def _attach_real_liquidation(positions: list):
+        """Precio de liquidación REAL (positionRisk vía sync) en posiciones Binance."""
+        uids = {p["user_id"] for p in positions if (p.get("exchange") or "").lower() == "binance"}
+        if not uids:
+            return
+        try:
+            from core.db_models import UserAccountSnapshot
+            snaps = UserAccountSnapshot.query.filter(
+                UserAccountSnapshot.user_id.in_(uids),
+                UserAccountSnapshot.exchange == "binance").all()
+        except Exception as e:
+            log.debug(f"liq snapshot load failed: {e}")
+            return
+        liq = {}
+        for sn in snaps:
+            for rp in (sn.data_json or {}).get("positions") or []:
+                if rp.get("side") == "short" and rp.get("liq_price"):
+                    liq[(sn.user_id, (rp.get("symbol") or "").upper())] = rp["liq_price"]
+        for p in positions:
+            v = liq.get((p["user_id"], (p.get("symbol") or "").upper()))
+            if v and (p.get("exchange") or "").lower() == "binance":
+                p["liq_price"] = v
 
     @staticmethod
     def _db_pos_to_dict(pos) -> dict:
@@ -146,6 +172,11 @@ class ScannerWorker:
             "exit_fees_est": getattr(pos, "exit_fees_est", 0) or 0,
             "entry_fees_real": getattr(pos, "entry_fees_real", None),
             "exit_fees_real": getattr(pos, "exit_fees_real", None),
+            "source": getattr(pos, "source", "") or "manual",
+            "earnings_source": getattr(pos, "earnings_source", "") or "estimated",
+            "spot_qty": getattr(pos, "spot_qty", None),
+            "perp_qty": getattr(pos, "perp_qty", None),
+            "spot_venue": getattr(pos, "spot_venue", "") or "",
             "payments": pos.payments_json or [],
         }
 
@@ -1024,6 +1055,9 @@ class ScannerWorker:
         for pos in positions:
             pos.pop("_earnings_updated", None)
             mode = pos.get("mode", "spot_perp")
+            # Earnings reales (income FUNDING_FEE) los escribe el AccountSyncer.
+            if pos.get("earnings_source") == "real":
+                continue
 
             if mode == "spot_perp":
                 self._update_spot_perp_earnings(pos, all_data, now)
@@ -1389,14 +1423,18 @@ class ScannerWorker:
             short_price = (short_d.get("price", 0) if is_cross else cur.get("price", 0)) or 0
             entry_price = pos.get("entry_price", 0) or 0
             leverage = pos.get("leverage", 1) or 1
+            real_liq = pos.get("liq_price")
             if entry_price > 0 and short_price > 0 and leverage > 0:
                 rise = (short_price - entry_price) / entry_price  # solo subidas importan
                 liq_consumed = leverage * rise
+                if real_liq and real_liq > entry_price:
+                    # Liquidación REAL del exchange (positionRisk) en vez de 1/leverage.
+                    liq_consumed = (short_price - entry_price) / (real_liq - entry_price)
                 if rise > 0 and liq_consumed >= LIQ_PROXIMITY_THRESHOLD:
                     key = f"LIQUIDATION_PROXIMITY_{sym}_{display_ex}_{uid}"
                     active_keys.add(key)
                     if key not in self._notified_alerts:
-                        liq_price = entry_price * (1 + 1.0 / leverage)
+                        liq_price = real_liq or entry_price * (1 + 1.0 / leverage)
                         alerts.append({
                             "type": "LIQUIDATION_PROXIMITY", "severity": "CRITICAL",
                             "position_idx": i, "symbol": sym, "exchange": display_ex,

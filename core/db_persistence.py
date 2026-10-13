@@ -76,8 +76,21 @@ class DBPersistence:
         history = UserHistory.query.filter_by(user_id=user_id).order_by(
             UserHistory.closed_at.desc()).limit(500).all()
 
+        # Capital REAL: si hay snapshot sincronizado de Binance (y/o wallet BSC),
+        # total = USDT libre (spot + futuros disponible + wallet) + capital en uso.
+        # Sin cuenta conectada se conserva el capital manual (otros exchanges).
+        used = sum(p.capital_used or 0 for p in positions)
+        real = self.real_free_usdt(user_id)
+        if real is not None:
+            total_capital = round(real["free_total"] + used, 2)
+        else:
+            total_capital = config.total_capital if config else 1000
+
         state = {
-            "total_capital": config.total_capital if config else 1000,
+            "total_capital": total_capital,
+            "capital_source": "real" if real is not None else "manual",
+            "real_balances": real,
+            "auto_transfer": bool(getattr(config, "auto_transfer", False)) if config else False,
             "min_volume": config.min_volume if config else 1000000,
             "min_apr": config.min_apr if config else 10,
             "min_score": config.min_score if config else 40,
@@ -108,7 +121,7 @@ class DBPersistence:
         for key in ("total_capital", "min_volume", "min_apr",
                      "min_score", "min_stability_days", "max_positions",
                      "alert_minutes_before", "email_enabled", "tg_chat_id",
-                     "allowed_exchanges"):
+                     "allowed_exchanges", "auto_transfer"):
             if key in data:
                 setattr(config, key, data[key])
 
@@ -159,6 +172,69 @@ class DBPersistence:
             "passphrase": decrypt_value(row.passphrase_encrypted),
         }
 
+    # ── Snapshots de cuenta real (sync) ─────────────────────────
+
+    def get_account_snapshot(self, user_id: int, exchange: str):
+        """Devuelve {data, ok, error, synced_at} o None."""
+        from core.db_models import UserAccountSnapshot
+        row = UserAccountSnapshot.query.filter_by(user_id=user_id, exchange=exchange).first()
+        if not row:
+            return None
+        return {
+            "data": row.data_json or {},
+            "ok": bool(row.ok),
+            "error": row.error,
+            "synced_at": row.synced_at.timestamp() if row.synced_at else None,
+        }
+
+    def save_account_snapshot(self, user_id: int, exchange: str, data: dict,
+                              ok: bool = True, error: str = None):
+        from core.database import db
+        from core.db_models import UserAccountSnapshot
+        row = UserAccountSnapshot.query.filter_by(user_id=user_id, exchange=exchange).first()
+        if not row:
+            row = UserAccountSnapshot(user_id=user_id, exchange=exchange)
+            db.session.add(row)
+        if ok or not row.data_json:
+            row.data_json = data or {}
+        row.ok = ok
+        row.error = error
+        row.synced_at = datetime.now(timezone.utc)
+        db.session.commit()
+
+    def real_free_usdt(self, user_id: int):
+        """USDT libre real por venue desde los snapshots, o None si no hay cuenta conectada.
+
+        {spot, futures, wallet, free_total}. Solo cuenta snapshots exitosos.
+        """
+        snap = self.get_account_snapshot(user_id, "binance")
+        wsnap = self.get_account_snapshot(user_id, "bsc_wallet")
+        if not (snap and snap["ok"]) and not (wsnap and wsnap["ok"]):
+            return None
+        bal = (snap["data"].get("balances") or {}) if snap and snap["ok"] else {}
+        wbal = (wsnap["data"] or {}) if wsnap and wsnap["ok"] else {}
+        spot = float(bal.get("spot_usdt_free") or 0)
+        fut = float(bal.get("futures_available") or 0)
+        wallet = float(wbal.get("usdt") or 0)
+        return {"spot": round(spot, 4), "futures": round(fut, 4), "wallet": round(wallet, 4),
+                "free_total": round(spot + fut + wallet, 4),
+                "synced_at": (snap or wsnap or {}).get("synced_at")}
+
+    def users_with_exchange_keys(self, exchange_name: str) -> list:
+        from core.db_models import UserExchangeKey
+        rows = UserExchangeKey.query.filter(
+            UserExchangeKey.exchange_name.ilike(exchange_name)).all()
+        return [r.user_id for r in rows if r.api_key_encrypted]
+
+    def load_user_wallet(self, user_id: int, chain: str = "bsc"):
+        """{address, private_key} descifrado, o None. Solo para el executor."""
+        from core.db_models import UserWallet
+        from core.encryption import decrypt_value
+        row = UserWallet.query.filter_by(user_id=user_id, chain=chain).first()
+        if not row:
+            return None
+        return {"address": row.address, "private_key": decrypt_value(row.pk_encrypted)}
+
     def save_position(self, user_id: int, pos_dict: dict) -> int:
         """Create a new position in DB. Returns position ID."""
         from core.database import db
@@ -200,6 +276,14 @@ class DBPersistence:
             exit_fees_real=pos_dict.get("exit_fees_real"),
             auto_executed=bool(pos_dict.get("auto_executed", False)),
             payments_json=pos_dict.get("payments_json") or [],
+            spot_qty=pos_dict.get("spot_qty"),
+            perp_qty=pos_dict.get("perp_qty"),
+            spot_venue=pos_dict.get("spot_venue", ""),
+            entry_basis_pct=pos_dict.get("entry_basis_pct"),
+            entry_mode=pos_dict.get("entry_mode", ""),
+            source=pos_dict.get("source") or ("auto" if pos_dict.get("auto_executed") else "manual"),
+            job_id=pos_dict.get("job_id"),
+            earnings_source=pos_dict.get("earnings_source", "estimated"),
         )
         db.session.add(pos)
         db.session.commit()
@@ -317,6 +401,13 @@ class DBPersistence:
             "entry_fees_real": pos.entry_fees_real,
             "exit_fees_real": pos.exit_fees_real,
             "auto_executed": bool(getattr(pos, "auto_executed", False)),
+            "spot_qty": getattr(pos, "spot_qty", None),
+            "perp_qty": getattr(pos, "perp_qty", None),
+            "spot_venue": getattr(pos, "spot_venue", "") or "",
+            "entry_basis_pct": getattr(pos, "entry_basis_pct", None),
+            "entry_mode": getattr(pos, "entry_mode", "") or "",
+            "source": getattr(pos, "source", "") or "manual",
+            "earnings_source": getattr(pos, "earnings_source", "") or "estimated",
             "payments": pos.payments_json or [],
         }
 

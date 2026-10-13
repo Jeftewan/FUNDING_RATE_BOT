@@ -118,7 +118,8 @@
     <div class="cfg-section">
       <h3>General</h3>
       <div class="cfg-grid">
-        <label>Capital USD<input type="number" id="cfg-capital" class="inp"></label>
+        <label id="cfg-capital-wrap">Capital USD<input type="number" id="cfg-capital" class="inp"></label>
+        <div id="cfg-capital-real" class="cfg-real-capital" style="display:none"></div>
         <label>Max posiciones<input type="number" id="cfg-max-pos" class="inp"></label>
         <label>Alerta (min antes)<input type="number" id="cfg-alert-min" class="inp"></label>
       </div>
@@ -159,6 +160,15 @@
       <h3>API Keys</h3>
       <p style="font-size:10px;color:#555;margin-bottom:10px">Tus keys se almacenan encriptadas.</p>
       <div id="exchange-keys-list"></div>
+    </div>
+    <div class="cfg-section">
+      <h3>Binance — cuenta real</h3>
+      <p style="font-size:10px;color:#555;margin-bottom:10px">Saldos, posiciones y funding reales sincronizados cada 5 min con tus API keys (sin permiso de retiro).</p>
+      <div id="binance-panel"><span style="font-size:11px;color:#555">Configura tus API keys de Binance.</span></div>
+    </div>
+    <div class="cfg-section">
+      <h3>Wallet BSC (spot on-chain para tokens Alpha)</h3>
+      <div id="wallet-panel"></div>
     </div>
     <div class="cfg-section">
       <h3 style="color:#ef4444">Zona peligrosa</h3>
