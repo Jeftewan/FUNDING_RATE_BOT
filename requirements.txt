@@ -2,6 +2,9 @@ flask
 gunicorn==26.2.0
 requests
 ccxt==4.5.85
+# Firma de swaps en la wallet BSC dedicada (pierna spot on-chain de tokens Alpha).
+# Sin web3.py (RAM): JSON-RPC vía requests.
+eth-account==0.14.0
 flask-sqlalchemy==3.1.1
 # SQLAlchemy 2.1 cambió el driver por defecto de postgresql:// a psycopg (v3);
 # core/database.py fuerza psycopg2, y el pin evita sorpresas de API.

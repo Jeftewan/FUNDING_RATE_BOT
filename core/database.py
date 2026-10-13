@@ -105,6 +105,17 @@ def _run_migrations(db):
         # validar predicciones previas contra el resultado real (ml_train.py).
         "ALTER TABLE score_snapshots ADD COLUMN IF NOT EXISTS model_prediction FLOAT",
         "ALTER TABLE score_snapshots ADD COLUMN IF NOT EXISTS model_version VARCHAR(50)",
+        # Binance live: cantidades reales por pierna, origen y earnings reales.
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS spot_qty FLOAT",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS perp_qty FLOAT",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS spot_venue VARCHAR(20) DEFAULT ''",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS entry_basis_pct FLOAT",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS entry_mode VARCHAR(30) DEFAULT ''",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'manual'",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS job_id INTEGER",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS earnings_source VARCHAR(20) DEFAULT 'estimated'",
+        "UPDATE user_positions SET source = 'auto' WHERE auto_executed = TRUE AND (source IS NULL OR source = 'manual')",
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS auto_transfer BOOLEAN DEFAULT FALSE",
     ]
     for sql in migrations:
         try:

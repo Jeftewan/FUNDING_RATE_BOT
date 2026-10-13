@@ -160,10 +160,22 @@ if db_enabled:
     email_notifier._dedup_check = _dedup_check
     email_notifier._dedup_record = _dedup_record
 
+# ── Cuentas reales + ejecución en background (requieren DB) ────
+# Sync de saldos/posiciones/funding real (Binance + wallet BSC) y runner de
+# jobs de órdenes reales. Arrancan con el primer request (como el scanner).
+account_syncer = job_runner = None
+if db_enabled:
+    from execution.account_sync import AccountSyncer
+    from execution.jobs import JobRunner
+
+    account_syncer = AccountSyncer(app, scanner_worker)
+    job_runner = JobRunner(app, scanner_worker, syncer=account_syncer)
+
 # ── API Routes ────────────────────────────────────────────────
 from api.routes import init_routes
 init_routes(app, state_manager, scanner_worker, Config,
-            defi_manager=defi_manager, db_enabled=db_enabled)
+            defi_manager=defi_manager, db_enabled=db_enabled,
+            job_runner=job_runner, account_syncer=account_syncer)
 
 log.info(
     f"Bot v10.0 [SaaS]: "

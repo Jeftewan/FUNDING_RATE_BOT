@@ -45,6 +45,14 @@ analysis/
 exchanges/
   manager.py            # ExchangeManager CEX (CCXT), historial, spot check
   defi_manager.py       # DefiExchangeManager, historial desde snapshots DB
+  trade_executor.py     # ÚNICA capa que coloca órdenes CEX (spot_perp pareado, TWAP, cross, reconcile)
+  binance_account.py    # Cuenta Binance del usuario: permisos, modo, saldos, posiciones, income
+  onchain_bsc.py        # Pierna spot on-chain BSC (wallet dedicada, tokens Alpha)
+  dex_aggregator.py     # Binance Web3 API (HMAC) / 0x para swaps BSC
+execution/
+  jobs.py               # Jobs de ejecución real en background + reconciliación
+  account_sync.py       # Sync periódico de cuentas reales (snapshots, funding real, drift)
+tests/                  # pytest: executor, jobs (SQLite), on-chain (mocks)
 core/
   db_models.py          # Modelos SQLAlchemy (8 tablas)
   db_persistence.py     # CRUD sobre los modelos
@@ -82,9 +90,12 @@ frontend/               # Servicio Railway "web" (rootDirectory=/frontend)
 |-------|-----------|
 | `users` | Cuentas de usuario (email, password_hash, terms_accepted_at) |
 | `user_configs` | Config por usuario (capital, thresholds, Telegram encrypted) |
-| `user_positions` | Posiciones abiertas con earnings y historial de pagos |
+| `user_positions` | Posiciones abiertas con earnings y historial de pagos; `spot_qty`/`perp_qty`, `spot_venue`, `source` (manual/auto/imported), `earnings_source` (estimated/real), `job_id` |
 | `user_history` | Posiciones cerradas para PnL histórico (columna `notes` para auditoría de ediciones manuales) |
-| `user_exchange_keys` | API keys de exchanges cifradas (infraestructura lista, no conectada a trading) |
+| `user_exchange_keys` | API keys de exchanges cifradas (Fernet, **fail-closed**); usadas por sync y auto-ejecución |
+| `user_account_snapshots` | Último estado real por (user, exchange): `binance` (saldos, posiciones, permisos, modo, importables, drift) y `bsc_wallet` |
+| `execution_jobs` | Jobs de órdenes reales en background (open/close, TWAP), progreso y resultado |
+| `user_wallets` | Wallet BSC dedicada del usuario (address + private key cifrada) |
 | `scan_cache` | Último resultado del scan (opportunities_json, defi_json) |
 | `funding_rate_snapshots` | 90 días de tasas históricas, dedup por (symbol, exchange, funding_ts) |
 | `score_snapshots` | Evolución del score por oportunidad (ventana rolling 30 entradas) |
@@ -329,42 +340,50 @@ UI: `editPosEarnings(posId)` / `editHistEarnings(histId)` en `frontend/site/stat
 
 ---
 
-## Auto-ejecución de órdenes (CEX)
+## Binance en vivo: sync de cuenta + auto-ejecución (CEX y spot on-chain BSC)
 
-Coloca y ejecuta las órdenes reales de ambas piernas usando las API keys del usuario. **Trigger por botón** (semi-automático), no autónomo: el scanner sigue siendo event-driven.
+Coloca y ejecuta las órdenes reales de ambas piernas con las API keys del usuario, y sincroniza saldos, posiciones y funding **reales**. **Trigger por botón** (semi-automático); la ejecución corre en **jobs en background**. Margen **aislado** en todas las posiciones; el **leverage lo elige el usuario** por posición (basyo solo valida el máximo del símbolo).
 
-**Alcance: solo CEX** (binance/bybit/okx/bitget). DeFi y spot on-chain (Binance Alpha, Bitget Onchain, Web3 wallets) **no** son operables por CCXT → siguen en flujo manual.
+### Hallazgos de la documentación de Binance (oct-2026)
+- **Alpha API = solo market data** (`/bapi/defi/v1/public/alpha-trade/*`, token list pública). No existe API para operar Alpha ni la Web3 Wallet MPC del usuario; ccxt no soporta Alpha.
+- **Binance Wallet Web3 API** (`https://web3.binance.com/build`): agregador DEX para wallets self-custody (quote → swap → firmar local → broadcast). HMAC base64 sobre `ts + METHOD + "/build" + path?query + body`. ⚠ **Bloquea por región del servidor** (US, CA, NL, GB…, `40301`): con el bot en Railway US/Ámsterdam no funciona → mover el servicio a **asia-southeast (Singapur)** o usar `DEX_AGGREGATOR=0x`. El SDK Python v8.0.0 manda los POST como query (bug); aquí se usa body JSON.
+- Multi-Assets solo admite cruzado; Portfolio Margin usa `papi` (no soportado → bloqueado con guía).
+- ccxt dejó el sandbox de futuros de Binance: `TRADE_SANDBOX=1` usa **demo trading** (`enable_demo_trading`), sin sapi.
 
-### Módulo `exchanges/trade_executor.py`
-Única capa que coloca órdenes reales, **aislada** del `ExchangeManager` global de solo-lectura. Cada llamada construye un cliente CCXT autenticado fresco desde las keys *del usuario* (`build_user_client`, importación perezosa de ccxt).
-- `test_connection(ex, creds)` → `fetch_balance` (botón "Probar conexión").
-- `spot_tradeable(ex, creds, symbol)` → gate: el símbolo debe ser mercado **spot centralizado** operable (`spot=True, active`). Excluye Alpha/Onchain/Web3.
-- `execute_open(creds_by_exchange, opp, capital, leverage, dry_run, allow_market_fallback=True)` — metodología de `build_entry_strategy`:
-  - `spot_perp`: **Limit BUY spot a precio FAVORABLE → Market SHORT perp** al llenar. El límite se coloca en `fav_px = min(spot_bid, perp_bid·(1−EPS))` (basis ≥ 0, maker). Si no llena en 60s, **fallback a mercado SOLO con guardia de basis**: compra a mercado únicamente si `spot_ask ≤ perp_bid` (basis aún a favor); si no, **aborta** (`allow_market_fallback=False` siempre aborta). El resultado expone `entry_mode` (`limit_favorable`/`market_fallback`), `basis_pct`, `limit_px`. Si el perp falla, **unwind** del spot a market.
-  - `cross_exchange`: **Limit en ambas piernas (90s)**; si solo una llena, cancela la otra + **unwind** a market.
-- `execute_close(...)` — revierte ambas piernas a market (`reduceOnly` en perps).
-- `dry_run=True` → simula sin enviar (alimenta el modo "Simular" de la UI). Sizing/precisión vía `amount_to_precision` + `contractSize` (OKX/Bitget usan contratos).
-- Env `TRADE_SANDBOX=1` → `set_sandbox_mode(True)` en todos los clientes (testnet).
+### Metodología (`exchanges/trade_executor.py`)
+- **spot_perp pareado, delta-neutral en todo momento**: pierna spot **maker** (`LIMIT_MAKER` al mejor bid, re-precio solo si el libro se mueve) y **perp taker cubierto por cada fill** (`PerpHedger`) sobre la cantidad **neta** recibida (descuenta comisión en base; BNB no reduce la base). Taker fallback solo si `spot_ask ≤ perp_bid·(1+0.05%)` (apertura); en cierre el taker es incondicional.
+- **TWAP pareado propio** (`twap={slices, duration_s}`): N tramos con la misma rutina; nunca dos TWAP nativos independientes (se desincronizan). Sugerencia automática en la simulación si nocional > 25% de la profundidad ±0.2% o > 5.000 USDT.
+- **Fees reales** desde `fetch_my_trades(orderId)` convertidas a USD (USDT, BNB y base a mercado).
+- **Cierre por cantidades persistidas** (`spot_qty`/`perp_qty`), nunca `exposure/precio`; capado por saldo libre y short real. Posiciones sin cantidades → no se cierran en auto.
+- **Preflight Binance**: Multi-Assets → `code=MULTI_ASSETS`; leverage > máximo (`leverageBracket`) → error; aislado + leverage verificados con `/fapi/v1/symbolConfig` (funciona sin posición). Hedge mode: ccxt traduce `hedged` → `positionSide`.
+- **Idempotencia**: `clientOrderId = bsy{job}-{leg}{n}`. `reconcile_spot_perp` recalcula lo ejecutado desde el exchange y re-cubre el perp hasta igualar el spot.
+- `cross_exchange`: límites en ambas piernas con polling **conjunto**; el exceso de la pierna más llena se deshace (posición = cantidad emparejada).
+- Liquidación estimada short aislado: `entry·(1 + 1/L − mmr)`; advertencia (no bloqueo) si distancia < 33%.
 
-### Rutas (`api/routes.py`)
-`/api/account/exchange_keys/test`, `/api/execute_open`, `/api/execute_close`. `execute_open` reusa el lookup de oportunidad y la validación de capital de `open_position` (bookkeeping), luego **sobreescribe con fills reales** (`entry_price`, `entry_fees_real`), marca `auto_executed=True` y audita `order_ids` en `payments_json` (`kind:"auto_open"`). Fallo con pierna llena → alerta crítica `EXEC_FAILURE` vía `_dispatch_alerts_per_user` (`_exec_alert`).
+### Jobs en background (`execution/jobs.py`, tabla `execution_jobs`)
+`POST /api/execute_open|close` (no dry-run) crea un job y devuelve `job_id`; un thread por job ejecuta y guarda la posición con fills reales (`source='auto'`, `job_id`, `spot_qty`, `perp_qty`, `spot_venue`, `entry_basis_pct`, `entry_mode`). Máx. 1 job activo por usuario; cancelable (`/api/exec/jobs/<id>/cancel` → termina cubriendo). Al arrancar, los jobs `running` se **reconcilian** (CEX) y quedan `interrupted` con alerta; no se reanuda un TWAP a ciegas. Fallos con piernas llenas → alerta `EXEC_FAILURE`; éxito → `EXEC_DONE`.
 
-### Persistencia
-- `DBPersistence.load_user_exchange_keys(user_id, exchange)` descifra las keys (Fernet) para el executor.
-- Columna nueva `user_positions.auto_executed BOOLEAN` (migración en `core/database.py`, modelo en `db_models.py`, expuesta en `_pos_to_dict`).
+### Sync de cuenta real (`execution/account_sync.py`, `exchanges/binance_account.py`)
+Cada 5 min (y bajo demanda) por usuario con keys de Binance → `user_account_snapshots`:
+- permisos de la key (`apiRestrictions`): **se rechazan keys con retiros habilitados** al guardar; avisos si falta IP whitelist/permisos.
+- modo de cuenta (PM, Multi-Assets, hedge), saldos spot/USDⓈ-M, posiciones con **liquidación real**, **importables** y **drift** (alerta `POSITION_DRIFT`, dedup diaria).
+- **Funding real**: posiciones Binance `auto`/`imported` toman `earned_real` del income `FUNDING_FEE` (`earnings_source='real'`); el monitor deja de estimarlas.
+- **Capital real**: con snapshot, `total = USDT libre (spot + futuros disponible + wallet BSC) + capital en posiciones`; el campo manual se oculta/ignora (sin cuenta conectada sigue el manual).
+- Una posición basyo por símbolo en Binance. Transfer automático spot↔futuros opcional (`user_configs.auto_transfer`, requiere "Universal Transfer").
 
-### Frontend (`frontend/site/static/app.js`, `style.css`, `frontend/site/app.html`)
-- Opp card: botón **"Ejecutar"** (`.btn-exec`) junto a "Entrar". Deshabilitado con tooltip si: DeFi/no-CEX, `has_spot=false`, o faltan keys (`_cexKeys` cargado vía `loadUserKeys`).
-- Positions: botón **"Cerrar (auto)"** (solo si `posIsCex`) + badge **AUTO**.
-- Modal de confirmación de riesgo (`showExecConfirm`) con 3 acciones: Cancelar / **Simular** (dry-run) / **Ejecutar órdenes reales**. Modal de resultado (`showExecResult`) con tabla de fills; desde una simulación se puede promover a ejecución real.
-- Cuenta: botón **"Probar conexión"** por exchange (`testExchangeKey`).
+### Spot on-chain BSC (`exchanges/onchain_bsc.py`, `exchanges/dex_aggregator.py`)
+Para tokens cuyo spot solo existe en Alpha (detectado con la token list pública, chainId 56, liquidez ≥ $200k). Wallet **dedicada** del usuario (`user_wallets`, private key cifrada fail-closed). `BscSpotLeg`: quote → guardas (impacto ≤ 1%, precio ≤ perp_bid·1.005) → approve acotado → swap (tx tipo 2/legacy firmada con eth-account) → broadcast (MEV protection) → receipt → cantidad real = delta de `balanceOf` → hedge perp. Flag `ONCHAIN_ENABLED=1`. Reconciliación automática tras reinicio: **no** (on-chain queda `interrupted` para revisión).
 
-### Precondiciones / límites v1
-- Fondos ya en la wallet correcta (spot wallet para la pierna spot, futures para márgenes). **Sin auto-transferencia entre wallets.**
-- **Margen aislado + leverage exacto GARANTIZADOS (verify-and-abort).** Antes de colocar la primera orden, `_ensure_margin_and_leverage(client, sym, leverage, side)` fija `set_margin_mode("isolated")` + `set_leverage` con params por exchange (Bitget: `marginCoin=USDT`/`productType=USDT-FUTURES`/`holdSide` en hedge; OKX: `marginMode=isolated`/`posSide` en hedge) y **verifica por read-back** (`fetch_positions`). Si no se puede confirmar aislado + leverage pedido, **aborta sin tocar el spot** con mensaje accionable. Reemplaza el viejo best-effort que dejaba abrir en cruzado/leverage default (caso real: Bitget cruzado x10). Errores idempotentes "no change" se tratan como éxito.
-- Slippage real asumido (ya estimado por el sistema).
+### Rutas
+`/api/execute_open` (`{opportunity_id, capital, leverage, dry_run?, twap?, allow_market_fallback?}`), `/api/execute_close` (`{position_id, dry_run?, twap?}`, solo `auto`/`imported`), `/api/exec/jobs/<id>`, `/api/exec/jobs/active`, `/api/exec/jobs/<id>/cancel`, `/api/account/binance` (snapshot), `/api/account/binance/sync`, `/api/account/binance/multi_assets_off` (`{confirm:true}`), `/api/account/binance/import` (`{symbol}`), `/api/account/settings` (`{auto_transfer}`), `/api/account/wallet` (GET/POST `{private_key, accept_risk:true}`/DELETE).
 
----
+### Frontend
+Modal de ejecución con TWAP, simulación con leverage/liquidación/basis/fondos por wallet/sugerencia TWAP, progreso del job en vivo (reanuda al recargar). Posiciones: badges AUTO/IMPORTADA/BSC/FUNDING REAL, short/liq real, drift. Cuenta: panel Binance (saldos, modo, desactivar Multi-Assets, importar, transfer automático, sincronizar) y wallet BSC.
+
+### Verificación
+- `pytest tests/` (exchange y agregador simulados + jobs sobre SQLite).
+- `python scripts/binance_sync_check.py` — chequeo **solo lectura** con `BINANCE_USER_API_KEY/SECRET` en `.env`.
+- Dinero real: lo ejecuta el usuario desde la UI con montos mínimos.
 
 ## Notificaciones Telegram
 
@@ -475,7 +494,13 @@ BITGET_API_KEY / BITGET_API_SECRET
 COINGLASS_API_KEY     # Datos adicionales de mercado
 ENABLED_EXCHANGES     # Default: binance,bybit,okx,bitget
 ARBITRAGE_MODES       # Default: spot_perp,cross_exchange
-TRADE_SANDBOX         # =1 → auto-ejecución usa testnet CCXT (set_sandbox_mode)
+TRADE_SANDBOX         # =1 → auto-ejecución en test (Binance: demo trading; resto: set_sandbox_mode)
+ONCHAIN_ENABLED       # =1 → habilita la pierna spot on-chain BSC (tokens solo-Alpha)
+DEX_AGGREGATOR        # binance (default, Web3 API) | 0x
+BINANCE_WEB3_API_KEY / BINANCE_WEB3_API_SECRET   # web3.binance.com/en/dev-portal (permisos Trading + Transaction)
+ZEROX_API_KEY         # si DEX_AGGREGATOR=0x
+BSC_RPC_URL           # default https://bsc-dataseed.bnbchain.org
+BSC_MEV_PROTECTION    # default 1 (broadcast por mempool privada)
 ```
 
 > Nota: las API keys globales de CEX (arriba) son para datos públicos del scanner. La **auto-ejecución** usa las keys *por usuario* guardadas en `user_exchange_keys` (tab Cuenta), no estas.
@@ -585,15 +610,17 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 
 ### Funcionalidad incompleta (infraestructura lista, falta conectar)
 
-- **Auto-trading CEX**: ✅ implementado (ver sección "Auto-ejecución de órdenes" abajo). Botón "Ejecutar" por oportunidad + "Cerrar (auto)" por posición colocan órdenes reales vía las API keys del usuario. **Pendiente**: auto-trading DeFi (Hyperliquid/GMX/Aster/Lighter/Extended) y spot on-chain (Binance Alpha, Bitget Onchain) — esos no exponen API de órdenes usable por CCXT y siguen en flujo manual.
+- **Auto-trading CEX**: ✅ implementado (ver sección "Binance en vivo"). Botón "Ejecutar" por oportunidad + "Cerrar (auto)" por posición colocan órdenes reales vía las API keys del usuario. Spot de tokens solo-Alpha vía wallet BSC dedicada (`ONCHAIN_ENABLED`). **Pendiente**: auto-trading DeFi (Hyperliquid/GMX/Aster/Lighter/Extended) y Bitget Onchain — siguen en flujo manual.
 - **Coinglass**: cliente existe en `coinglass/client.py`, no integrado en el flujo principal.
 
 ### Mejoras identificadas
 
+- **Binance en vivo — pendientes**: (1) Web3 API bloquea regiones US/NL/GB → mover el servicio del bot a Railway asia-southeast o usar 0x (validar con un swap mínimo); (2) actualizar Términos/Privacidad (custodia de la wallet dedicada) en el source React de la landing; (3) reconciliación automática de jobs on-chain interrumpidos; (4) Portfolio Margin (`papi`) no soportado; (5) IP fija de salida de Railway para whitelist de keys; (6) `cross_exchange` sigue con límites simples (sin TWAP).
+
 - **DeFi history fiabilidad**: `fetch_funding_history` en `defi_manager.py` depende de que los snapshots existan en DB. En deploys nuevos o símbolos nuevos, thin-history (<5 muestras) da scoring neutro — correcto pero subóptimo para toma de decisiones. Nota: GMX, Aster, Lighter y Extended reportan `volume_24h=0`; el gate de volumen del scan trata ese `0` (desconocido) como **pasa**, así que estos pares ya no quedan excluidos (el filtro de volumen real es de display, client-side).
 - **Scoring DeFi bajo (pendiente)**: los modos `cross_exchange`/`defi` puntúan bajo de forma estructural — consistency (46) + stability (21) = 67% del score se calculan sobre el *diferencial* (`period_diffs`), que cambia de signo mucho más que una tasa única → streak/consistencia bajos, CV alto. A esto se suma thin-history y `volume_24h=0`. **Pendiente** (otro plan): `defi_opportunity_score()` separado con umbrales heurísticos, tras verificar cuántos snapshots/muestras hay acumulados.
 - **Alertas sin posiciones activas**: el scanner solo corre cuando hay posiciones abiertas o se fuerza manualmente. Si no hay posiciones, las oportunidades excepcionales no se escanean automáticamente.
-- **Tests**: no hay suite de tests automatizados. El proyecto depende del syntax check via `python -c "import ast; ast.parse(...)"`.
+- **Tests**: suite pytest solo para ejecución/sync (`tests/`); el resto depende del syntax check via `python -c "import ast; ast.parse(...)"`.
 - **Rate limits DeFi**: los adaptadores DeFi no tienen retry exponencial ante errores HTTP 429/503.
 - **Legacy columns**: `user_configs` tiene `wa_phone`, `wa_apikey_encrypted`, `scan_interval` — columnas de versiones anteriores. No se usan, pueden limpiarse con una migración DROP COLUMN cuando sea conveniente.
 

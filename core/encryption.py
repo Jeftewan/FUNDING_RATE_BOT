@@ -26,12 +26,22 @@ def _get_fernet():
         return None
 
 
-def encrypt_value(plaintext: str) -> str:
-    """Encrypt a string value. Returns ciphertext or plaintext if no key."""
+class EncryptionUnavailable(RuntimeError):
+    """FERNET_KEY ausente/inválida al cifrar un secreto que no puede ir en claro."""
+
+
+def encrypt_value(plaintext: str, required: bool = False) -> str:
+    """Encrypt a string value. Returns ciphertext or plaintext if no key.
+
+    required=True (API keys de trading, private keys de wallet): fail-closed —
+    lanza EncryptionUnavailable en vez de guardar el secreto en claro.
+    """
     if not plaintext:
         return ""
     f = _get_fernet()
     if f is None:
+        if required:
+            raise EncryptionUnavailable("FERNET_KEY no configurada: no se guardan secretos en claro")
         return plaintext
     return f.encrypt(plaintext.encode()).decode()
 

@@ -201,6 +201,10 @@ class EmailNotifier:
             lines.append("\n\U0001f504 *Alternativa superior disponible*")
         elif alert_type == "POSITION_CLOSED":
             lines.append("\n\U0001f7e2 Posicion cerrada")
+        elif alert_type == "POSITION_DRIFT":
+            lines.append("\n\U0001f7e0 *La posicion en el exchange no coincide con basyo — revisar*")
+        elif alert_type == "EXEC_DONE":
+            lines.append("\n\U0001f7e2 Ejecucion completada")
 
         return "\n".join(lines)
 
