@@ -415,7 +415,13 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 earned = pos.get("earned_real", 0)
                 from portfolio.manager import position_fees as _pf
                 entry_fee_val, exit_fee_val, est_fees, fees_is_real = _pf(pos)
-                net_earned = earned - est_fees
+                # + PnL de precio ya realizado por cierres parciales (fills reales).
+                net_earned = earned - est_fees + float(pos.get("realized_price_pnl") or 0)
+                # Basis capturado al entrar (perp vendido sobre el spot comprado), USD.
+                entry_basis_usd = None
+                if pos.get("spot_entry_price") and pos.get("entry_price") and pos.get("perp_qty"):
+                    entry_basis_usd = round((float(pos["entry_price"]) - float(pos["spot_entry_price"]))
+                                            * float(pos["perp_qty"]), 6)
 
                 fr_reversed = ((pos["entry_fr"] > 0 and cfr < 0) or
                                (pos["entry_fr"] < 0 and cfr > 0))
@@ -445,6 +451,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "exit_fees_effective": exit_fee_val,
                     "fees_is_real": fees_is_real,
                     "net_earned": net_earned,
+                    "entry_basis_usd": entry_basis_usd,
                     "current_apr": current_apr,
                     "fr_reversed": fr_reversed,
                     "mins_next": mins_next,
@@ -1154,7 +1161,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         if not updated:
             return jsonify({"ok": False, "msg": "Nada que actualizar"}), 400
 
-        hist.net_earned = (hist.earned or 0) - (hist.fees or 0)
+        # Neto real: funding + PnL de precio (fills reales, si existe) − fees.
+        hist.net_earned = (hist.earned or 0) + (hist.price_pnl or 0) - (hist.fees or 0)
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         note_line = f"[{stamp}] manual edit: {', '.join(updated)}"
         hist.notes = (hist.notes + "\n" + note_line) if hist.notes else note_line

@@ -325,6 +325,16 @@ class BscSpotLeg:
         q = self.agg.quote(self.token["address"], USDT, to_wei(base_amt, dec), self.address)
         return from_wei(int(q["to_amount"]), USDT_DECIMALS) / base_amt
 
+    def mid_price(self, ref_px: float, usd: float = 25.0):
+        """Precio justo on-chain: mid de cotizaciones chicas de compra y venta
+        (la comisión del pool se cancela; sin impacto). Referencia de slippage."""
+        if not ref_px:
+            return None
+        base = usd / ref_px
+        buy = self.quote_price(base, "buy", ref_px=ref_px)
+        sell = self.quote_price(base, "sell")
+        return (buy + sell) / 2 if buy and sell else (buy or sell or None)
+
     def trade(self, side, target_base, on_fill, window, taker_ok):
         if target_base <= 0 or self.ctx.cancelled():
             return 0.0

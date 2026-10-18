@@ -293,6 +293,8 @@ class JobRunner:
             "spot_qty": fill.get("spot_qty"), "perp_qty": fill.get("perp_qty"),
             "spot_venue": fill.get("spot_venue", ""),
             "entry_basis_pct": fill.get("basis_pct"),
+            "spot_entry_price": fill.get("spot_avg_price_gross") or fill.get("spot_avg_price"),
+            "entry_slippage_usd": (fill.get("entry_slippage") or {}).get("total"),
             "entry_mode": fill.get("entry_mode", ""),
             "earnings_source": "real" if is_binance else "estimated",
             "payments_json": [{
@@ -355,7 +357,9 @@ class JobRunner:
             # Último income real antes de cerrar (captura el pago más reciente).
             self._final_income(uid, pos)
             self._finalize_close(uid, pos, exit_fees, res, jid)
-            self._alert(uid, sym, f"Posición cerrada. Fees salida ${exit_fees:.2f}",
+            pp = res.get("price_pnl")
+            self._alert(uid, sym, f"Posición cerrada. Fees salida ${exit_fees:.2f}"
+                        + (f". PnL de precio (basis+slippage) ${pp:+.2f}" if pp is not None else ""),
                         severity="INFO", typ="EXEC_DONE")
             self._update(jid, status="done", result_json=_jsonable(res))
         else:
@@ -379,9 +383,12 @@ class JobRunner:
                 row.perp_qty = max(0.0, (row.perp_qty or 0) - float(res.get("perp_closed") or 0))
             if add_fees:
                 row.exit_fees_real = (row.exit_fees_real or 0) + add_fees
+            if res.get("price_pnl") is not None:
+                row.realized_price_pnl = (row.realized_price_pnl or 0) + float(res["price_pnl"])
             pj = list(row.payments_json or [])
             pj.append({"ts": time.time(), "kind": "auto_close_partial",
                        "order_ids": res.get("order_ids", []), "legs": res.get("legs", []),
+                       "price_pnl": res.get("price_pnl"), "exec": res.get("exec"),
                        "note": res.get("partial_note") or res.get("msg", "")})
             row.payments_json = pj
             db.session.commit()
@@ -415,8 +422,10 @@ class JobRunner:
                 "entry_fees_real": row.entry_fees_real, "exit_fees_real": row.exit_fees_real,
             })
             earned = row.earned_real or 0
+            pnl = real_net_breakdown(row, res)
             DBPersistence().close_position(row.id, {
-                "reason": "auto", "hours": el_h, "fees": fees, "net_earned": earned - fees,
+                "reason": "auto", "hours": el_h, "fees": fees,
+                "net_earned": earned + (pnl["price_pnl"] or 0) - fees, **pnl,
             })
             hist = (UserHistory.query.filter_by(user_id=uid, symbol=symbol)
                     .order_by(UserHistory.id.desc()).first())
@@ -508,6 +517,24 @@ class JobRunner:
                      result_json={"reconciled": rec}, error=f"Interrumpido por reinicio. {rec['msg']}")
         self._alert(uid, symbol, f"Job #{jid} interrumpido por reinicio. {rec['msg']}",
                     severity="WARNING")
+
+
+def real_net_breakdown(row, res) -> dict:
+    """PnL de precio total (parciales + este cierre), slippage entrada+salida y el
+    detalle de ejecución para user_history. Neto real = funding + price_pnl − fees.
+
+    price_pnl None (falta precio de entrada) → el neto queda funding − fees como antes.
+    """
+    partial = getattr(row, "realized_price_pnl", None)
+    this = res.get("price_pnl")
+    price_pnl = None if this is None and partial is None else round((partial or 0) + (this or 0), 6)
+    exit_slip = (res.get("exit_slippage") or {}).get("total")
+    entry_slip = getattr(row, "entry_slippage_usd", None)
+    slip = None if exit_slip is None and entry_slip is None else round((entry_slip or 0) + (exit_slip or 0), 6)
+    ex = dict(res.get("exec") or {})
+    ex.update({"entry_basis_pct": getattr(row, "entry_basis_pct", None),
+               "entry_slippage_usd": entry_slip, "partial_price_pnl": partial})
+    return {"price_pnl": price_pnl, "slippage_usd": slip, "exec": _jsonable(ex)}
 
 
 def _jsonable(obj):

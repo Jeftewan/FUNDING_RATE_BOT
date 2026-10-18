@@ -1088,6 +1088,7 @@ body {
   transition: background 120ms ease;
 }
 .hist-item:hover { background: rgba(255,255,255,0.03); }
+.hist-item .hist-breakdown { font-size: 10.5px; opacity: .9; }
 .hist-item .hist-main { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .hist-item .hist-sym { font-size: 13px; font-weight: 600; color: var(--text-primary, #e5e7eb); }
 .hist-item .hist-meta { color: var(--text-secondary, #9ca3af); font-size: 11px; }
