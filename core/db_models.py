@@ -123,6 +123,8 @@ class UserPosition(db.Model):
     entry_mode = db.Column(db.String(30), default="")
     source = db.Column(db.String(20), default="manual")  # manual | auto | imported
     job_id = db.Column(db.Integer, nullable=True)
+    # Seguros (SL del short + venta límite spot): ver trade_executor.place_protection.
+    protection_json = db.Column(db.JSON, nullable=True)
     # "real" = earnings desde el income FUNDING_FEE del exchange (sync);
     # "estimated" = exposure × tasa pública (scanner).
     earnings_source = db.Column(db.String(20), default="estimated")

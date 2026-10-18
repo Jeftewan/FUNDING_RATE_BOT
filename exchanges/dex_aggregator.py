@@ -8,9 +8,11 @@ Interfaz común (la usa onchain_bsc.BscSpotLeg):
 
 Binance Wallet Web3 API (por defecto) — https://web3.binance.com/build
   Firma HMAC-SHA256 base64 de ts + METHOD + "/build" + path?query + body.
-  ⚠ Bloquea por región del SERVIDOR (US, CA, NL, GB…): desplegar el bot en una
-  región permitida (p.ej. Railway asia-southeast/Singapur) o usar 0x.
-0x Swap API v2 (fallback, DEX_AGGREGATOR=0x).
+  ⚠ Bloquea por región del SERVIDOR (US, CA, NL, GB…; códigos 40301/40302/40304).
+0x Swap API v2 (DEX_AGGREGATOR=0x, requiere ZEROX_API_KEY).
+KyberSwap Aggregator (DEX_AGGREGATOR=kyber, sin API key). Además es el fallback
+automático cuando el primario responde con bloqueo de región/compliance
+(FallbackAggregator): el bot en Railway Amsterdam recibe 40304 de Binance Web3.
 """
 import base64
 import hashlib
@@ -29,10 +31,15 @@ from exchanges.net import requests_proxies
 log = logging.getLogger("bot.dex")
 
 CHAIN_ID = "56"
+# Binance Web3: 40301/40302 región bloqueada, 40304 "compliance restriction" (NL).
+REGION_CODES = {40301, 40302, 40304}
+REGION_TTL = 3600
 
 
 class AggregatorError(RuntimeError):
-    pass
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code
 
 
 class BinanceWeb3Aggregator:
@@ -74,8 +81,8 @@ class BinanceWeb3Aggregator:
                 raise AggregatorError(f"HTTP {r.status_code}: {r.text[:200]}")
             if r.status_code >= 400 or j.get("code") != 0:
                 code = j.get("code")
-                hint = " (región del servidor bloqueada por Binance Web3)" if code in (40301, 40302) else ""
-                raise AggregatorError(f"Web3 API {code}: {j.get('msg')}{hint}")
+                hint = " (región del servidor bloqueada por Binance Web3)" if code in REGION_CODES else ""
+                raise AggregatorError(f"Web3 API {code}: {j.get('msg')}{hint}", code=code)
             return j.get("data")
         raise AggregatorError("Web3 API: rate limit")
 
@@ -180,10 +187,118 @@ class ZeroExAggregator:
                 "spender": allow.get("spender") or t["to"]}
 
 
+class KyberSwapAggregator:
+    """KyberSwap Aggregator API v1 (BSC). Sin API key; `x-client-id` identifica
+    al integrador. Sin broadcast propio → la tx se envía por el RPC BSC."""
+
+    BASE = "https://aggregator-api.kyberswap.com/bsc/api/v1"
+    CLIENT_ID = "basyo"
+
+    def __init__(self):
+        self.h = {"x-client-id": self.CLIENT_ID}
+
+    def _req(self, method, path, params=None, body=None):
+        r = requests.request(method, self.BASE + path, params=params, json=body, headers=self.h,
+                             timeout=15)
+        try:
+            j = r.json()
+        except ValueError:
+            raise AggregatorError(f"Kyber HTTP {r.status_code}: {r.text[:200]}")
+        if r.status_code >= 400 or j.get("code") not in (0, None):
+            raise AggregatorError(f"Kyber {j.get('code')}: {j.get('message')}", code=j.get("code"))
+        return j.get("data") or {}
+
+    @staticmethod
+    def _impact(d):
+        try:
+            usd_in, usd_out = float(d.get("amountInUsd") or 0), float(d.get("amountOutUsd") or 0)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, 1 - usd_out / usd_in) if usd_in > 0 and usd_out > 0 else None
+
+    def _route(self, src, dst, amount_wei):
+        d = self._req("GET", "/routes", {"tokenIn": src, "tokenOut": dst, "amountIn": str(int(amount_wei))})
+        if not d.get("routeSummary"):
+            raise AggregatorError("sin ruta de swap")
+        return d
+
+    def quote(self, src, dst, amount_wei, wallet):
+        s = self._route(src, dst, amount_wei)["routeSummary"]
+        return {"to_amount": int(s["amountOut"]), "price_impact": self._impact(s)}
+
+    def swap_tx(self, src, dst, amount_wei, wallet, slippage, max_impact=0.01):
+        route = self._route(src, dst, amount_wei)
+        impact = self._impact(route["routeSummary"])
+        if impact is not None and impact > max_impact:
+            raise AggregatorError(f"impacto de precio {impact * 100:.2f}% > máx {max_impact * 100:.1f}%")
+        d = self._req("POST", "/route/build", body={
+            "routeSummary": route["routeSummary"], "sender": wallet, "recipient": wallet,
+            "slippageTolerance": int(round(slippage * 10000)), "source": self.CLIENT_ID})
+        router = d.get("routerAddress") or route.get("routerAddress")
+        if not router or not d.get("data"):
+            raise AggregatorError("Kyber route/build sin calldata")
+        amount_out = int(d.get("amountOut") or route["routeSummary"]["amountOut"])
+        return {"tx": {"to": router, "data": d["data"], "value": int(d.get("transactionValue") or 0),
+                       "gas": int(d["gas"]) if d.get("gas") else None, "gasPrice": None},
+                "min_out": int(amount_out * (1 - slippage)), "spender": router,
+                "price_impact": self._impact(d) if d.get("amountInUsd") else impact}
+
+
+class FallbackAggregator:
+    """Primario + secundarios. Ante un bloqueo de región/compliance del primario
+    (Binance Web3 40301/40302/40304) cambia al siguiente y recuerda el bloqueo
+    REGION_TTL segundos para no pagar el round-trip fallido en cada swap."""
+
+    def __init__(self, chain):
+        self.chain = [a for a in chain if a is not None]
+        self._blocked = {}   # idx → ts
+        self._last = None    # agregador que armó la última tx (para broadcast)
+
+    def _usable(self):
+        now = time.time()
+        items = [(i, a) for i, a in enumerate(self.chain) if now - self._blocked.get(i, 0) >= REGION_TTL]
+        return items or list(enumerate(self.chain[-1:], start=len(self.chain) - 1))
+
+    def _call(self, name, *args, **kw):
+        err = None
+        for i, agg in self._usable():
+            try:
+                out = getattr(agg, name)(*args, **kw)
+                if name == "swap_tx":
+                    self._last = agg
+                return out
+            except AggregatorError as e:
+                if e.code not in REGION_CODES or i == len(self.chain) - 1:
+                    raise
+                self._blocked[i] = time.time()
+                log.warning(f"{type(agg).__name__} bloqueado por región ({e}); fallback a siguiente agregador")
+                err = e
+        raise err or AggregatorError("sin agregador disponible")
+
+    def quote(self, *a, **kw):
+        return self._call("quote", *a, **kw)
+
+    def swap_tx(self, *a, **kw):
+        return self._call("swap_tx", *a, **kw)
+
+    def broadcast(self, raw_hex, wallet):
+        if self._last is None or not hasattr(self._last, "broadcast"):
+            raise AggregatorError("agregador sin broadcast (se usa RPC)")
+        return self._last.broadcast(raw_hex, wallet)
+
+
 def build_aggregator():
     kind = os.environ.get("DEX_AGGREGATOR", "binance").lower()
-    if kind == "0x":
-        return ZeroExAggregator(os.environ.get("ZEROX_API_KEY", ""))
-    return BinanceWeb3Aggregator(os.environ.get("BINANCE_WEB3_API_KEY", ""),
-                                 os.environ.get("BINANCE_WEB3_API_SECRET", ""),
-                                 mev_protection=os.environ.get("BSC_MEV_PROTECTION", "1") != "0")
+    if kind == "kyber":
+        return KyberSwapAggregator()
+    try:
+        if kind == "0x":
+            primary = ZeroExAggregator(os.environ.get("ZEROX_API_KEY", ""))
+        else:
+            primary = BinanceWeb3Aggregator(os.environ.get("BINANCE_WEB3_API_KEY", ""),
+                                            os.environ.get("BINANCE_WEB3_API_SECRET", ""),
+                                            mev_protection=os.environ.get("BSC_MEV_PROTECTION", "1") != "0")
+    except AggregatorError as e:
+        log.warning(f"agregador '{kind}' no disponible ({e}); se usa KyberSwap")
+        return KyberSwapAggregator()
+    return FallbackAggregator([primary, KyberSwapAggregator()])

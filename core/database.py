@@ -113,6 +113,7 @@ def _run_migrations(db):
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS entry_mode VARCHAR(30) DEFAULT ''",
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'manual'",
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS job_id INTEGER",
+        "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS protection_json JSON",
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS earnings_source VARCHAR(20) DEFAULT 'estimated'",
         "UPDATE user_positions SET source = 'auto' WHERE auto_executed = TRUE AND (source IS NULL OR source = 'manual')",
         "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS auto_transfer BOOLEAN DEFAULT FALSE",

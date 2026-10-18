@@ -34,6 +34,8 @@ class JobRunner:
             return
         self._started = True
         threading.Thread(target=self._recover, daemon=True, name="jobs-recover").start()
+        from execution.protection import ProtectionWatcher
+        ProtectionWatcher(self).start()
 
     # ── API ────────────────────────────────────────────────────────────
     def active_job(self, user_id):
@@ -132,13 +134,16 @@ class JobRunner:
                 out[ex.lower()] = c
         return out
 
+    def _load_wallet(self, uid):
+        from core.db_persistence import DBPersistence
+        with self.app.app_context():
+            return DBPersistence().load_user_wallet(uid, "bsc")
+
     def _spot_leg_factory(self, uid, params):
         if params.get("spot_venue") != "bsc":
             return None
-        from core.db_persistence import DBPersistence
         from exchanges import onchain_bsc
-        with self.app.app_context():
-            wallet = DBPersistence().load_user_wallet(uid, "bsc")
+        wallet = self._load_wallet(uid)
         if not wallet:
             raise RuntimeError("Configura tu wallet BSC dedicada en la pestaña Cuenta")
         token = params.get("token") or {}
@@ -183,17 +188,86 @@ class JobRunner:
         pos_id = None
         if fill and (fill.get("perp_qty") or 0) > 0:
             pos_id = self._save_open_position(uid, jid, opp, p, fill)
+        prot = None
+        if res.get("ok") and pos_id and mode == "spot_perp":
+            prot = self._protect(uid, pos_id, creds, ctx, token=p.get("token"))
+            res["protection"] = prot
         status = "done" if res.get("ok") else "failed"
         self._update(jid, status=status, result_json=_jsonable(res), position_id=pos_id,
                      error=None if res.get("ok") else res.get("msg"))
         sym = opp.get("symbol", "")
         if res.get("ok"):
+            sl_txt = f". Seguros: SL {prot['sl_price']:g}" if prot and prot.get("ok") else ""
             self._alert(uid, sym, f"Posición abierta: spot {res.get('spot_qty') or 0:g} / short "
                         f"{res.get('perp_qty') or 0:g}. Fees ${res.get('entry_fees_usd', 0):.2f}"
+                        + sl_txt
                         + (f". {res['partial_note']}" if res.get("partial_note") else ""),
                         severity="INFO", typ="EXEC_DONE")
         elif "unwound" in res or res.get("code") == "HEDGE_FAILED":
             self._alert(uid, sym, f"Fallo al abrir {sym} (auto): {res.get('msg', '')}")
+
+    # ── Seguros (SL del short + venta límite del spot) ─────────────────
+    def _save_protection(self, pos_id, prot):
+        from core.database import db
+        from core.db_models import UserPosition
+        with self.app.app_context():
+            row = UserPosition.query.get(int(pos_id))
+            if row:
+                row.protection_json = _jsonable(prot)
+                db.session.commit()
+
+    def _load_pos(self, pos_id):
+        from core.db_models import UserPosition
+        from core.db_persistence import DBPersistence
+        with self.app.app_context():
+            row = UserPosition.query.get(int(pos_id))
+            return DBPersistence()._pos_to_dict(row) if row and row.status == "active" else None
+
+    def _bsc_args(self, uid, pos, token=None):
+        if pos.get("spot_venue") != "bsc":
+            return None, None
+        from exchanges import onchain_bsc
+        return self._load_wallet(uid), (token or onchain_bsc.alpha_token(pos.get("symbol", "")))
+
+    def _protect(self, uid, pos_id, creds, ctx=None, token=None):
+        """Coloca los seguros de una posición spot_perp recién abierta y los
+        persiste. Un fallo nunca deshace la posición: alerta para ponerlos a mano."""
+        from exchanges import trade_executor as texec
+        pos = self._load_pos(pos_id)
+        if not pos:
+            return None
+        sym = pos.get("symbol", "")
+        try:
+            wallet, token = self._bsc_args(uid, pos, token)
+            prot = texec.place_protection(creds, pos, ctx=ctx, wallet=wallet, token=token)
+        except Exception as e:
+            log.exception(f"place_protection pos={pos_id}: {e}")
+            prot = {"ok": False, "msg": f"{type(e).__name__}: {e}"}
+        if not prot.get("ok"):
+            prot = {**prot, "status": "failed"}
+            self._alert(uid, sym, f"Seguros NO colocados en {sym}: {prot.get('msg')}. "
+                                  f"Pon el SL del short y la venta del spot manualmente.")
+        elif prot.get("errors"):
+            self._alert(uid, sym, f"Seguros incompletos en {sym} (SL {prot['sl_price']:g}): "
+                                  + "; ".join(prot["errors"]))
+        self._save_protection(pos_id, prot)
+        return prot
+
+    def _restore_protection(self, uid, pos, creds, token=None):
+        """Tras un cierre fallido/parcial: si los seguros se cancelaron, se vuelven
+        a poner sobre lo que queda abierto."""
+        from exchanges import trade_executor as texec
+        prot = pos.get("protection") or {}
+        if prot.get("status") != "active" or (pos.get("exchange") or "").lower()                 not in texec.PROTECTION_EXCHANGES:
+            return
+        try:
+            wallet, _ = self._bsc_args(uid, pos, token)
+            st = texec.protection_status(creds, pos, wallet)
+            if "open" in (st["perp"], st["spot"]):
+                return
+        except Exception as e:
+            log.warning(f"protection status pos={pos.get('id')}: {e}")
+        self._protect(uid, pos["id"], creds, token=token)
 
     def _save_open_position(self, uid, jid, opp, p, fill) -> int:
         from core.db_persistence import DBPersistence
@@ -265,9 +339,18 @@ class JobRunner:
             # Si algo se ejecutó, ajustar cantidades registradas.
             if res.get("spot_sold") or res.get("perp_closed"):
                 self._apply_partial_close(pos, res)
+            self._restore_protection(uid, self._load_pos(pos["id"]) or pos, creds, p.get("token"))
             return
 
         exit_fees = float(res.get("exit_fees_usd") or 0)
+        if not res.get("spot_sold") and not res.get("perp_closed") and \
+                (res.get("partial_note") or not res.get("complete", True)):
+            # Nada se ejecutó: es un fallo, no un cierre parcial (antes quedaba 'done' sin alerta).
+            msg = res.get("partial_note") or "No se ejecutó ninguna orden"
+            self._update(jid, status="failed", result_json=_jsonable(res), error=msg)
+            self._alert(uid, sym, f"Fallo al cerrar {sym} (auto): {msg}. La posición sigue abierta.")
+            self._restore_protection(uid, pos, creds, p.get("token"))
+            return
         if res.get("complete", True) and not res.get("partial_note"):
             # Último income real antes de cerrar (captura el pago más reciente).
             self._final_income(uid, pos)
@@ -279,6 +362,9 @@ class JobRunner:
             self._apply_partial_close(pos, res, add_fees=exit_fees)
             self._update(jid, status="done", result_json=_jsonable(res),
                          error=res.get("partial_note"))
+            remaining = self._load_pos(pos["id"])
+            if remaining:
+                self._restore_protection(uid, remaining, creds, p.get("token"))
 
     def _apply_partial_close(self, pos, res, add_fees=0.0):
         from core.database import db

@@ -207,6 +207,12 @@ class EmailNotifier:
             lines.append("\n\U0001f7e2 Ejecucion completada")
         elif alert_type == "EXCHANGE_GEOBLOCKED":
             lines.append("\n\U0001f6a8 *Gestionar posiciones desde la app del exchange*")
+        elif alert_type == "PROTECTION_TRIGGERED":
+            lines.append("\n\U0001f6e1 *Seguro ejecutado — cerrando la otra pierna*")
+        elif alert_type == "PROTECTION_RENEWED":
+            lines.append("\n\U0001f6e1 Orden limite renovada (7 dias)")
+        elif alert_type == "PROTECTION_CANCELED":
+            lines.append("\n\U0001f7e0 *Seguro cancelado — revisar*")
 
         return "\n".join(lines)
 
