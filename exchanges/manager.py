@@ -4,7 +4,7 @@ import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.models import FundingRate, FundingHistory
-from exchanges.net import ccxt_proxy_params
+from exchanges.net import ccxt_proxy_params, is_geoblock_error, mark_geoblocked
 
 log = logging.getLogger("bot")
 
@@ -174,6 +174,10 @@ class ExchangeManager:
                             self._ban_until[name] = ban_ts
                             mins = (ban_ts - time.time()) / 60
                             log.error(f"{EXCHANGE_NAMES.get(name, name)}: IP BANNED for {mins:.0f}min")
+                        elif is_geoblock_error(err_str):
+                            mark_geoblocked(name)
+                            log.error(f"{EXCHANGE_NAMES.get(name, name)}: GEOBLOQUEADO desde la IP "
+                                      "de salida (ver EXCHANGE_PROXY_URL)")
                         else:
                             log.error(f"Fetch failed for {name}: {e}")
 

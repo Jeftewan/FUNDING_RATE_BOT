@@ -7,6 +7,7 @@ from functools import wraps
 from flask import Blueprint, jsonify, request as flask_req, redirect
 from portfolio.manager import get_capital_summary, open_position, close_position
 from portfolio.actions import calculate_position_estimate
+from exchanges.net import egress_status
 
 log = logging.getLogger("bot")
 
@@ -89,6 +90,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             "ok": db_ok, "scans": s["scan_count"],
             "status": s["status"], "version": "10.0",
             "db": "connected" if db_enabled else "not configured",
+            "egress": egress_status(),
         }), (200 if db_ok else 503)
 
     # ── Config ─────────────────────────────────────────────────

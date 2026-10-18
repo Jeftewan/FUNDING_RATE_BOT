@@ -205,6 +205,8 @@ class EmailNotifier:
             lines.append("\n\U0001f7e0 *La posicion en el exchange no coincide con basyo — revisar*")
         elif alert_type == "EXEC_DONE":
             lines.append("\n\U0001f7e2 Ejecucion completada")
+        elif alert_type == "EXCHANGE_GEOBLOCKED":
+            lines.append("\n\U0001f6a8 *Gestionar posiciones desde la app del exchange*")
 
         return "\n".join(lines)
 
