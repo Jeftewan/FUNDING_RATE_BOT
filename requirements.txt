@@ -2,6 +2,8 @@ flask
 gunicorn==26.2.0
 requests
 ccxt==4.5.85
+# SOCKS5 para EXCHANGE_PROXY_URL (salida a exchanges con geobloqueo; ccxt y requests).
+PySocks==1.7.1
 # Firma de swaps en la wallet BSC dedicada (pierna spot on-chain de tokens Alpha).
 # Sin web3.py (RAM): JSON-RPC vía requests.
 eth-account==0.14.0

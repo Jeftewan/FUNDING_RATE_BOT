@@ -19,6 +19,8 @@ import time
 
 import requests
 
+from exchanges.net import requests_proxies
+
 log = logging.getLogger("bot.bsc")
 
 CHAIN_ID = 56
@@ -139,7 +141,7 @@ def _load_alpha():
     if time.time() - _alpha_cache["ts"] < _ALPHA_TTL and _alpha_cache["by_symbol"]:
         return _alpha_cache["by_symbol"]
     try:
-        r = requests.get(ALPHA_LIST_URL, timeout=20)
+        r = requests.get(ALPHA_LIST_URL, timeout=20, proxies=requests_proxies())
         r.raise_for_status()
         rows = r.json().get("data") or []
     except Exception as e:

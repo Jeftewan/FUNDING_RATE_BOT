@@ -501,6 +501,7 @@ BINANCE_WEB3_API_KEY / BINANCE_WEB3_API_SECRET   # web3.binance.com/en/dev-porta
 ZEROX_API_KEY         # si DEX_AGGREGATOR=0x
 BSC_RPC_URL           # default https://bsc-dataseed.bnbchain.org
 BSC_MEV_PROTECTION    # default 1 (broadcast por mempool privada)
+EXCHANGE_PROXY_URL    # socks5h://user:pass@ip:puerto — salida a exchanges vía VPS (geobloqueo); vacío = directo
 ```
 
 > Nota: las API keys globales de CEX (arriba) son para datos públicos del scanner. La **auto-ejecución** usa las keys *por usuario* guardadas en `user_exchange_keys` (tab Cuenta), no estas.
@@ -601,6 +602,7 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 - Healthcheck y root dir viven en la **configuración del servicio** (no en `railway.json`: Railway deprecó Config as Code el 2026-12-01).
 - **Sin watch paths**: con ellos Railway marcó el merge del PR #98 como `SKIPPED` ("No changes to watched files") en ambos servicios. Todo push a `main` redeploya los dos (Caddy tarda segundos).
 - Bot: `PORT=8080` (lo referencia `web`) y `MALLOC_ARENA_MAX=2` (glibc + threads fragmenta; RAM base era ~0.78 GB).
+- **Salida a exchanges (proxy)**: desde el 2026-10-17 la IP de salida de Railway (asia-southeast1) recibe **451** de Binance ("restricted location") y **403 CloudFront** de Bybit; la IP cambia por deploy y ninguna región de Railway es elegible (US/NL bloqueadas, Singapur restringida). Solución: proxy SOCKS5 propio (`gost`) en un VPS de país permitido (`scripts/proxy_vps_setup.sh`) + `EXCHANGE_PROXY_URL`. `exchanges/net.py` lo aplica **solo** a ccxt (`manager.py`, `trade_executor._build_client` → también `binance_account`), Web3 API/0x y la token list Alpha; Postgres/Telegram/Gemini/DeFi/RPC BSC salen directo (no usar `HTTPS_PROXY` global). Al arrancar se loguea `Egress exchanges: <país> <ip> via ...`. Diagnóstico: `python scripts/egress_check.py` (con/sin proxy). La IP del VPS es la de la whitelist de las API keys.
 - RAM ccxt: las instancias de solo lectura de `exchanges/manager.py` cargan solo spot + linear/swap y descartan `market['info']` (`_ensure_markets`); el spot check reusa esos mercados. `trade_executor` usa clientes propios, no afectados.
 - CLI: `railway ... -p 7dc7767e-983c-45a6-afc0-be5210dee632 -e production -s <servicio>` (el repo no está linkeado).
 
@@ -615,7 +617,7 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 
 ### Mejoras identificadas
 
-- **Binance en vivo — pendientes**: (1) Web3 API bloquea regiones US/NL/GB → mover el servicio del bot a Railway asia-southeast o usar 0x (validar con un swap mínimo); (2) actualizar Términos/Privacidad (custodia de la wallet dedicada) en el source React de la landing; (3) reconciliación automática de jobs on-chain interrumpidos; (4) Portfolio Margin (`papi`) no soportado; (5) IP fija de salida de Railway para whitelist de keys; (6) `cross_exchange` sigue con límites simples (sin TWAP).
+- **Binance en vivo — pendientes**: (1) Web3 API bloquea regiones US/NL/GB → mover el servicio del bot a Railway asia-southeast o usar 0x (validar con un swap mínimo); (2) actualizar Términos/Privacidad (custodia de la wallet dedicada) en el source React de la landing; (3) reconciliación automática de jobs on-chain interrumpidos; (4) Portfolio Margin (`papi`) no soportado; (5) IP fija de salida → resuelta con el VPS proxy (`EXCHANGE_PROXY_URL`); (6) `cross_exchange` sigue con límites simples (sin TWAP).
 
 - **DeFi history fiabilidad**: `fetch_funding_history` en `defi_manager.py` depende de que los snapshots existan en DB. En deploys nuevos o símbolos nuevos, thin-history (<5 muestras) da scoring neutro — correcto pero subóptimo para toma de decisiones. Nota: GMX, Aster, Lighter y Extended reportan `volume_24h=0`; el gate de volumen del scan trata ese `0` (desconocido) como **pasa**, así que estos pares ya no quedan excluidos (el filtro de volumen real es de display, client-side).
 - **Scoring DeFi bajo (pendiente)**: los modos `cross_exchange`/`defi` puntúan bajo de forma estructural — consistency (46) + stability (21) = 67% del score se calculan sobre el *diferencial* (`period_diffs`), que cambia de signo mucho más que una tasa única → streak/consistencia bajos, CV alto. A esto se suma thin-history y `volume_24h=0`. **Pendiente** (otro plan): `defi_opportunity_score()` separado con umbrales heurísticos, tras verificar cuántos snapshots/muestras hay acumulados.

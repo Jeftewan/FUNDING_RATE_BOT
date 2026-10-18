@@ -31,6 +31,8 @@ import time
 import math
 import logging
 
+from exchanges.net import ccxt_proxy_params
+
 log = logging.getLogger("bot.exec")
 
 SUPPORTED_EXCHANGES = {"binance", "bybit", "okx", "bitget"}
@@ -148,6 +150,7 @@ def _build_client(exchange_name: str, creds: dict, default_type: str = "swap"):
         "options": options,
         "apiKey": creds.get("api_key", ""),
         "secret": creds.get("api_secret", ""),
+        **ccxt_proxy_params(),
     }
     if creds.get("passphrase"):
         params["password"] = creds["passphrase"]
