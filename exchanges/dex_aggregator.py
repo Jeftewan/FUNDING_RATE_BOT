@@ -24,6 +24,8 @@ from urllib.parse import quote, urlencode
 
 import requests
 
+from exchanges.net import requests_proxies
+
 log = logging.getLogger("bot.dex")
 
 CHAIN_ID = "56"
@@ -62,7 +64,7 @@ class BinanceWeb3Aggregator:
                        "X-OC-RECV-WINDOW": "10000", "Content-Type": "application/json"}
             # Firmar y enviar EXACTAMENTE los mismos bytes (no usar params=).
             r = requests.request(method, self.HOST + req_path, data=body_str or None,
-                                 headers=headers, timeout=15)
+                                 headers=headers, timeout=15, proxies=requests_proxies())
             if r.status_code == 429 and attempt < 2:
                 time.sleep(float(r.headers.get("Retry-After", 1)))
                 continue
@@ -151,7 +153,8 @@ class ZeroExAggregator:
         self.h = {"0x-api-key": api_key, "0x-version": "v2"}
 
     def _get(self, path, params):
-        r = requests.get(self.BASE + path, params={"chainId": CHAIN_ID, **params}, headers=self.h, timeout=15)
+        r = requests.get(self.BASE + path, params={"chainId": CHAIN_ID, **params}, headers=self.h, timeout=15,
+                         proxies=requests_proxies())
         j = r.json()
         if r.status_code >= 400:
             raise AggregatorError(f"0x {r.status_code}: {j}")

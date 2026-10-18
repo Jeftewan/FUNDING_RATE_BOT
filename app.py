@@ -183,6 +183,11 @@ log.info(
     f"DB: {'connected' if db_enabled else 'not configured'}"
 )
 
+# País/IP de salida hacia exchanges (diagnóstico de 451/403 por geobloqueo).
+import threading
+from exchanges.net import log_egress
+threading.Thread(target=log_egress, daemon=True, name="egress-check").start()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)

@@ -4,6 +4,7 @@ import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from core.models import FundingRate, FundingHistory
+from exchanges.net import ccxt_proxy_params
 
 log = logging.getLogger("bot")
 
@@ -77,7 +78,7 @@ class ExchangeManager:
                 continue
             cfg = exchange_configs[name]
             try:
-                params = {"enableRateLimit": True, "options": cfg["options"]}
+                params = {"enableRateLimit": True, "options": cfg["options"], **ccxt_proxy_params()}
                 if cfg.get("api_key"):
                     params["apiKey"] = cfg["api_key"]
                     params["secret"] = cfg["secret"]
