@@ -122,3 +122,20 @@ def test_key_helpers():
     assert ob.normalize_key("11" * 32) == "0x" + "11" * 32
     with pytest.raises(ValueError):
         ob.normalize_key("0x1234")
+
+
+def test_gas_limit_uses_estimate_over_short_hint(monkeypatch):
+    # Caso real: el agregador sugirió 250k y el swap necesitaba ~364k (out-of-gas).
+    monkeypatch.setattr(ob, "_estimate_gas", lambda tx: 364_000)
+    tx = {"to": "0xrouter", "data": "0xswap", "value": 0}
+    assert ob._gas_limit(WALLET["address"], tx, 250_000) == int(364_000 * ob.GAS_BUFFER)
+    monkeypatch.setattr(ob, "_estimate_gas", lambda tx: 100_000)
+    assert ob._gas_limit(WALLET["address"], tx, 250_000) == 250_000
+
+
+def test_gas_limit_aborts_if_simulation_reverts(monkeypatch):
+    def boom(tx):
+        raise RuntimeError("RPC eth_estimateGas: execution reverted")
+    monkeypatch.setattr(ob, "_estimate_gas", boom)
+    with pytest.raises(RuntimeError):
+        ob._gas_limit(WALLET["address"], {"to": "0xr", "data": "0x", "value": 0}, 250_000)
