@@ -202,6 +202,48 @@ def _top_of_book(client, ccxt_symbol: str, fallback: float = 0.0):
     return fb, fb, fb
 
 
+def _ref_mids(spot_cli, spot_sym, perp_cli, perp_sym, leg=None, fallback: float = 0.0) -> dict:
+    """Mids de referencia al INICIAR la ejecución (para medir slippage).
+
+    Spot on-chain: mid de cotizaciones chicas compra/venta (la comisión del DEX
+    se compensa entre ambas y queda el precio justo)."""
+    _, _, pmid = _top_of_book(perp_cli, perp_sym, fallback)
+    smid = None
+    try:
+        if leg is not None and hasattr(leg, "mid_price"):
+            smid = leg.mid_price(pmid)
+        else:
+            _, _, smid = _top_of_book(spot_cli, spot_sym)
+    except Exception as e:
+        log.warning(f"ref mid spot {spot_sym}: {e}")
+    return {"spot_mid": smid or None, "perp_mid": pmid or None, "ts": time.time()}
+
+
+def _slippage_usd(side: str, avg, mid, qty):
+    """Costo vs mid en USD (positivo = peor que el mid). None sin datos."""
+    if not avg or not mid or not qty:
+        return None
+    return round(((avg - mid) if side == "buy" else (mid - avg)) * qty, 6)
+
+
+def _slip_summary(spot_side, spot_avg, spot_qty, perp_avg, perp_qty, ref) -> dict:
+    ref = ref or {}
+    s = _slippage_usd(spot_side, spot_avg, ref.get("spot_mid"), spot_qty)
+    p = _slippage_usd("sell" if spot_side == "buy" else "buy", perp_avg, ref.get("perp_mid"), perp_qty)
+    total = round((s or 0) + (p or 0), 6) if (s is not None or p is not None) else None
+    return {"spot": s, "perp": p, "total": total}
+
+
+def _legacy_spot_entry(position: dict):
+    """Precio spot de entrada desde el audit auto_open (posiciones previas)."""
+    for p in position.get("payments") or position.get("payments_json") or []:
+        if p.get("kind") == "auto_open":
+            for leg in p.get("legs") or []:
+                if leg.get("kind") == "spot" and leg.get("price"):
+                    return float(leg["price"])
+    return None
+
+
 def _mid_price(client, ccxt_symbol: str, fallback: float = 0.0) -> float:
     return _top_of_book(client, ccxt_symbol, fallback)[2]
 
@@ -805,7 +847,7 @@ def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = No
 def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None) -> dict:
     """Cancela las órdenes de seguro vivas. Devuelve fees/qty de lo que ya se
     había llenado (para sumarlo al cierre)."""
-    out = {"perp_filled": 0.0, "spot_filled": 0.0, "fee_usd": 0.0}
+    out = {"perp_filled": 0.0, "perp_cost": 0.0, "spot_filled": 0.0, "spot_cost": 0.0, "fee_usd": 0.0}
     perp = prot.get("perp")
     if _leg_active(perp):
         try:
@@ -814,7 +856,8 @@ def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wal
                 perp_cli.cancel_order(perp["id"], perp_sym, {"trigger": True})
             elif o.get("status") == "closed" and (o.get("info") or {}).get("actualOrderId"):
                 f = order_fills(perp_cli, perp_sym, o["info"]["actualOrderId"])
-                out["perp_filled"], out["fee_usd"] = f["gross"], out["fee_usd"] + f["fee_usd"]
+                out["perp_filled"], out["perp_cost"] = f["gross"], f["cost"]
+                out["fee_usd"] += f["fee_usd"]
         except Exception as e:
             log.warning(f"cancel SL {perp_sym}: {e}")
     spot = prot.get("spot")
@@ -831,7 +874,8 @@ def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wal
                     o = _final_order(spot_cli, spot["id"], spot_sym) or o
                 if float(o.get("filled") or 0) > 0:
                     f = order_fills(spot_cli, spot_sym, spot["id"])
-                    out["spot_filled"], out["fee_usd"] = f["gross"], out["fee_usd"] + f["fee_usd"]
+                    out["spot_filled"], out["spot_cost"] = f["gross"], f["cost"]
+                    out["fee_usd"] += f["fee_usd"]
         except Exception as e:
             log.warning(f"cancel venta límite {spot_sym}: {e}")
     return out
@@ -1216,13 +1260,16 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
     leg = spot_leg_factory(perp_cli, perp_sym, ctx) if onchain \
         else CexSpotLeg(spot_cli, spot_sym, ctx, perp_cli, perp_sym)
     hedger = PerpHedger(perp_cli, perp_sym, ctx, opening=True)
-    state = {"spot_net": 0.0, "spot_cost": 0.0, "per_order": {}}
+    state = {"spot_net": 0.0, "spot_cost": 0.0, "spot_gross": 0.0, "per_order": {},
+             "ref": _ref_mids(spot_cli, spot_sym, perp_cli, perp_sym, leg if onchain else None,
+                              plan.get("perp_mid") or 0)}
 
     def on_fill(oid, f, net):
         # f/net son acumulados de ESA orden → recomputar el total neto.
-        state["per_order"][oid] = (net, f["cost"])
+        state["per_order"][oid] = (net, f["cost"], f["gross"])
         state["spot_net"] = sum(v[0] for v in state["per_order"].values())
         state["spot_cost"] = sum(v[1] for v in state["per_order"].values())
+        state["spot_gross"] = sum(v[2] for v in state["per_order"].values())
         err = hedger.target(state["spot_net"])
         ctx.progress({"phase": "open", "spot_net": state["spot_net"],
                       "perp_hedged": hedger.hedged, "slices_done": state.get("slice", 0)})
@@ -1311,13 +1358,21 @@ def _unwind_spot(leg, base_amt) -> bool:
 
 def _open_result(exchange, spot_sym, perp_sym, leg, hedger, state, leverage, onchain):
     spot_px = state["spot_cost"] / state["spot_net"] if state["spot_net"] else 0
+    # Bruto (sin la comisión cobrada en base, que ya va en entry_fees_usd): base del
+    # PnL de precio, para no contar la comisión dos veces.
+    gross = state.get("spot_gross") or state["spot_net"]
+    spot_px_gross = state["spot_cost"] / gross if gross else 0
     perp_px = hedger.avg
-    basis = round((perp_px - spot_px) / spot_px * 100, 4) if spot_px and perp_px else None
+    basis = round((perp_px - spot_px_gross) / spot_px_gross * 100, 4) if spot_px_gross and perp_px else None
     spot_ids = list(getattr(leg, "order_ids", []))
     return {
         "dry_run": False,
         "entry_price": perp_px,
         "spot_avg_price": spot_px,
+        "spot_avg_price_gross": spot_px_gross,
+        "ref_mids": state.get("ref"),
+        "entry_slippage": _slip_summary("buy", spot_px_gross, gross, perp_px, hedger.hedged,
+                                        state.get("ref")),
         "entry_fees_usd": round(leg.fee_usd + hedger.fee_usd, 6),
         "spot_qty": state["spot_net"],
         "perp_qty": hedger.hedged,
@@ -1580,6 +1635,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
                      "type": "market reduceOnly"},
                 ]}
 
+    ref = _ref_mids(spot_cli, spot_sym, perp_cli, perp_sym, leg if onchain else None,
+                    position.get("entry_price") or 0)
     hedger = PerpHedger(perp_cli, perp_sym, ctx, opening=False, max_base=perp_to_close)
     ratio = (perp_to_close / spot_to_sell) if spot_to_sell else 0
     state = {"per_order": {}, "sold": 0.0, "proceeds": 0.0}
@@ -1647,9 +1704,42 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
              "order_ids": hedger.order_ids, "fee_usd": round(hedger.fee_usd, 6)},
         ],
     }
+    res.update(_close_pnl(position, state, hedger, prot_fill, ref))
     if error or ctx.cancelled():
         res["partial_note"] = str(error) if error else "Cancelado por el usuario"
     return res
+
+
+def _close_pnl(position, state, hedger, prot_fill, ref) -> dict:
+    """PnL de precio REAL de lo cerrado en esta ejecución (incluye lo que llenaron
+    los seguros): (salida − entrada)·qty en el spot + (entrada − salida)·qty en el
+    perp. Ya contiene basis, slippage y comisión del DEX; las fees explícitas van
+    aparte en exit_fees_usd. price_pnl=None si falta el precio de entrada."""
+    spot_entry = position.get("spot_entry_price") or _legacy_spot_entry(position)
+    perp_entry = float(position.get("entry_price") or 0) or None
+    spot_out = state["sold"] + float(prot_fill.get("spot_filled") or 0)
+    spot_proc = state["proceeds"] + float(prot_fill.get("spot_cost") or 0)
+    perp_out = hedger.hedged + float(prot_fill.get("perp_filled") or 0)
+    perp_cost = hedger.cost + float(prot_fill.get("perp_cost") or 0)
+    spot_exit = spot_proc / spot_out if spot_out else None
+    perp_exit = perp_cost / perp_out if perp_out else None
+    pnl = None
+    if spot_entry and perp_entry and (spot_out or perp_out):
+        pnl = round((spot_proc - spot_entry * spot_out) + (perp_entry * perp_out - perp_cost), 6)
+    slip = _slip_summary("sell", state["proceeds"] / state["sold"] if state["sold"] else None,
+                         state["sold"], hedger.avg, hedger.hedged, ref)
+    return {
+        "price_pnl": pnl,
+        "exit_slippage": slip,
+        "exec": {
+            "spot_entry": spot_entry, "perp_entry": perp_entry,
+            "spot_exit": spot_exit, "perp_exit": perp_exit,
+            "spot_qty_out": spot_out, "perp_qty_out": perp_out,
+            "exit_basis_pct": round((perp_exit - spot_exit) / spot_exit * 100, 4)
+            if spot_exit and perp_exit else None,
+            "exit_ref_mids": ref, "exit_slippage": slip,
+        },
+    }
 
 
 def _close_cross(creds_by_exchange, position, dry_run, ctx):

@@ -284,6 +284,8 @@ class DBPersistence:
             source=pos_dict.get("source") or ("auto" if pos_dict.get("auto_executed") else "manual"),
             job_id=pos_dict.get("job_id"),
             earnings_source=pos_dict.get("earnings_source", "estimated"),
+            spot_entry_price=pos_dict.get("spot_entry_price"),
+            entry_slippage_usd=pos_dict.get("entry_slippage_usd"),
         )
         db.session.add(pos)
         db.session.commit()
@@ -317,6 +319,9 @@ class DBPersistence:
             net_earned=result.get("net_earned", 0),
             avg_rate=pos.avg_rate,
             reason=result.get("reason", "manual"),
+            price_pnl=result.get("price_pnl"),
+            slippage_usd=result.get("slippage_usd"),
+            exec_json=result.get("exec"),
         )
         db.session.add(hist)
         db.session.commit()
@@ -409,6 +414,9 @@ class DBPersistence:
             "source": getattr(pos, "source", "") or "manual",
             "earnings_source": getattr(pos, "earnings_source", "") or "estimated",
             "protection": getattr(pos, "protection_json", None) or None,
+            "spot_entry_price": getattr(pos, "spot_entry_price", None),
+            "realized_price_pnl": getattr(pos, "realized_price_pnl", None),
+            "entry_slippage_usd": getattr(pos, "entry_slippage_usd", None),
             "payments": pos.payments_json or [],
         }
 
@@ -455,11 +463,19 @@ class DBPersistence:
         series = []
         for i in range(days - 1, -1, -1):
             d = (now_dt - timedelta(days=i)).strftime("%Y-%m-%d")
-            series.append({"date": d, "earned": 0.0, "fees": 0.0, "net": 0.0})
+            series.append({"date": d, "earned": 0.0, "fees": 0.0, "net": 0.0, "price_pnl": 0.0})
         by_date = {row["date"]: row for row in series}
 
         all_time_earned = 0.0
         all_time_fees = 0.0
+        all_time_price = 0.0   # PnL de precio realizado (fills reales: basis+slippage)
+
+        def _bucket_price(ts_seconds: float, pnl: float):
+            nonlocal all_time_price
+            all_time_price += pnl
+            row = by_date.get(datetime.fromtimestamp(ts_seconds).strftime("%Y-%m-%d"))
+            if row:
+                row["price_pnl"] += pnl
 
         def _bucket(ts_seconds: float, earned: float):
             nonlocal all_time_earned
@@ -490,6 +506,8 @@ class DBPersistence:
                 ts = h.closed_at.timestamp()
                 earned = float(h.earned or 0)
                 _bucket(ts, earned)
+                if getattr(h, "price_pnl", None):
+                    _bucket_price(ts, float(h.price_pnl))
 
         # Active fees (estimates + reals merged elsewhere — use stored values)
         for pos in positions:
@@ -498,10 +516,12 @@ class DBPersistence:
             entry = entry_real if entry_real is not None else (pos.entry_fees or 0)
             exit_ = exit_real if exit_real is not None else (pos.exit_fees_est or 0)
             all_time_fees += float(entry) + float(exit_)
+            if getattr(pos, "realized_price_pnl", None):   # cierres parciales
+                all_time_price += float(pos.realized_price_pnl)
 
         # Fill nets in series
         for row in series:
-            row["net"] = row["earned"]  # day-level fees not tracked separately
+            row["net"] = row["earned"] + row["price_pnl"]  # fees por día no se rastrean
 
         # Period sums
         def _sum_last(n_days: int) -> dict:
@@ -510,25 +530,23 @@ class DBPersistence:
             else:
                 rows = series[-n_days:]
             e = sum(r["earned"] for r in rows)
-            return {"earned": e, "fees": 0.0, "net": e}
+            pp = sum(r["price_pnl"] for r in rows)
+            return {"earned": e, "fees": 0.0, "price_pnl": pp, "net": e + pp}
 
-        today = {
-            "earned": by_date[today_str]["earned"] if today_str in by_date else 0.0,
-            "fees": 0.0,
-            "net": by_date[today_str]["earned"] if today_str in by_date else 0.0,
-        }
+        _t = by_date.get(today_str, {})
+        today = {"earned": _t.get("earned", 0.0), "fees": 0.0, "price_pnl": _t.get("price_pnl", 0.0),
+                 "net": _t.get("net", 0.0)}
         yest_dt = (now_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-        yesterday = {
-            "earned": by_date.get(yest_dt, {}).get("earned", 0.0),
-            "fees": 0.0,
-            "net": by_date.get(yest_dt, {}).get("earned", 0.0),
-        }
+        _y = by_date.get(yest_dt, {})
+        yesterday = {"earned": _y.get("earned", 0.0), "fees": 0.0, "price_pnl": _y.get("price_pnl", 0.0),
+                     "net": _y.get("net", 0.0)}
         last_7d = _sum_last(min(7, days))
         last_30d = _sum_last(min(30, days))
         all_time = {
             "earned": all_time_earned,
             "fees": all_time_fees,
-            "net": all_time_earned - all_time_fees,
+            "price_pnl": all_time_price,
+            "net": all_time_earned + all_time_price - all_time_fees,
         }
 
         # Realized APR (last 7d): annualize the 7d earnings against current
@@ -569,6 +587,9 @@ class DBPersistence:
             "reason": h.reason,
             "closed_at": h.closed_at.isoformat() if h.closed_at else "",
             "notes": getattr(h, "notes", None),
+            "price_pnl": getattr(h, "price_pnl", None),
+            "slippage_usd": getattr(h, "slippage_usd", None),
+            "exec": getattr(h, "exec_json", None),
         }
 
     def get_score_trend(self, symbol: str, exchange: str, limit: int = 10) -> dict:

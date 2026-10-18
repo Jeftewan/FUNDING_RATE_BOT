@@ -1482,7 +1482,8 @@ function renderPositions(data) {
             $${p.est_fees_total?.toFixed(2)}
           </span>
         </div>
-        <div class="pos-field"><span class="label">Neto</span><span class="value" style="color:${earnColor};font-weight:700">$${p.net_earned?.toFixed(2)}</span></div>
+        ${p.entry_basis_usd != null ? `<div class="pos-field"><span class="label" title="(precio perp − precio spot de entrada) × cantidad, con fills reales. Slippage de entrada vs mid: ${p.entry_slippage_usd != null ? '$' + (+p.entry_slippage_usd).toFixed(2) : '—'} (ya incluido). Se realiza al cerrar, junto con el basis de salida.">Basis entrada</span><span class="value" style="color:${p.entry_basis_usd >= 0 ? 'var(--green)' : 'var(--red)'}">${p.entry_basis_usd >= 0 ? '+' : '−'}$${Math.abs(p.entry_basis_usd).toFixed(2)}${p.entry_basis_pct != null ? ` <span style="font-size:10px;opacity:.7">(${(+p.entry_basis_pct).toFixed(3)}%)</span>` : ''}</span></div>` : ''}
+        <div class="pos-field"><span class="label" title="Funding − fees${p.realized_price_pnl ? ' + PnL de precio de cierres parciales' : ''}. El PnL de precio (basis + slippage) se suma al cerrar.">Neto</span><span class="value" style="color:${earnColor};font-weight:700">$${p.net_earned?.toFixed(2)}</span></div>
       </div>
 
       ${payTable}
@@ -1935,13 +1936,14 @@ let _lastHistoryData = [];
 
 function exportCSV() {
   if (!_lastHistoryData.length) { showToast('Sin historial para exportar', 'warning'); return; }
-  const headers = ['Simbolo','Exchange','Modo','Capital','Exposicion','Apalancamiento','Horas','Pagos','Ganancia','Fees','Neto','Tasa Promedio','Razon','Fecha Cierre'];
+  const headers = ['Simbolo','Exchange','Modo','Capital','Exposicion','Apalancamiento','Horas','Pagos','Ganancia','Fees','PnL Precio','Slippage','Neto','Tasa Promedio','Razon','Fecha Cierre'];
   const rows = _lastHistoryData.map(h => [
     h.symbol, h.exchange, h.mode || 'spot_perp',
     h.capital_used?.toFixed(2) || '', h.exposure?.toFixed(2) || '', h.leverage || '1',
     h.hours?.toFixed(1) || '',
     h.payment_count || h.intervals || '', h.earned?.toFixed(4) || '',
-    h.fees?.toFixed(4) || '', (h.net_earned || h.earned)?.toFixed(4) || '',
+    h.fees?.toFixed(4) || '', h.price_pnl != null ? h.price_pnl.toFixed(4) : '',
+    h.slippage_usd != null ? h.slippage_usd.toFixed(4) : '', (h.net_earned ?? h.earned)?.toFixed(4) || '',
     h.avg_rate ? (h.avg_rate * 100).toFixed(4) + '%' : '',
     h.reason || '', h.closed_at || h.time || '',
   ]);
@@ -1988,6 +1990,18 @@ function _drawHistoryRows(container, ordered, limit) {
     const editedMark = h.notes
       ? ' <span title="Editado manualmente" style="opacity:.6;font-size:11px">✎</span>'
       : '';
+    // Desglose del neto real: funding + PnL de precio (fills reales) − fees.
+    const ex = h.exec || {};
+    const pp = h.price_pnl;
+    const fmt = v => `${v >= 0 ? '+' : '−'}$${Math.abs(v).toFixed(2)}`;
+    const breakdown = pp != null
+      ? `<div class="hist-sub hist-breakdown" title="Basis entrada ${ex.entry_basis_pct != null ? (+ex.entry_basis_pct).toFixed(3) + '%' : '—'} · salida ${ex.exit_basis_pct != null ? (+ex.exit_basis_pct).toFixed(3) + '%' : '—'}${h.slippage_usd != null ? ' · slippage vs mid ' + fmt(-h.slippage_usd) + ' (ya incluido en precio)' : ''}">
+          <span>Funding ${fmt(h.earned || 0)}</span>
+          <span>Precio ${fmt(pp)}</span>
+          <span>Fees −$${(h.fees || 0).toFixed(2)}</span>
+          ${h.slippage_usd != null ? `<span style="opacity:.7">Slip ${fmt(-h.slippage_usd)}</span>` : ''}
+        </div>`
+      : '';
     return `
     <div class="hist-item">
       <div class="hist-main">
@@ -2000,6 +2014,7 @@ function _drawHistoryRows(container, ordered, limit) {
         ${exp ? `<span>${exp}${lev}</span>` : ''}
         <span>${date}</span>
       </div>
+      ${breakdown}
       <div class="hist-net" style="color:${netColor}">${sign}$${net.toFixed(2)}${editedMark}${editBtn}</div>
     </div>`;
   }).join('');

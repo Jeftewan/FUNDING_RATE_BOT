@@ -324,6 +324,15 @@ Encima del listado de posiciones, la tab "Posiciones" muestra:
 
 Datos provistos por `GET /api/earnings/daily?days=30` → `DBPersistence.aggregate_daily_earnings()` en `core/db_persistence.py`. Bucketing por día local del servidor. Limitación documentada: `realized_apr_7d` usa `capital_in_use` actual como aproximación (no series histórica de capital).
 
+## PnL neto real (posiciones auto)
+
+**Neto = funding + PnL de precio − fees.** Antes `net_earned = funding − fees` e ignoraba el resultado de precio de las dos piernas (basis de entrada/salida, slippage, comisión del DEX). Caso #43 AGT: registrado −0.0325, real −0.0244 (precio +0.0081: basis entrada +0.2195 %, salida −0.1899 %).
+- **Entrada** (`trade_executor._open_result`): `spot_avg_price_gross` = costo / cantidad **bruta** (la comisión cobrada en base ya va en `entry_fees_usd`, no se cuenta dos veces) → `user_positions.spot_entry_price`; `entry_price` = precio medio perp. `basis_pct` usa el bruto. `ref_mids` = mids al iniciar (`_ref_mids`; BSC: mid de cotizaciones chicas compra/venta, `BscSpotLeg.mid_price`) → `entry_slippage {spot, perp, total}` (USD, positivo = peor que el mid) → `entry_slippage_usd`.
+- **Cierre** (`_close_pnl`): `price_pnl = (proceeds_spot − spot_entry·qty_spot) + (perp_entry·qty_perp − costo_recompra)`, incluyendo los fills de los seguros (SL / venta límite). Sin precio de entrada (manual/importada) → `None` (fallback de `spot_entry` al audit `auto_open`). `exec` = precios entrada/salida, `exit_basis_pct`, `exit_slippage`.
+- **Persistencia**: parciales acumulan en `user_positions.realized_price_pnl`; `jobs.real_net_breakdown` suma todo → `user_history.price_pnl`, `slippage_usd` (entrada+salida, diagnóstico: ya está dentro del precio, no se resta aparte), `exec_json`. La edición manual (`PATCH /api/history/<id>/earnings`) recalcula con `price_pnl`. KPIs (`aggregate_daily_earnings`): `price_pnl` por día de cierre y en `all_time.net`.
+- **Activas**: `/api/positions` expone `entry_basis_usd` (basis capturado) y suma `realized_price_pnl` al neto; el PnL de precio total se realiza al cerrar.
+- **Backfill**: `python scripts/backfill_price_pnl.py [--user N]` (dry-run; `--apply` escribe, solo con las columnas ya migradas) reconstruye desde `execution_jobs`.
+
 ## Edición manual de earnings
 
 **Semántica: valor absoluto reseteable.** El usuario fija un total; el scanner sigue sumando los próximos settlements encima de ese valor. Sin flag de "freeze".

@@ -125,6 +125,12 @@ class UserPosition(db.Model):
     job_id = db.Column(db.Integer, nullable=True)
     # Seguros (SL del short + venta límite spot): ver trade_executor.place_protection.
     protection_json = db.Column(db.JSON, nullable=True)
+    # PnL real de ejecución (auto): precio medio BRUTO del spot (sin la comisión
+    # en base, que va en fees), PnL de precio ya realizado por cierres parciales y
+    # slippage de entrada vs mid al iniciar (diagnóstico: ya está dentro del precio).
+    spot_entry_price = db.Column(db.Float, nullable=True)
+    realized_price_pnl = db.Column(db.Float, nullable=True)
+    entry_slippage_usd = db.Column(db.Float, nullable=True)
     # "real" = earnings desde el income FUNDING_FEE del exchange (sync);
     # "estimated" = exposure × tasa pública (scanner).
     earnings_source = db.Column(db.String(20), default="estimated")
@@ -221,6 +227,11 @@ class UserHistory(db.Model):
     closed_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     # Free-form audit trail (e.g. "manual earnings edit at <ts>"). NULL = no edits.
     notes = db.Column(db.Text, nullable=True)
+    # PnL de precio de ambas piernas con fills reales (spot + perp). net_earned =
+    # earned (funding) + price_pnl − fees. NULL = sin datos de ejecución (manual).
+    price_pnl = db.Column(db.Float, nullable=True)
+    slippage_usd = db.Column(db.Float, nullable=True)   # entrada + salida, vs mid (diagnóstico)
+    exec_json = db.Column(db.JSON, nullable=True)       # precios entrada/salida, basis, slippage por pierna
 
     user = db.relationship("User", back_populates="history")
 
