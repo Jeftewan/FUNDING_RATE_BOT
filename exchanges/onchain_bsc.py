@@ -30,6 +30,7 @@ MAX_PRICE_IMPACT = 0.01           # 1%
 ONCHAIN_MAX_BASIS = 0.005         # compra on-chain hasta 0.5% sobre el perp bid (incluye fee del DEX)
 MIN_LIQUIDITY_USD = 200_000       # liquidez mínima del token (lista Alpha)
 RECEIPT_TIMEOUT = 90
+GAS_BUFFER = 1.3                  # margen sobre eth_estimateGas (el estado cambia entre estimar y minar)
 ALPHA_LIST_URL = ("https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/"
                   "wallet/cex/alpha/all/token/list")
 _ALPHA_TTL = 3600
@@ -102,6 +103,17 @@ def _gas_price() -> int:
 
 def _estimate_gas(tx: dict) -> int:
     return int(_rpc("eth_estimateGas", [{k: tx[k] for k in ("from", "to", "data", "value") if k in tx}]), 16)
+
+
+def _gas_limit(sender: str, tx: dict, hint=None) -> int:
+    """máx(eth_estimateGas × GAS_BUFFER, gas sugerido por el agregador).
+
+    El `gas` del agregador se queda corto en rutas multi-hop (caso real: límite
+    250k, el swap necesitaba ~364k → revert por out-of-gas). La estimación además
+    simula la tx: si revertiría, lanza y no se transmite (no se quema gas).
+    """
+    est = _estimate_gas({"from": sender, "to": tx["to"], "data": tx["data"], "value": hex(tx["value"])})
+    return max(int(est * GAS_BUFFER), int(hint or 0))
 
 
 def wait_receipt(tx_hash: str, timeout: float = RECEIPT_TIMEOUT) -> dict:
@@ -190,11 +202,7 @@ def _sign_and_send(wallet: dict, tx: dict, aggregator=None) -> str:
         full.update(type=2, maxFeePerGas=gas_price, maxPriorityFeePerGas=int(tx["maxPriorityFeePerGas"]))
     else:
         full["gasPrice"] = gas_price
-    gas = tx.get("gas")
-    if not gas:
-        gas = int(_estimate_gas({"from": acct.address, "to": full["to"], "data": full["data"],
-                                 "value": hex(full["value"])}) * 1.25)
-    full["gas"] = int(gas)
+    full["gas"] = _gas_limit(acct.address, full, tx.get("gas"))
     signed = acct.sign_transaction(full)
     raw = signed.raw_transaction.hex()
     raw = raw if raw.startswith("0x") else "0x" + raw
