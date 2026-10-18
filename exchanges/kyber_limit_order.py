@@ -84,8 +84,9 @@ def place_sell(wallet: dict, token: dict, base_qty: float, price: float, ttl: in
     """Venta límite de `base_qty` token a `price` USDT. Devuelve
     {id, expires_at, making, taking}."""
     maker = wallet["address"]
-    making = bsc.to_wei(base_qty, int(token["decimals"]))
-    taking = bsc.to_wei(base_qty * price, bsc.USDT_DECIMALS)
+    dec = int(token["decimals"])
+    making = min(bsc.to_wei(base_qty, dec), bsc.erc20_balance(token["address"], maker))
+    taking = bsc.to_wei(bsc.from_wei(making, dec) * price, bsc.USDT_DECIMALS)
     if making <= 0 or taking <= 0:
         raise LimitOrderError("cantidad/precio inválidos para la orden límite")
     expires = int(time.time()) + int(ttl)

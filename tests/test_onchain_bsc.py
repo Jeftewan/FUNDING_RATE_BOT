@@ -46,6 +46,8 @@ def chain(monkeypatch):
     def send(wallet, tx, agg=None):
         if tx.get("_swap"):
             src, dst, amt = tx["_swap"]
+            if amt > c.bal.get(src.lower(), 0):
+                raise RuntimeError("execution reverted: TransferHelper: TRANSFER_FROM_FAILED")
             c.bal[src.lower()] -= amt
             c.bal[dst.lower()] = c.bal.get(dst.lower(), 0) + c._out(src, amt)
         else:  # approve
@@ -155,3 +157,20 @@ def test_sign_accepts_lowercase_to(monkeypatch):
     tx = {"to": "0x5dbde81fce337ff4bcaaee4ca3466c00aecae274", "data": "0x", "gasPrice": 50_000_000}
     assert ob._sign_and_send(WALLET, tx, Agg()) == "0xhash"
     assert sent["raw"].startswith("0x")
+
+
+def test_to_wei_exact_decimal():
+    assert ob.to_wei(0.1, 18) == 10 ** 17
+    assert ob.to_wei(50.3, 18) == 503 * 10 ** 17
+
+
+def test_onchain_close_full_balance_with_float_dust(chain, perp):
+    # Caso real (job #5, AGT): vender "todo" pedía 25 614 wei más que el saldo.
+    chain.bal[TOKEN["address"].lower()] = 170163324011630992370
+    perp.short = 170
+    pos = {"mode": "spot_perp", "symbol": "XYZ", "exchange": "Binance", "spot_venue": "bsc",
+           "spot_qty": 170.163324011631, "perp_qty": 170, "entry_price": 2.0}
+    res = te.execute_close(CREDS, pos, spot_leg_factory=_factory(chain))
+    assert res["ok"] and res["complete"], res
+    assert chain.bal[TOKEN["address"].lower()] == 0
+    assert perp.short == pytest.approx(0)
