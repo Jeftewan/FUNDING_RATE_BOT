@@ -189,11 +189,13 @@ def _sign_and_send(wallet: dict, tx: dict, aggregator=None) -> str:
     fallback a eth_sendRawTransaction.
     """
     from eth_account import Account
+    from eth_utils import to_checksum_address
     acct = Account.from_key(wallet["private_key"])
     full = {
         "chainId": CHAIN_ID,
         "nonce": _nonce(acct.address),
-        "to": tx["to"],
+        # eth-account exige checksum EIP-55; la lista Alpha trae direcciones en minúsculas.
+        "to": to_checksum_address(tx["to"]),
         "data": tx.get("data", "0x"),
         "value": int(tx.get("value") or 0),
     }

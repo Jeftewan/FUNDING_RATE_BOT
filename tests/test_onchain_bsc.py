@@ -139,3 +139,19 @@ def test_gas_limit_aborts_if_simulation_reverts(monkeypatch):
     monkeypatch.setattr(ob, "_estimate_gas", boom)
     with pytest.raises(RuntimeError):
         ob._gas_limit(WALLET["address"], {"to": "0xr", "data": "0x", "value": 0}, 250_000)
+
+
+def test_sign_accepts_lowercase_to(monkeypatch):
+    # Caso real: approve del token Alpha (dirección en minúsculas) → "invalid fields: to".
+    monkeypatch.setattr(ob, "_nonce", lambda a: 0)
+    monkeypatch.setattr(ob, "_gas_limit", lambda s, tx, hint=None: 60_000)
+    sent = {}
+
+    class Agg:
+        def broadcast(self, raw, addr):
+            sent["raw"] = raw
+            return "0xhash"
+
+    tx = {"to": "0x5dbde81fce337ff4bcaaee4ca3466c00aecae274", "data": "0x", "gasPrice": 50_000_000}
+    assert ob._sign_and_send(WALLET, tx, Agg()) == "0xhash"
+    assert sent["raw"].startswith("0x")
