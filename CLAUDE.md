@@ -48,10 +48,12 @@ exchanges/
   trade_executor.py     # ÚNICA capa que coloca órdenes CEX (spot_perp pareado, TWAP, cross, reconcile)
   binance_account.py    # Cuenta Binance del usuario: permisos, modo, saldos, posiciones, income
   onchain_bsc.py        # Pierna spot on-chain BSC (wallet dedicada, tokens Alpha)
-  dex_aggregator.py     # Binance Web3 API (HMAC) / 0x para swaps BSC
+  dex_aggregator.py     # Binance Web3 API (HMAC) / 0x / KyberSwap (fallback por región) para swaps BSC
+  kyber_limit_order.py  # Órdenes límite on-chain BSC (seguro de la pierna spot, 7 días)
 execution/
   jobs.py               # Jobs de ejecución real en background + reconciliación
   account_sync.py       # Sync periódico de cuentas reales (snapshots, funding real, drift)
+  protection.py         # Vigilante de seguros (SL/venta límite): cierra la otra pierna, renueva BSC
 tests/                  # pytest: executor, jobs (SQLite), on-chain (mocks)
 core/
   db_models.py          # Modelos SQLAlchemy (8 tablas)
@@ -374,6 +376,19 @@ Cada 5 min (y bajo demanda) por usuario con keys de Binance → `user_account_sn
 ### Spot on-chain BSC (`exchanges/onchain_bsc.py`, `exchanges/dex_aggregator.py`)
 Para tokens cuyo spot solo existe en Alpha (detectado con la token list pública, chainId 56, liquidez ≥ $200k). Wallet **dedicada** del usuario (`user_wallets`, private key cifrada fail-closed). `BscSpotLeg`: quote → guardas (impacto ≤ 1%, precio ≤ perp_bid·1.005) → approve acotado → swap (tx tipo 2/legacy firmada con eth-account; **gas = máx(eth_estimateGas×1.3, gas del agregador)** — el del agregador se quedó corto en rutas multi-hop y el swap revirtió por out-of-gas el 2026-10-18; la estimación simula y aborta antes de transmitir si revertiría) → broadcast (MEV protection) → receipt → cantidad real = delta de `balanceOf` → hedge perp. Flag `ONCHAIN_ENABLED=1`. Reconciliación automática tras reinicio: **no** (on-chain queda `interrupted` para revisión).
 
+**Agregador con fallback** (`exchanges/dex_aggregator.py:build_aggregator`): `FallbackAggregator([primario, KyberSwap])`. Si el primario (Binance Web3) responde bloqueo de región/compliance (`40301/40302/40304`) pasa a **KyberSwap Aggregator** (sin API key, `aggregator-api.kyberswap.com/bsc`) y recuerda el bloqueo 1 h; Kyber no tiene broadcast propio → la tx sale por el RPC BSC. Sin keys Web3 → Kyber directo. `DEX_AGGREGATOR=kyber` lo fuerza. Motivo: con el bot en Amsterdam, el cierre de la posición #43 (AGT) falló con `Web3 API 40304: Service not available due to compliance restriction` (job #4, 2026-10-18). Un cierre que no ejecuta nada ahora queda `failed` + alerta (antes `done` silencioso).
+
+### Seguros automáticos spot_perp (SL + venta límite)
+Al abrir por API (`jobs._run_open` → `trade_executor.place_protection`), solo Binance:
+- **Precio**: `sl = entry + 0.75·(liq − entry)` (`PROTECTION_LIQ_FRACTION`); `liq` = `liquidationPrice` real de `fetch_positions`, fallback `liquidation_estimate`.
+- **Perp**: `STOP_MARKET` buy `closePosition=true`, `workingType=MARK_PRICE` (hedge: `positionSide=SHORT`). ccxt 4.5.85 lo enruta a la **Algo Order API** (`/fapi/v1/algoOrder`); consultar/cancelar con `params={"trigger": True}`; al dispararse `info.actualOrderId` = orden de mercado real.
+- **Spot CEX**: `LIMIT` sell GTC por `spot_qty` a `sl` (bloquea la base libre).
+- **Spot BSC**: orden límite **KyberSwap Limit Order** (`exchanges/kyber_limit_order.py`): sign-message → approve del contrato DSLO → firma EIP-712 local → `POST /write/api/v1/orders`; expira a **7 días**, cancelación gasless.
+- Persistido en `user_positions.protection_json` (`status`, `sl_price`, `liq_price`, `perp{id,status}`, `spot{venue,id,status,qty,expires_at}`, `errors`). Fallo → la posición queda abierta + alerta CRITICAL "Seguros NO colocados" (`status=failed`, badge "SIN SEGUROS").
+- **Cierre**: `_close_spot_perp` cancela los seguros ANTES de leer el saldo libre; lo que ya llenaron suma a `exit_fees_usd` (`protection_filled`). Si el cierre falla/parcial, `jobs._restore_protection` los vuelve a poner sobre lo que queda.
+- **Vigilante** (`execution/protection.py`, cada 60 s, lo arranca `JobRunner.start`): si se llenó el SL o la venta → lanza un job de cierre normal (`trigger:"protection"`) que cierra la otra pierna; orden BSC a <12 h de expirar → la renueva + Telegram `PROTECTION_RENEWED`; seguro cancelado fuera de basyo → `PROTECTION_CANCELED`.
+- Solo posiciones nuevas (las previas al cambio no tienen seguros).
+
 ### Rutas
 `/api/execute_open` (`{opportunity_id, capital, leverage, dry_run?, twap?, allow_market_fallback?}`), `/api/execute_close` (`{position_id, dry_run?, twap?}`, solo `auto`/`imported`), `/api/exec/jobs/<id>`, `/api/exec/jobs/active`, `/api/exec/jobs/<id>/cancel`, `/api/account/binance` (snapshot), `/api/account/binance/sync`, `/api/account/binance/multi_assets_off` (`{confirm:true}`), `/api/account/binance/import` (`{symbol}`), `/api/account/settings` (`{auto_transfer}`), `/api/account/wallet` (GET/POST `{private_key, accept_risk:true}`/DELETE).
 
@@ -496,7 +511,7 @@ ENABLED_EXCHANGES     # Default: binance,bybit,okx,bitget
 ARBITRAGE_MODES       # Default: spot_perp,cross_exchange
 TRADE_SANDBOX         # =1 → auto-ejecución en test (Binance: demo trading; resto: set_sandbox_mode)
 ONCHAIN_ENABLED       # =1 → habilita la pierna spot on-chain BSC (tokens solo-Alpha)
-DEX_AGGREGATOR        # binance (default, Web3 API) | 0x
+DEX_AGGREGATOR        # binance (default, Web3 API, fallback auto a KyberSwap) | 0x | kyber
 BINANCE_WEB3_API_KEY / BINANCE_WEB3_API_SECRET   # web3.binance.com/en/dev-portal (permisos Trading + Transaction)
 ZEROX_API_KEY         # si DEX_AGGREGATOR=0x
 BSC_RPC_URL           # default https://bsc-dataseed.bnbchain.org

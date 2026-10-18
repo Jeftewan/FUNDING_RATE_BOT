@@ -1232,6 +1232,7 @@ function showExecResult(title, data, isDry, job) {
   }
   if (liq && liq.liq_price) {
     extra += `<div class="est-row"><span>Liquidación est. del short</span><span class="est-val" style="color:${liq.warning ? 'var(--red)' : 'inherit'}">$${(+liq.liq_price).toPrecision(6)} (+${liq.liq_distance_pct}%)</span></div>`;
+    if (liq.sl_price) extra += `<div class="est-row"><span>Seguros: SL short + venta spot</span><span class="est-val">$${(+liq.sl_price).toPrecision(6)} (75% hacia liq.)</span></div>`;
     if (liq.warning) extra += `<div class="exec-warn" style="margin:6px 0">Distancia a liquidación &lt; 33%: un rally moderado puede liquidar el short. Considera menos leverage.</div>`;
   }
   if (ex.basis_pct != null) {
@@ -1334,6 +1335,23 @@ async function analyzePositionsAI() {
   }
 }
 
+function protectionBadge(pr) {
+  if (!pr) return '';
+  if (pr.status !== 'active') {
+    return `<span class="ind-badge badge-unprotected" title="${(pr.msg || 'Seguros no colocados').replace(/"/g, '&quot;')}">SIN SEGUROS</span>`;
+  }
+  const legs = [];
+  if (pr.perp) legs.push(`SL short: ${pr.perp.status}`);
+  if (pr.spot) {
+    let s = `Venta spot (${pr.spot.venue}): ${pr.spot.status}`;
+    if (pr.spot.expires_at) s += `, expira ${new Date(pr.spot.expires_at * 1000).toLocaleString()}`;
+    legs.push(s);
+  }
+  if ((pr.errors || []).length) legs.push('Errores: ' + pr.errors.join('; '));
+  const ok = pr.perp && pr.perp.status === 'open' && pr.spot && pr.spot.status === 'open';
+  return `<span class="ind-badge ${ok ? 'badge-protected' : 'badge-unprotected'}" title="${legs.join(' | ').replace(/"/g, '&quot;')}">🛡 SL $${(+pr.sl_price).toPrecision(5)}</span>`;
+}
+
 function renderPositions(data) {
   _lastPosData = data;
   const positions = data.positions || [];
@@ -1433,6 +1451,7 @@ function renderPositions(data) {
           ${p.source === 'imported' ? '<span class="ind-badge badge-auto" title="Importada desde tu cuenta de Binance">IMPORTADA</span>' : ''}
           ${p.spot_venue === 'bsc' ? '<span class="ind-badge badge-onchain" title="Pierna spot en tu wallet BSC">BSC</span>' : ''}
           ${p.earnings_source === 'real' ? '<span class="ind-badge badge-real" title="Funding real leído del income de Binance">FUNDING REAL</span>' : ''}
+          ${protectionBadge(p.protection)}
         </div>
         <div class="pos-header-actions">
           ${posIsAutoClosable(p) ? `<button class="btn btn-exec" onclick="autoExecuteClose('${posId}','${p.symbol}')" title="Cerrar colocando órdenes reales">Cerrar (auto)</button>` : ''}

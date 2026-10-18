@@ -408,6 +408,7 @@ class DBPersistence:
             "entry_mode": getattr(pos, "entry_mode", "") or "",
             "source": getattr(pos, "source", "") or "manual",
             "earnings_source": getattr(pos, "earnings_source", "") or "estimated",
+            "protection": getattr(pos, "protection_json", None) or None,
             "payments": pos.payments_json or [],
         }
 

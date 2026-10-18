@@ -649,6 +649,202 @@ def binance_preflight(perp_cli, perp_sym: str, leverage: int):
         raise ExecError(f"Leverage {leverage}x supera el máximo de {perp_sym} ({max_lev}x)")
 
 
+# ── Seguros spot_perp: SL del short + venta límite del spot al mismo precio ──
+# SL al 75 % del camino entrada → liquidación del short aislado. El spot se vende
+# con una límite a ese precio (CEX: LIMIT GTC; BSC: orden límite Kyber de 7 días),
+# así ambas piernas salen juntas antes de la liquidación. El vigilante
+# (execution/protection.py) completa la otra pierna si solo se llena una.
+PROTECTION_LIQ_FRACTION = 0.75
+PROTECTION_EXCHANGES = {"binance"}   # STOP_MARKET closePosition vía Algo API (ccxt)
+
+
+def protection_price(entry: float, liq: float, fraction: float = PROTECTION_LIQ_FRACTION) -> float:
+    return entry + fraction * (liq - entry)
+
+
+def _short_liq_price(perp_cli, perp_sym: str):
+    try:
+        for p in perp_cli.fetch_positions([perp_sym]):
+            if p.get("contracts") and p.get("side") in (None, "short") and p.get("liquidationPrice"):
+                return float(p["liquidationPrice"])
+    except Exception as e:
+        log.warning(f"liquidationPrice {perp_sym} failed: {e}")
+    return None
+
+
+def _protection_clients(creds_by_exchange, position):
+    exchange = position.get("exchange", "")
+    if exchange.lower() not in PROTECTION_EXCHANGES:
+        raise ExecError(f"Seguros automáticos no soportados en {exchange}")
+    creds = creds_by_exchange.get(exchange.lower())
+    if not creds:
+        raise ExecError(f"Sin API keys para {exchange}")
+    spot_cli = _build_client(exchange, creds, default_type="spot")
+    perp_cli = _build_client(exchange, creds, default_type="swap")
+    _ensure_markets(spot_cli)
+    _ensure_markets(perp_cli)
+    sym = position.get("symbol", "")
+    return spot_cli, perp_cli, to_ccxt_symbol(sym, "spot"), to_ccxt_symbol(sym, "swap")
+
+
+def place_protection(creds_by_exchange: dict, position: dict, ctx: ExecContext = None,
+                     wallet: dict = None, token: dict = None) -> dict:
+    """Coloca SL (STOP_MARKET closePosition, mark price) + venta límite del spot.
+
+    Cada pierna es independiente: si una falla, la otra se conserva y el error
+    queda en `errors`. Devuelve el dict a persistir en user_positions.protection_json
+    (ok=False si no se pudo colocar ninguna).
+    """
+    ctx = ctx or ExecContext()
+    try:
+        spot_cli, perp_cli, spot_sym, perp_sym = _protection_clients(creds_by_exchange, position)
+    except ExecError as e:
+        return {"ok": False, "msg": str(e)}
+    except Exception as e:
+        return {"ok": False, "msg": f"No se pudo conectar a {position.get('exchange')}: {e}"}
+
+    entry = float(position.get("entry_price") or 0)
+    liq, liq_source = _short_liq_price(perp_cli, perp_sym), "exchange"
+    if not liq and entry:
+        _, mmr = binance_max_leverage(perp_cli, perp_sym)
+        liq = liquidation_estimate(entry, position.get("leverage") or 1, mmr or 0.004)["liq_price"]
+        liq_source = "estimate"
+    if not entry or not liq or liq <= entry:
+        return {"ok": False, "msg": f"No se pudo determinar entrada/liquidación (entry={entry}, liq={liq})"}
+    sl = float(perp_cli.price_to_precision(perp_sym, protection_price(entry, liq)))
+    prot = {"status": "active", "sl_price": sl, "liq_price": liq, "liq_source": liq_source,
+            "entry_price": entry, "fraction": PROTECTION_LIQ_FRACTION, "placed_at": time.time(),
+            "perp": None, "spot": None, "errors": []}
+
+    try:
+        params = {"closePosition": True, "workingType": "MARK_PRICE", "triggerPrice": sl}
+        if _is_hedged(perp_cli, perp_sym) is True:
+            params["positionSide"] = "SHORT"
+        o = perp_cli.create_order(perp_sym, "STOP_MARKET", "buy", None, None,
+                                  _with_coid(params, ctx.coid("sl")))
+        prot["perp"] = {"id": str(o.get("id")), "status": "open"}
+    except Exception as e:
+        log.error(f"SL {perp_sym} failed: {e}")
+        prot["errors"].append(f"SL del short: {e}")
+
+    venue = position.get("spot_venue") or "binance"
+    try:
+        if venue == "bsc":
+            from exchanges import kyber_limit_order as klo
+            from exchanges import onchain_bsc as bsc
+            if not wallet or not token:
+                raise ExecError("falta wallet/token BSC")
+            held = bsc.from_wei(bsc.erc20_balance(token["address"], wallet["address"]), int(token["decimals"]))
+            qty = min(float(position.get("spot_qty") or 0), held)
+            lo = klo.place_sell(wallet, token, qty, sl)
+            prot["spot"] = {"venue": "bsc", "id": lo["id"], "status": "open", "qty": qty,
+                            "expires_at": lo["expires_at"]}
+        else:
+            qty = _spot_sellable(spot_cli, spot_sym, float(position.get("spot_qty") or 0))
+            if qty <= 0 or not _min_ok(spot_cli, spot_sym, qty, sl):
+                raise ExecError(f"cantidad spot {qty:g} bajo el mínimo")
+            o = spot_cli.create_order(spot_sym, "limit", "sell", qty, sl, _with_coid({}, ctx.coid("tp")))
+            prot["spot"] = {"venue": "binance", "id": str(o.get("id")), "status": "open", "qty": qty}
+    except Exception as e:
+        log.error(f"venta límite spot {spot_sym} failed: {e}")
+        prot["errors"].append(f"Venta límite spot: {e}")
+
+    prot["ok"] = bool(prot["perp"] or prot["spot"])
+    if not prot["ok"]:
+        prot["msg"] = "; ".join(prot["errors"])
+    return prot
+
+
+def _leg_active(leg) -> bool:
+    return bool(leg and leg.get("id") and leg.get("status") == "open")
+
+
+def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = None) -> dict:
+    """Estado real de los seguros: {perp, spot} ∈ open|filled|canceled|missing|unknown,
+    con fills (`perp_fill`, `spot_fill`) cuando hay ejecución."""
+    prot = position.get("protection") or {}
+    out = {"perp": "missing", "spot": "missing"}
+    spot_cli, perp_cli, spot_sym, perp_sym = _protection_clients(creds_by_exchange, position)
+    if _leg_active(prot.get("perp")):
+        try:
+            o = perp_cli.fetch_order(prot["perp"]["id"], perp_sym, {"trigger": True})
+            st = o.get("status")
+            out["perp"] = {"closed": "filled", "open": "open"}.get(st, "canceled")
+            if out["perp"] == "filled":
+                actual = (o.get("info") or {}).get("actualOrderId")
+                out["perp_fill"] = order_fills(perp_cli, perp_sym, actual) if actual else None
+        except Exception as e:
+            log.warning(f"SL status {perp_sym}: {e}")
+            out["perp"] = "unknown"
+    spot = prot.get("spot")
+    if _leg_active(spot):
+        try:
+            if spot.get("venue") == "bsc":
+                from exchanges import kyber_limit_order as klo
+                o = klo.get_order(wallet["address"], spot["id"]) if wallet else None
+                st = (o or {}).get("status")
+                filled = int((o or {}).get("filledMakingAmount") or 0)
+                if st == "filled" or (filled and st not in klo.ACTIVE_STATUSES):
+                    out["spot"] = "filled"
+                elif st in klo.ACTIVE_STATUSES:
+                    out["spot"] = "open"
+                else:
+                    out["spot"] = "canceled" if o else "unknown"   # cancelled/expired
+            else:
+                o = spot_cli.fetch_order(spot["id"], spot_sym)
+                st = o.get("status")
+                out["spot"] = {"closed": "filled", "open": "open"}.get(st, "canceled")
+                if out["spot"] == "filled":
+                    out["spot_fill"] = order_fills(spot_cli, spot_sym, spot["id"])
+        except Exception as e:
+            log.warning(f"spot protection status {spot_sym}: {e}")
+            out["spot"] = "unknown"
+    return out
+
+
+def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None) -> dict:
+    """Cancela las órdenes de seguro vivas. Devuelve fees/qty de lo que ya se
+    había llenado (para sumarlo al cierre)."""
+    out = {"perp_filled": 0.0, "spot_filled": 0.0, "fee_usd": 0.0}
+    perp = prot.get("perp")
+    if _leg_active(perp):
+        try:
+            o = perp_cli.fetch_order(perp["id"], perp_sym, {"trigger": True})
+            if o.get("status") == "open":
+                perp_cli.cancel_order(perp["id"], perp_sym, {"trigger": True})
+            elif o.get("status") == "closed" and (o.get("info") or {}).get("actualOrderId"):
+                f = order_fills(perp_cli, perp_sym, o["info"]["actualOrderId"])
+                out["perp_filled"], out["fee_usd"] = f["gross"], out["fee_usd"] + f["fee_usd"]
+        except Exception as e:
+            log.warning(f"cancel SL {perp_sym}: {e}")
+    spot = prot.get("spot")
+    if _leg_active(spot):
+        try:
+            if spot.get("venue") == "bsc":
+                from exchanges import kyber_limit_order as klo
+                if wallet:
+                    klo.cancel(wallet, [spot["id"]])
+            else:
+                o = spot_cli.fetch_order(spot["id"], spot_sym)
+                if o.get("status") == "open":
+                    spot_cli.cancel_order(spot["id"], spot_sym)
+                    o = _final_order(spot_cli, spot["id"], spot_sym) or o
+                if float(o.get("filled") or 0) > 0:
+                    f = order_fills(spot_cli, spot_sym, spot["id"])
+                    out["spot_filled"], out["fee_usd"] = f["gross"], out["fee_usd"] + f["fee_usd"]
+        except Exception as e:
+            log.warning(f"cancel venta límite {spot_sym}: {e}")
+    return out
+
+
+def cancel_protection(creds_by_exchange: dict, position: dict, wallet: dict = None) -> dict:
+    prot = position.get("protection") or {}
+    if not prot:
+        return {}
+    spot_cli, perp_cli, spot_sym, perp_sym = _protection_clients(creds_by_exchange, position)
+    return _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet)
+
+
 # ── Public: connection test + spot gate ────────────────────────────────────
 def test_connection(exchange_name: str, creds: dict) -> dict:
     """Validate the user's keys by fetching the futures balance."""
@@ -972,6 +1168,8 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
     is_binance = exchange.lower() == "binance"
     max_lev, mmr = (binance_max_leverage(perp_cli, perp_sym) if is_binance else (None, None))
     liq = liquidation_estimate(plan["perp_mid"], leverage, mmr or 0.004)
+    if is_binance and liq.get("liq_price"):
+        liq["sl_price"] = protection_price(plan["perp_mid"], liq["liq_price"])
 
     if dry_run:
         sugg = twap_suggestion(spot_cli, spot_sym, plan["spot_size"]) if not onchain else \
@@ -1348,10 +1546,17 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         return {"ok": False, "msg": f"No se pudo conectar a {exchange}: {e}"}
 
     onchain = spot_leg_factory is not None
+    leg = spot_leg_factory(perp_cli, perp_sym, ctx) if onchain else None
+    # Seguros primero: la venta límite bloquea la base (saldo libre) y el SL no
+    # debe dispararse a mitad del cierre. Lo que ya llenaron cuenta como salida.
+    prot_fill = {}
+    if position.get("protection") and not dry_run:
+        prot_fill = _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym,
+                                               position["protection"],
+                                               getattr(leg, "wallet", None))
     actual_short = _open_perp_size(perp_cli, perp_sym, "short")
     perp_to_close = min(perp_qty, actual_short) if actual_short else 0.0
     if onchain:
-        leg = spot_leg_factory(perp_cli, perp_sym, ctx)
         spot_held = leg.held_base()
     else:
         leg = CexSpotLeg(spot_cli, spot_sym, ctx, perp_cli, perp_sym)
@@ -1426,7 +1631,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
 
     res = {
         "ok": True, "dry_run": False, "drift": drift,
-        "exit_fees_usd": round(leg.fee_usd + hedger.fee_usd, 6),
+        "exit_fees_usd": round(leg.fee_usd + hedger.fee_usd + prot_fill.get("fee_usd", 0.0), 6),
+        "protection_filled": prot_fill or None,
         "spot_sold": state["sold"], "perp_closed": hedger.hedged,
         "spot_exit_price": state["proceeds"] / state["sold"] if state["sold"] else None,
         "perp_exit_price": hedger.avg or None,

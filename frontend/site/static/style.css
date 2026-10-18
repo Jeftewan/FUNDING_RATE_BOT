@@ -338,6 +338,8 @@ body {
 .badge-auto { background: rgba(245,158,11,0.18); color: var(--orange); border: 1px solid #f59e0b55; }
 .badge-real { background: rgba(34,197,94,0.15); color: var(--green); border: 1px solid #22c55e55; }
 .badge-onchain { background: rgba(59,130,246,0.15); color: var(--blue); border: 1px solid #3b82f655; }
+.badge-protected { background: rgba(34,197,94,0.12); color: var(--green); border: 1px solid #22c55e55; }
+.badge-unprotected { background: rgba(245,158,11,0.15); color: #f59e0b; border: 1px solid #f59e0b55; }
 
 /* Binance live: datos reales, drift, TWAP, progreso de jobs */
 .pos-real { display: flex; flex-wrap: wrap; gap: 6px 14px; font-family: var(--font-ui); font-size: 11px; color: var(--text-secondary); margin: 4px 0 8px; }
