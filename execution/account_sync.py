@@ -13,6 +13,8 @@ import threading
 import time
 from datetime import datetime
 
+from exchanges.net import is_geoblock_error, mark_geoblocked
+
 log = logging.getLogger("bot.sync")
 
 SYNC_INTERVAL = 300
@@ -92,6 +94,9 @@ class AccountSyncer:
             with self.app.app_context():
                 DBPersistence().save_account_snapshot(uid, "binance", {}, ok=False,
                                                       error=f"{type(e).__name__}: {e}")
+            if is_geoblock_error(e):
+                mark_geoblocked("binance")
+                self._geoblock_alert(uid, "Binance")
             return {"ok": False, "error": str(e)}
 
         with self.app.app_context():
@@ -157,6 +162,24 @@ class AccountSyncer:
             self.worker._dispatch_alerts_per_user(alerts)
         except Exception as e:
             log.warning(f"drift alert dispatch: {e}")
+
+    def _geoblock_alert(self, uid, exchange: str):
+        """Una alerta diaria: el exchange rechaza la IP de salida (451/403)."""
+        if not self.worker or not self.worker.email_notifier:
+            return
+        day = datetime.now().strftime("%Y%m%d")
+        alert = {
+            "type": "EXCHANGE_GEOBLOCKED", "severity": "CRITICAL",
+            "symbol": "-", "exchange": exchange, "user_id": uid,
+            "_exc_bucket": day,
+            "dedup_key": f"EXCHANGE_GEOBLOCKED:{uid}:{exchange}:{day}",
+            "message": f"{exchange} rechaza la IP del servidor por ubicación: sin sync de "
+                       "saldos, funding real ni ejecución automática.",
+        }
+        try:
+            self.worker._dispatch_alerts_per_user([alert])
+        except Exception as e:
+            log.warning(f"geoblock alert dispatch: {e}")
 
     # ── Wallet BSC ─────────────────────────────────────────────────────
     def _sync_wallet(self, uid: int):

@@ -7,11 +7,45 @@ RPC BSC salen directo (no dependen del proxy).
 """
 import logging
 import os
+import re
+import time
 from urllib.parse import urlsplit
 
 log = logging.getLogger("bot")
 
 EGRESS_URL = "https://ipinfo.io/json"
+
+# Países desde los que Binance/Bybit niegan servicio. Las IPs propias de Railway
+# (AS400940, 152.55.x) geolocalizan en San Francisco sin importar la región.
+BLOCKED_COUNTRIES = {"US"}
+
+# 451 de Binance ("restricted location") y 403 CloudFront de Bybit ("block access
+# from your country").
+_GEOBLOCK_RE = re.compile(r"restricted location|block access from your country", re.I)
+GEOBLOCK_TTL = 3600
+
+_egress = {}       # {country, proxy} del último log_egress
+_geoblocked = {}   # {exchange: ts del último 451/403 geográfico}
+
+
+def is_geoblock_error(err) -> bool:
+    return bool(_GEOBLOCK_RE.search(str(err)))
+
+
+def mark_geoblocked(exchange: str):
+    _geoblocked[exchange.lower()] = time.time()
+
+
+def geoblocked() -> list:
+    """Exchanges con geobloqueo visto en la última hora."""
+    now = time.time()
+    return sorted(ex for ex, ts in _geoblocked.items() if now - ts < GEOBLOCK_TTL)
+
+
+def egress_status() -> dict:
+    """Resumen para /health (público): sin IP ni host del proxy."""
+    return {"country": _egress.get("country"), "proxy": bool(exchange_proxy()),
+            "geoblocked": geoblocked()}
 
 
 def exchange_proxy() -> str:
@@ -46,6 +80,12 @@ def log_egress():
     import requests
     try:
         j = requests.get(EGRESS_URL, proxies=requests_proxies(), timeout=10).json()
-        log.info(f"Egress exchanges: {j.get('country')} {j.get('ip')} via {describe()}")
+        country = j.get("country")
+        _egress.update(country=country)
+        log.info(f"Egress exchanges: {country} {j.get('ip')} via {describe()}")
+        if country in BLOCKED_COUNTRIES:
+            log.error(f"Egress exchanges en {country}: Binance/Bybit responderán 451/403. "
+                      "Configurar EXCHANGE_PROXY_URL (VPS en país permitido) o una IP "
+                      "estática no-US.")
     except Exception as e:
         log.warning(f"Egress exchanges: check falló via {describe()}: {e}")
