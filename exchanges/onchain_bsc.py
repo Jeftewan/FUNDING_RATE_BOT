@@ -129,7 +129,12 @@ def wait_receipt(tx_hash: str, timeout: float = RECEIPT_TIMEOUT) -> dict:
 
 
 def to_wei(amount: float, decimals: int) -> int:
-    return int(round(amount * (10 ** decimals)))
+    """Decimal desde el repr (sin ruido binario de `amount * 10**18`), truncado.
+    Un float que viene de from_wei(saldo) aún puede quedar unos wei por encima del
+    saldo (caso real: +25 614 wei → TRANSFER_FROM_FAILED): quien vende "todo" debe
+    acotar contra erc20_balance (ver BscSpotLeg._swap)."""
+    from decimal import ROUND_DOWN, Decimal
+    return int((Decimal(repr(float(amount))) * (10 ** decimals)).to_integral_value(rounding=ROUND_DOWN))
 
 
 def from_wei(amount: int, decimals: int) -> float:
@@ -282,6 +287,11 @@ class BscSpotLeg:
         agregador caduca en ~30 s, así que tras aprobar se pide un swap fresco.
         """
         amt_wei = to_wei(amount_in, src_dec)
+        if src.lower() != NATIVE.lower():
+            # Nunca más que el saldo real (vender "todo" llega como float redondeado).
+            amt_wei = min(amt_wei, erc20_balance(src, self.address))
+        if amt_wei <= 0:
+            raise RuntimeError("saldo insuficiente para el swap")
         q = self.agg.swap_tx(src, dst, amt_wei, self.address, self.max_slippage, MAX_PRICE_IMPACT)
         if src.lower() != NATIVE.lower() and \
                 erc20_allowance(src, self.address, q["spender"]) < amt_wei:
