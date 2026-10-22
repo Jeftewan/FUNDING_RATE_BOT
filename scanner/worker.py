@@ -1636,7 +1636,9 @@ class ScannerWorker:
                 ),
                 "message": (
                     f"Posicion abierta {elapsed_h:.0f}h ({elapsed_h/24:.0f} dias) "
-                    f"— revisar SL/TP. Ganancia acum: ${earned:.2f}"
+                    f"— revisar SL/TP y margen. Ganancia acum: ${earned:.2f}. Mientras el "
+                    f"funding siga positivo conviene mantener (reports/exit_policy_20261022.md: "
+                    f"hasta ~30 d rinde más que cerrar por tiempo)"
                 ),
             })
             self._sl_tp_review_sent[pos_id] = now

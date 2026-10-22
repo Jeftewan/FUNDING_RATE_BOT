@@ -35,6 +35,29 @@ class ArbitrageScanner:
         self._defi_exchanges = set(getattr(config, "DEFI_EXCHANGES", []))
 
     @staticmethod
+    def _model_params(all_rates_hist: list, fr, score_params: dict) -> dict:
+        """Params para el MODELO según el feature_spec del artefacto cargado.
+
+        settled_v1 (dataset Binance): ventana = las LOOKBACK liquidaciones
+        anteriores a la última y "tasa actual" = la última liquidada — igual que
+        scripts/ml_binance.py; ambas salen del mismo endpoint (/fapi/v1/fundingRate).
+        """
+        if ml_scorer.feature_spec() != "settled_v1":
+            return score_params
+        from analysis.indicators import compute_all_indicators
+        if len(all_rates_hist) < LOOKBACK + 1:
+            return {**score_params, "_thin": True}
+        window = all_rates_hist[-(LOOKBACK + 1):-1]
+        cur = all_rates_hist[-1]
+        ws = window_stats(window)
+        if ws is None:
+            return {**score_params, "_thin": True}
+        return {"cv": ws["cv"], "min_ratio": ws["min_ratio"], "streak": ws["streak"],
+                "pct": ws["pct"], "volume": fr.volume_24h, "settlement_avg": ws["settlement_avg"],
+                "payments_per_day": fr.payments_per_day, "current_rate": cur,
+                "mode": "spot_perp", "_indicators": compute_all_indicators(abs(cur), window)}
+
+    @staticmethod
     def _resolve_score(heuristic_score: int, score_params: dict):
         """Devuelve (display_score, score_heuristic, model_prediction).
 
@@ -128,7 +151,7 @@ class ArbitrageScanner:
         """Analyze a single spot-perp opportunity."""
         n_payments_3d = int(fr.payments_per_day * 3)
         history_obj = self._fetch_history(
-            fr.symbol, fr.exchange, limit=max(n_payments_3d, LOOKBACK)
+            fr.symbol, fr.exchange, limit=max(n_payments_3d, LOOKBACK + 1)
         )
 
         accumulated_3d = self.aggregator.calculate_3day_accumulated(
@@ -188,7 +211,9 @@ class ArbitrageScanner:
             "_thin": ws is None,
         }
         sc = opportunity_score(score_params)
-        display_score, score_heuristic, model_pred = self._resolve_score(sc, score_params)
+        model_params = self._model_params(all_rates_hist, fr, score_params)
+        display_score, _, model_pred = self._resolve_score(sc, model_params)
+        score_heuristic = sc
         grade = grade_from_net_apr(model_pred) if model_pred is not None else stability_grade(display_score)
         est_days = estimated_hold_days(hist_dict, fr.payments_per_day)
 

@@ -1,6 +1,6 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-04-28**, rama activa `claude/integrate-landing-auth-QfCwW`.
+Estado del proyecto al **2026-10-22** (auditoría Binance spot_perp, rama `feat/binance-spot-perp-audit`).
 
 ---
 
@@ -22,6 +22,48 @@ Estado del proyecto al **2026-04-28**, rama activa `claude/integrate-landing-aut
 | Frontend (landing) | React + Vite — compilado en `frontend/site/static/landing/assets/`. Source original en [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) (Lovable, **deprecado**). Editar via recompilación en este repo. |
 
 **El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing es un bundle Vite estático servido por Caddy — el contenido visible vive en `frontend/site/static/landing/assets/index-*.js`, no en `frontend/site/index.html`. **Flask ya no sirve HTML** (`static_folder=None`): es API pura.
+
+---
+
+## Auditoría 2026-10-22 — foco Binance spot_perp
+
+**Decisión:** solo Binance + solo spot_perp (`ENABLED_EXCHANGES=binance`, `ARBITRAGE_MODES=spot_perp`,
+`DEFI_ENABLED=0`, reversibles por env). Binance = única ejecución automática con seguros, 76 % del PnL
+realizado y más pares de carry alto con liquidez. cross/DeFi: 2 trades en 6 meses, IC en vivo −0.15.
+
+**Ejecución (tests `tests/test_exec_safety.py`):** el cierre lee el short ANTES de operar y aborta si
+`fetch_positions` falla (`_open_perp_size` → `None`); reconciliación de cierre con signo correcto;
+órdenes idempotentes (`_create_idempotent`, búsqueda por `origClientOrderId`); `order_fills` cae al
+order si los trades van atrasados; estados de seguros nunca se asumen "cancelado" (`_algo_state`,
+`_limit_state`, llenado parcial = disparado); si un seguro no se cancela se aborta el cierre; vigilante
+por posición (aunque haya otro job), `NAKED_SPOT` y `LIQUIDATION_RISK`; `submit_exclusive` contra el
+doble clic; `entry_time` = inicio del job; la auto-ejecución solo acepta spot_perp.
+
+**Scan (tests `tests/test_scan_quality.py`):** candidatos = todos los perps con spot cubrible y tasa
+DIARIA ≥ base (0.03 %/día), prima primero y luego volumen, tope 250 (antes top-20 por tasa cruda);
+se eliminó el filtro `net_3d>0` (exigía ~73 % APR → solo picos); `net_3d` con la pierna perp y con
+signo; ventana del modelo = 30 liquidaciones con `analysis/ml_features.window_stats` (misma función que
+offline); `fee_loader` ya no toma defaults spot como fee del perp. Verificado contra la API pública
+(2026-10-22): 149 pares analizados (antes 20), 3 con APR neto esperado > 0 (antes 1) → el mercado está
+comprimido, no es un bug.
+
+**Salidas:** `CLOSE_SUGGESTED` = dos settlements seguidos sin cobrar (último pago ≤ 0 y el próximo
+también). `reports/exit_policy_20261022.md`: esa regla (B) le gana a salir al primer pago ≤ 0, y
+mantener hasta ~30 d con ella es lo mejor (+3.7 % anual simulado vs +1.6 %); hold fijo pierde; un piso
+de rendimiento alto NO mejora (deja slots vacíos).
+
+**Dataset y modelo:** `scripts/binance_dataset.py` baja de data.binance.vision + fapi las tasas
+LIQUIDADAS desde 2024 (2.25 M filas, 890 símbolos con deslistados) a `cache/binance/fr_binance.csv`.
+`scripts/ml_binance.py` entrena con label realista de 14 d, IC diario, walk-forward mensual purgado,
+hold-out de 30 d y cartera simulada (`reports/ml_binance_20261022.md`). Resultado: IC 0.54–0.55 pero
+uplift vs heurístico +0.02/+0.03 (< 0.05) y el modelo vigente (20261009) rinde igual o mejor →
+**no se exportó** modelo nuevo. Prod soporta `feature_spec` en el artefacto (`estimate_v0` vigente;
+`settled_v1` = ventana de 30 liquidaciones previas + última liquidada como tasa actual) por si un
+modelo del dataset Binance pasa el gate. `--export E0|E0a` exporta.
+
+**Realidad del negocio:** en la simulación sistemática (5 slots, 5.2 k USD, 1x) el edge neto de fees
+sobre 13 meses es chico (~3–4 % anual sobre capital), lejos del ~29 % realizado. Para atribuirlo, cada
+apertura auto guarda `entry_model_prediction`/`entry_score` en el `auto_open` de `payments_json`.
 
 ---
 
@@ -118,7 +160,9 @@ El scanner **no usa un intervalo configurable**. Funciona por eventos de pago de
    - **Force scan**: botón "Escanear" en UI o `POST /api/force`
 4. Para **cross_exchange**, cada pierna (long y short) se evalúa independientemente para PRE y POST según su propio `next_funding_ts` e intervalo.
 
-Esto significa que en periodos sin posiciones abiertas el bot puede estar inactivo.
+   - **Scan horario** (`PERIODIC_SCAN_SECS`, a :04 UTC tras los settlements): corre aunque no haya posiciones (desde 2026-10-22). Antes, sin posiciones el bot quedaba mudo y no escribía snapshots.
+
+El historial de funding por candidato se cachea hasta el próximo settlement del par (máx. 1 h, `exchanges/manager.py:fetch_funding_history`) → el scan horario casi no gasta llamadas. Los intervalos de funding de Binance se refrescan cada 15 min (`FUNDING_INTERVALS_TTL`).
 
 ### Captura exacta de la tasa al pago
 
@@ -167,9 +211,8 @@ hard-cap desaparece, vive en el multiplicador de yield).
 > v11.0 se re-optimizó solo sobre `spot_perp` (liquidez→0). Para
 `cross_exchange`/`defi` se **conserva** la estructura de liquidez de v10.6 (6 pts),
 sin re-validar — pendiente de un tuning propio. El optimizador nunca aplica cambios
-solo — esta adopción fue manual tras revisar el reporte. **Pendiente de sync:**
-`scripts/scoring_optimizer.py:BASELINE_PARAMS` sigue en v10.6; actualizarlo a v11.0
-antes de la próxima re-optimización.
+solo — esta adopción fue manual tras revisar el reporte. `scripts/scoring_optimizer.py:BASELINE_PARAMS`
+ya está en v11.0 (evaluado con `parametric_score_candidate`; v10.6 queda como `BASELINE_V106_PARAMS`).
 
 Para **cross_exchange / DeFi**, los indicadores (momentum, z-score, percentile, regime) se calculan sobre `period_diffs` — diferencial por-período emparejado por timestamp — en lugar del `diff_series` diario. Esto garantiza ≥5-15 muestras incluso con pocos días de histórico. Ver `analysis/arbitrage.py:_analyze_differential_history`.
 
@@ -251,6 +294,8 @@ en `scanner/worker.py:_store_score_snapshots` desde `opp["model_prediction"]` y
 validación de predicciones previas de `ml_train.py`.
 
 ### Loop operativo de re-entreno (~cada 15 días, lo corre el usuario)
+
+0. (Desde 2026-10-22) `python scripts/binance_dataset.py` (incremental) + `python -u scripts/ml_binance.py` → comparar contra el modelo vigente con `scripts/exit_policy_study.py`; exportar (`--export`) solo si pasa el gate.
 
 1. `pip install -r requirements-dev.txt` (local).
 1b. `python scripts/ml_health.py --refresh-cache` → salud del modelo VIVO fuera de
@@ -424,7 +469,7 @@ Modal de ejecución con TWAP, simulación con leverage/liquidación/basis/fondos
 - `notifications/email.py:build_alert_dedup_key(alert)` — única fuente de verdad para la dedup_key: `f"{type}:{user_id}:{symbol}:{exchange}:{bucket}"` donde `bucket` es `funding_ts` (ms o s) para alertas window-bound, o `_exc_bucket` (`YYYYMMDD`) para broadcasts diarios.
 - `notifications/email.py:valid_telegram_creds(chat_id, token)` — validación de formato barata antes de golpear la API (chat_id numérico ≥5 chars, token con `:` y ≥20 chars). Si falla, log único por usuario y skip.
 
-**Tipos de alerta:** `RATE_REVERSAL` (crítica), `RATE_DROP`, `PRE_PAYMENT_UNFAVORABLE`, `SL_TP_REVIEW`, `EXCEPTIONAL_OPPORTUNITY`, `SWITCH_OPPORTUNITY`, `POSITION_CLOSED`, `EXCHANGE_GEOBLOCKED` (crítica, diaria por usuario: el sync de Binance recibe 451 geográfico).
+**Tipos de alerta:** `CLOSE_SUGGESTED` (dos settlements seguidos sin cobrar: último pago ≤0 y el próximo también), `RATE_REVERSAL` (informativa, una vez por posición), `NAKED_SPOT` (crítica: short desaparecido con spot en manos), `LIQUIDATION_RISK` (short a <20% de liquidación), `PRE_PAYMENT_UNFAVORABLE`, `SL_TP_REVIEW`, `EXCEPTIONAL_OPPORTUNITY`, `SWITCH_OPPORTUNITY`, `POSITION_CLOSED`, `EXCHANGE_GEOBLOCKED` (crítica, diaria por usuario: el sync de Binance recibe 451 geográfico).
 
 ---
 
@@ -516,8 +561,10 @@ BITGET_API_KEY / BITGET_API_SECRET
 
 # Opcionales
 COINGLASS_API_KEY     # Datos adicionales de mercado
-ENABLED_EXCHANGES     # Default: binance,bybit,okx,bitget
-ARBITRAGE_MODES       # Default: spot_perp,cross_exchange
+ENABLED_EXCHANGES     # Default: binance (foco Binance desde 2026-10-22; otros CEX por env)
+ARBITRAGE_MODES       # Default: spot_perp (cross_exchange por env; su auto-ejecución está bloqueada)
+DEFI_ENABLED          # =1 → reactiva el scan DeFi (default apagado)
+AUTO_UNWIND_ON_LIQ    # =1 → si el short desaparece (liquidado) el vigilante vende el spot (default: solo alerta CRITICAL)
 TRADE_SANDBOX         # =1 → auto-ejecución en test (Binance: demo trading; resto: set_sandbox_mode)
 ONCHAIN_ENABLED       # =1 → habilita la pierna spot on-chain BSC (tokens solo-Alpha)
 DEX_AGGREGATOR        # binance (default, Web3 API, fallback auto a KyberSwap) | 0x | kyber

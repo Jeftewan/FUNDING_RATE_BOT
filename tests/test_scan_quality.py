@@ -73,6 +73,31 @@ def test_prod_window_features_match_offline_for_every_interval():
         assert len(opp.history["_rates"]) == mf.LOOKBACK
 
 
+def test_settled_v1_model_features_match_training(monkeypatch):
+    """Spec del dataset Binance: ventana = 30 liquidaciones previas a la última y
+    tasa actual = última liquidada (igual que scripts/ml_binance.py:build_rows)."""
+    from analysis import ml_scorer
+    from analysis.indicators import compute_all_indicators
+    seen = {}
+    monkeypatch.setattr(ml_scorer, "_feature_spec", "settled_v1")
+    monkeypatch.setattr(ml_scorer, "predict_score",
+                        lambda p, ind: seen.update(vec=mf.build_feature_vector(p, ind)) or (50, 10.0))
+    hist = [0.0001 * (1 + (i % 5) / 10) * (-1 if i == 20 else 1) for i in range(45)]
+    sc = arb.ArbitrageScanner(FakeEM(hist), Cfg())
+    fr = _fr("AAA", 0.0009, ih=4)          # la tasa vigente NO entra al modelo v1
+    opp = sc._analyze_spot_perp(fr)
+    assert opp.model_prediction == 10.0
+    i = len(hist) - 1                       # la fila offline es la última liquidación
+    window, cur = hist[i - mf.LOOKBACK:i], hist[i]
+    ws = mf.window_stats(window)
+    expected = mf.build_feature_vector(
+        {"cv": ws["cv"], "min_ratio": ws["min_ratio"], "streak": ws["streak"], "pct": ws["pct"],
+         "volume": fr.volume_24h, "settlement_avg": ws["settlement_avg"],
+         "payments_per_day": fr.payments_per_day, "current_rate": cur},
+        compute_all_indicators(abs(cur), window))
+    assert seen["vec"] == pytest.approx(expected)
+
+
 def test_thin_history_skips_model(monkeypatch):
     from analysis import ml_scorer
     called = []

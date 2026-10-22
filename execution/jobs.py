@@ -326,6 +326,10 @@ class JobRunner:
             "earnings_source": "real" if is_binance else "estimated",
             "payments_json": [{
                 "ts": time.time(), "kind": "auto_open", "job_id": jid,
+                # Qué esperaba el bot al entrar: permite atribuir el PnL realizado
+                # al modelo vs heurístico (user_history no lo guardaba).
+                "entry_model_prediction": opp.get("model_prediction"),
+                "entry_score": opp.get("score"), "entry_score_heuristic": opp.get("score_heuristic"),
                 "order_ids": fill.get("order_ids", []), "legs": fill.get("legs", []),
                 "note": "Auto-ejecutado" + (f" — {fill['partial_note']}" if fill.get("partial_note") else ""),
             }],
