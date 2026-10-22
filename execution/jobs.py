@@ -10,7 +10,9 @@ Railway mata los threads) se RECONCILIAN contra el exchange por clientOrderId
 posición y se guarda/actualiza la posición con lo realmente ejecutado.
 Nunca se reanuda un TWAP a ciegas: el usuario decide lanzar el resto.
 
-Límite: 1 job activo por usuario.
+Límite: 1 job activo por usuario para las acciones del usuario (submit_exclusive,
+atómico frente al doble clic). El vigilante de seguros puede lanzar un cierre
+aunque haya otro job: la pierna descubierta no puede esperar a un TWAP ajeno.
 """
 import logging
 import threading
@@ -28,6 +30,9 @@ class JobRunner:
         self.worker = scanner_worker
         self.syncer = syncer
         self._started = False
+        # Gunicorn corre 1 worker: un lock de proceso basta para que el chequeo
+        # "¿hay job activo?" y la creación del job sean atómicos.
+        self._submit_lock = threading.Lock()
 
     def start(self):
         if self._started:
@@ -42,6 +47,21 @@ class JobRunner:
         from core.db_models import ExecutionJob
         return ExecutionJob.query.filter(ExecutionJob.user_id == user_id,
                                          ExecutionJob.status.in_(_ACTIVE)).first()
+
+    def active_job_for_position(self, user_id, position_id):
+        from core.db_models import ExecutionJob
+        if position_id is None:
+            return None
+        return ExecutionJob.query.filter(ExecutionJob.user_id == user_id,
+                                         ExecutionJob.position_id == int(position_id),
+                                         ExecutionJob.status.in_(_ACTIVE)).first()
+
+    def submit_exclusive(self, user_id: int, kind: str, params: dict):
+        """submit() solo si el usuario no tiene otro job activo (atómico). None si ocupado."""
+        with self._submit_lock:
+            if self.active_job(user_id):
+                return None
+            return self.submit(user_id, kind, params)
 
     def submit(self, user_id: int, kind: str, params: dict) -> int:
         """Crea el job (llamar dentro de app context) y lanza su thread."""
@@ -187,9 +207,14 @@ class JobRunner:
         fill = res if res.get("ok") else res.get("partial")
         pos_id = None
         if fill and (fill.get("perp_qty") or 0) > 0:
-            pos_id = self._save_open_position(uid, jid, opp, p, fill)
+            # entry_time = inicio del job: el funding cobrado durante un TWAP largo
+            # también pertenece a esta posición.
+            started = job.get("created_at")
+            entry_ms = int(started.replace(tzinfo=timezone.utc).timestamp() * 1000) if started else None
+            pos_id = self._save_open_position(uid, jid, opp, p, fill, entry_ms=entry_ms)
         prot = None
-        if res.get("ok") and pos_id and mode == "spot_perp":
+        # También una apertura parcial (falló la cobertura del resto) queda con seguros.
+        if pos_id and mode == "spot_perp":
             prot = self._protect(uid, pos_id, creds, ctx, token=p.get("token"))
             res["protection"] = prot
         status = "done" if res.get("ok") else "failed"
@@ -269,7 +294,7 @@ class JobRunner:
             log.warning(f"protection status pos={pos.get('id')}: {e}")
         self._protect(uid, pos["id"], creds, token=token)
 
-    def _save_open_position(self, uid, jid, opp, p, fill) -> int:
+    def _save_open_position(self, uid, jid, opp, p, fill, entry_ms=None) -> int:
         from core.db_persistence import DBPersistence
         from portfolio.manager import open_position
         # Estimaciones (fees est., steps) del camino bookkeeping, sin validar
@@ -283,6 +308,8 @@ class JobRunner:
             "entry_fr": opp.get("funding_rate", opp.get("rate_differential", 0)),
         }
         is_binance = (opp.get("exchange") or "").lower() == "binance" and pos.get("mode") == "spot_perp"
+        if entry_ms:
+            pos["entry_time"] = entry_ms
         pos.update({
             "entry_price": fill.get("entry_price") or pos.get("entry_price"),
             "entry_fees_real": fill.get("entry_fees_usd"),
@@ -338,9 +365,9 @@ class JobRunner:
         if not res.get("ok"):
             self._update(jid, status="failed", result_json=_jsonable(res), error=res.get("msg"))
             self._alert(uid, sym, f"Fallo al cerrar {sym} (auto): {res.get('msg', '')}")
-            # Si algo se ejecutó, ajustar cantidades registradas.
+            # Si algo se ejecutó, ajustar cantidades registradas (y sus fees reales).
             if res.get("spot_sold") or res.get("perp_closed"):
-                self._apply_partial_close(pos, res)
+                self._apply_partial_close(pos, res, add_fees=float(res.get("exit_fees_usd") or 0))
             self._restore_protection(uid, self._load_pos(pos["id"]) or pos, creds, p.get("token"))
             return
 
@@ -415,6 +442,9 @@ class JobRunner:
                 return
             symbol = row.symbol
             row.exit_fees_real = (row.exit_fees_real or 0) + exit_fees
+            if row.protection_json:
+                row.protection_json = {**row.protection_json, "status": "closed",
+                                       "closed_at": time.time()}
             db.session.commit()
             el_h = (time.time() - (row.entry_time or 0) / 1000) / 3600
             _e, _x, fees, _ = position_fees({

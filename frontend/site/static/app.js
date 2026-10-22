@@ -1648,6 +1648,7 @@ async function closePos(posId, symbol) {
     if (data.ok) {
       const r = data.result;
       showToast(`${r.symbol} cerrada — Neto: $${r.net_earned.toFixed(2)} (${r.hours.toFixed(1)}h)`, r.net_earned >= 0 ? 'success' : 'warning', 6000);
+      if (data.warning) showToast(data.warning, 'error', 12000);
       loadPositions();
     } else {
       showToast(data.msg, 'error');
