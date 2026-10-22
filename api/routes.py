@@ -2,6 +2,7 @@
 import time
 import threading
 import logging
+from contextlib import nullcontext
 from datetime import datetime
 from functools import wraps
 from flask import Blueprint, jsonify, request as flask_req, redirect
@@ -113,6 +114,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "tg_chat_id": us.get("tg_chat_id", ""),
                     "tg_bot_token": us.get("tg_bot_token", ""),
                     "allowed_exchanges": us.get("allowed_exchanges", ""),
+                    "min_net_apr": us.get("min_net_apr", 10),
+                    "hide_negative": us.get("hide_negative", True),
                     "capital_source": us.get("capital_source", "manual"),
                     "real_balances": us.get("real_balances"),
                     "auto_transfer": us.get("auto_transfer", False),
@@ -154,6 +157,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 db_data["tg_bot_token"] = str(data["tg_bot_token"]).strip()
             if "allowed_exchanges" in data:
                 db_data["allowed_exchanges"] = str(data["allowed_exchanges"]).strip()
+            if "min_net_apr" in data:
+                db_data["min_net_apr"] = float(data["min_net_apr"])
+            if "hide_negative" in data:
+                db_data["hide_negative"] = bool(data["hide_negative"])
 
             get_db_persist().save_user_config(uid, db_data)
 
@@ -323,11 +330,18 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         """Active positions with real-time data."""
         uid = get_current_user_id()
         with state_manager.lock:
-            s = state_manager.state
+            _s = state_manager.state
             # Merge CEX and DeFi rates so cross-exchange positions with a DeFi
             # leg can resolve both sides (current_fr = short - long, mins_next
             # = earliest of the two).
-            all_data = s.get("all_data", []) + s.get("defi_data", [])
+            _all_data = _s.get("all_data", []) + _s.get("defi_data", [])
+            _alerts = list(_s.get("alerts", []))
+            outlook = dict(_s.get("position_outlook") or {})
+        # La lectura de la DB va FUERA del lock global (antes bloqueaba al monitor
+        # y al resto de rutas mientras cargaba posiciones y snapshots).
+        with nullcontext():
+            s = {"alerts": _alerts}
+            all_data = _all_data
 
             if uid and get_db_persist():
                 user_state = get_db_persist().load_user_state(uid)
@@ -459,6 +473,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "real": (real_by_sym.get((pos.get("symbol") or "").upper())
                              if (pos.get("exchange") or "").lower() == "binance" else None),
                     "drift": drift_by_pos.get(str(pos.get("id")), []),
+                    # APR neto esperado del par (modelo, último scan): si es ≤ 0 el
+                    # funding futuro esperado ya no compensa.
+                    "outlook_net_apr": (outlook.get(f"{pos.get('symbol')}_{pos.get('exchange')}")
+                                        or {}).get("pred"),
                 })
 
             # Calculate total_earned from active positions
@@ -496,7 +514,17 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 return jsonify({"ok": True, "analyses": {}, "switch_results": {}})
 
         # ── Run switch analysis on-demand ──────────────────────
-        scanner_worker.run_switch_analysis(positions_list)
+        # Con lista de alertas: antes se llamaba sin ella y SWITCH_OPPORTUNITY
+        # nunca llegaba a Telegram.
+        for p in positions_list:
+            p.setdefault("user_id", uid)
+        switch_alerts = []
+        scanner_worker.run_switch_analysis(positions_list, alerts=switch_alerts)
+        if switch_alerts and scanner_worker.email_notifier:
+            try:
+                scanner_worker._dispatch_alerts_per_user(switch_alerts)
+            except Exception as e:
+                log.warning(f"switch alert dispatch: {e}")
 
         # ── Build enriched position data ───────────────────────
         with state_manager.lock:

@@ -7,9 +7,12 @@ class Config:
     SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_MINUTES", "5"))
     MIN_VOLUME = float(os.environ.get("MIN_VOLUME", "1000000"))
 
-    # Arbitrage v7/v8
-    ARBITRAGE_MODES = os.environ.get("ARBITRAGE_MODES", "spot_perp,cross_exchange").split(",")
-    ENABLED_EXCHANGES = os.environ.get("ENABLED_EXCHANGES", "binance,bybit,okx,bitget").split(",")
+    # Foco Binance spot_perp (auditoría 2026-10-22): es el único venue con
+    # auto-ejecución y seguros, el más líquido y el 76% del PnL realizado.
+    # cross_exchange/DeFi y otros CEX se reactivan por env (código intacto).
+    ARBITRAGE_MODES = os.environ.get("ARBITRAGE_MODES", "spot_perp").split(",")
+    ENABLED_EXCHANGES = os.environ.get("ENABLED_EXCHANGES", "binance").split(",")
+    DEFI_ENABLED = os.environ.get("DEFI_ENABLED", "0").lower() in ("1", "true", "yes")
     MIN_3DAY_REVENUE_PCT = float(os.environ.get("MIN_3DAY_REVENUE_PCT", "0.03"))
     MIN_FUNDING_DIFFERENTIAL = float(os.environ.get("MIN_FUNDING_DIFFERENTIAL", "0.0002"))
     MAX_LEVERAGE = int(os.environ.get("MAX_LEVERAGE", "1"))

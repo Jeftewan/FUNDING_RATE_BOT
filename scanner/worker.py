@@ -30,6 +30,14 @@ POST_SETTLEMENT_DELAY_SECS = 3 * 60
 # Tolerance (in seconds) when matching a settlement timestamp against
 # historical entries returned by the exchange / DB snapshots.
 SETTLEMENT_RATE_TOLERANCE_SECS = 120
+# Si la tasa liquidada aún no aparece en el historial, se reintenta durante
+# este tiempo antes de caer a la tasa vigente (no grabar la predicha de inmediato).
+SETTLEMENT_RETRY_SECS = 15 * 60
+# Scan periódico aunque no haya posiciones: oportunidades, snapshots y alertas
+# de excepcionales siempre frescos (antes sin posiciones el bot quedaba mudo).
+PERIODIC_SCAN_SECS = 3600
+PERIODIC_SCAN_OFFSET_SECS = 4 * 60      # :04 de cada hora → tras los settlements de :00
+AI_REUSE_SECS = 6 * 3600                # reusar el análisis Gemini si el top-5 no cambió
 # Liquidación: fracción de la distancia a liquidación del short que, al
 # consumirse, dispara la alarma LIQUIDATION_PROXIMITY. Con margen aislado la
 # liquidación del short está ~1/leverage por encima de la entrada; 0.70 avisa
@@ -68,6 +76,7 @@ class ScannerWorker:
         self._last_switch_analysis = 0  # Timestamp of last switch analysis
         self._switch_results = {}  # {position_id: switch_analysis_result}
         self._prev_exceptional_keys = set()  # Exceptional keys from previous scan
+        self._ai_key, self._ai_ts, self._ai_by_id = (), 0.0, {}  # caché del análisis Gemini
 
     def start(self):
         if self._started:
@@ -95,6 +104,20 @@ class ScannerWorker:
             except Exception as e:
                 log.exception(f"Monitor error: {e}")
             time.sleep(30)
+
+    def _periodic_scan_key(self, now: float):
+        """Clave del scan horario si toca (≥ :04 de la hora y sin scan reciente).
+
+        Los settlements de Binance caen en horas en punto; a :04 el exchange ya
+        publicó las tasas liquidadas. Si un scan por evento ya corrió en esta
+        hora (o hace < 30 min) no se repite.
+        """
+        hour_start = int(now // PERIODIC_SCAN_SECS) * PERIODIC_SCAN_SECS
+        if now - hour_start < PERIODIC_SCAN_OFFSET_SECS:
+            return None
+        if self._last_scan_ts >= hour_start + PERIODIC_SCAN_OFFSET_SECS or now - self._last_scan_ts < 1800:
+            return None
+        return f"periodic_{hour_start}"
 
     def _get_db_persist(self):
         """Lazy-init DBPersistence."""
@@ -198,16 +221,16 @@ class ScannerWorker:
             all_data = s.get("all_data", [])
             defi_data = s.get("defi_data", [])
 
-            if not positions:
-                self._refresh_mins_next(all_data, now, defi_data)
-                return
-
             self._refresh_mins_next(all_data, now, defi_data)
 
             # Optimize: deduplicate positions by (symbol, exchange) for trigger checks
             # Multiple users with same symbol/exchange only need ONE trigger check
             triggered_keys = []
             triggered_labels = []
+            periodic_key = self._periodic_scan_key(now)
+            if periodic_key and periodic_key not in self._scanned_events:
+                triggered_keys.append(periodic_key)
+                triggered_labels.append("Scan horario")
             combined = all_data + defi_data
             seen_pairs = set()  # (symbol, exchange) already checked
 
@@ -289,21 +312,25 @@ class ScannerWorker:
             except Exception as e:
                 log.error(f"Triggered scan failed: {e}")
 
-        # Process earnings and alerts (re-read market data after possible scan)
+        # Process earnings and alerts (re-read market data after possible scan).
+        # Se copia el estado bajo el lock y se procesa FUERA: resolver la tasa
+        # liquidada es una llamada de red y antes bloqueaba todas las rutas API.
         with self.state_manager.lock:
             s = self.state_manager.state
-            all_data = s.get("all_data", [])
-            defi_data = s.get("defi_data", [])
-            combined = all_data + defi_data
+            self._refresh_mins_next(s.get("all_data", []), time.time(), s.get("defi_data", []))
+            all_data = [dict(d) for d in s.get("all_data", [])]
+            defi_data = [dict(d) for d in s.get("defi_data", [])]
+            outlook = dict(s.get("position_outlook") or {})
+        combined = all_data + defi_data
 
-            if not combined:
-                log.debug(f"Monitor tick: no market data (all_data={len(all_data)}, defi={len(defi_data)})")
-            elif positions:
-                self._refresh_mins_next(all_data, time.time(), defi_data)
-                updated_positions = self._update_earnings_db(positions, combined)
-                alerts = self._check_alerts_db(positions, combined)
-                alerts.extend(self._check_sl_tp_reviews(positions))
-                s["alerts"] = alerts
+        if not combined:
+            log.debug(f"Monitor tick: no market data (all_data={len(all_data)}, defi={len(defi_data)})")
+        elif positions:
+            self._update_earnings_db(positions, combined)
+            alerts = self._check_alerts_db(positions, combined, outlook)
+            alerts.extend(self._check_sl_tp_reviews(positions))
+            with self.state_manager.lock:
+                self.state_manager.state["alerts"] = alerts
 
                 if not alerts and int(now) % 300 < 35:
                     for pos in positions:
@@ -471,6 +498,7 @@ class ScannerWorker:
                         avg_rate=pos.get("avg_rate", 0),
                         last_fr=pos.get("last_fr_used", 0),
                         payments=pos.get("payments", []),
+                        ih=pos.get("ih"),
                     )
                 log.debug(f"Saved earnings for {len(positions)} positions to DB")
         except Exception as e:
@@ -499,9 +527,13 @@ class ScannerWorker:
             s = self.state_manager.state
             opportunities = s.get("opportunities", []) + s.get("defi_opportunities", [])
             all_data = s.get("all_data", []) + s.get("defi_data", [])
+            outlook = dict(s.get("position_outlook") or {})
 
         if not opportunities:
             return
+        for pos in positions:
+            o = outlook.get(f"{pos.get('symbol')}_{pos.get('exchange')}") or {}
+            pos["_outlook_pred"] = o.get("pred")
 
         db_persist = None
         if self._flask_app:
@@ -647,6 +679,11 @@ class ScannerWorker:
             all_rates, min_volume=min_volume
         )
 
+        # 3b. Pronóstico del modelo para cada posición spot_perp abierta (aunque
+        # su tasa ya no la deje entre los candidatos): base de CLOSE_SUGGESTED y
+        # del "APR neto esperado" que ve el usuario en Posiciones.
+        position_outlook = self._position_outlook(all_rates, spot_perp_opps)
+
         # 4. Scan for cross-exchange opportunities
         cross_ex_opps = self.arb_scanner.scan_cross_exchange_opportunities(
             all_rates, min_volume=min_volume
@@ -713,11 +750,26 @@ class ScannerWorker:
         # Sort by score DESC
         opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
 
-        # 6b. AI analysis of top opportunities
-        try:
-            opportunities = analyze_top_opportunities(opportunities, self.config)
-        except Exception as e:
-            log.warning(f"AI analysis skipped: {e}")
+        # 6b. AI analysis of top opportunities — solo si cambió el top-5 (por
+        # Net APR predicho) o pasaron AI_REUSE_SECS; si no, se reutiliza el
+        # análisis previo (cada llamada consume cuota del free tier de Gemini).
+        def _napr(o):
+            mp = o.get("model_prediction")
+            return mp if mp is not None else o.get("score", 0)
+        top_key = tuple(o.get("_id") for o in sorted(opportunities, key=_napr, reverse=True)[:5])
+        if top_key and top_key == self._ai_key and time.time() - self._ai_ts < AI_REUSE_SECS:
+            for o in opportunities:
+                if o.get("_id") in self._ai_by_id:
+                    o["ai_analysis"] = self._ai_by_id[o["_id"]]
+        else:
+            try:
+                opportunities = analyze_top_opportunities(opportunities, self.config)
+                self._ai_by_id = {o["_id"]: o["ai_analysis"] for o in opportunities
+                                  if o.get("ai_analysis")}
+                if self._ai_by_id:
+                    self._ai_key, self._ai_ts = top_key, time.time()
+            except Exception as e:
+                log.warning(f"AI analysis skipped: {e}")
 
         # 6c. Detect exceptional opportunities (global Net APR percentile)
         # One global query for the p95 threshold over the predicted net APR
@@ -784,6 +836,7 @@ class ScannerWorker:
             s["defi_opportunities"] = defi_opportunities
             # Earnings are updated in _monitor_tick via _update_earnings_db
             s["opportunities"] = opportunities
+            s["position_outlook"] = position_outlook
             s["coinglass_data"] = cg_opps
             s["last_scan"] = time.time()
             s["scan_count"] = s.get("scan_count", 0) + 1
@@ -838,6 +891,36 @@ class ScannerWorker:
                 daemon=True,
             ).start()
 
+    def _position_outlook(self, all_rates: dict, spot_perp_opps: list) -> dict:
+        """{"SYM_Exchange": {pred, score, ts}} para las posiciones spot_perp activas."""
+        out = {}
+        by_key = {f"{o.symbol}_{o.exchange}": o for o in spot_perp_opps}
+        try:
+            positions = self._load_all_positions_from_db()
+        except Exception as e:
+            log.debug(f"outlook positions: {e}")
+            return out
+        for pos in positions:
+            if pos.get("mode", "spot_perp") != "spot_perp":
+                continue
+            key = f"{pos['symbol']}_{pos['exchange']}"
+            if key in out:
+                continue
+            opp = by_key.get(key)
+            if opp is None:
+                fr = next((r for rates in all_rates.values() for r in rates
+                           if r.symbol == pos["symbol"] and r.exchange == pos["exchange"]), None)
+                if fr is None:
+                    continue
+                try:
+                    opp = self.arb_scanner._analyze_spot_perp(fr)
+                except Exception as e:
+                    log.warning(f"outlook {key}: {e}")
+                    continue
+            out[key] = {"pred": opp.model_prediction, "score": opp.score,
+                        "rate": opp.funding_rate, "ts": time.time()}
+        return out
+
     # ── Rate Snapshot Storage (data accumulation for ML) ─────
 
     def _store_rate_snapshots(self, all_data: list):
@@ -887,11 +970,18 @@ class ScannerWorker:
                 if not rows:
                     return
 
-                # Bulk insert, skip duplicates via ON CONFLICT DO NOTHING
+                # Upsert: la fila de cada (symbol, exchange, funding_ts) queda con la
+                # ÚLTIMA estimación antes del settlement (la más cercana a la tasa
+                # liquidada). Con DO NOTHING quedaba la primera, de hasta 8 h antes,
+                # y labels/historia offline salían de estimaciones tempranas.
                 from sqlalchemy.dialects.postgresql import insert as pg_insert
                 stmt = pg_insert(FundingRateSnapshot.__table__).values(rows)
-                stmt = stmt.on_conflict_do_nothing(
-                    constraint="uq_snapshot_symbol_exchange_ts"
+                stmt = stmt.on_conflict_do_update(
+                    constraint="uq_snapshot_symbol_exchange_ts",
+                    set_={"rate": stmt.excluded.rate, "volume_24h": stmt.excluded.volume_24h,
+                          "mark_price": stmt.excluded.mark_price,
+                          "interval_hours": stmt.excluded.interval_hours,
+                          "captured_at": stmt.excluded.captured_at},
                 )
                 result = db.session.execute(stmt)
                 db.session.commit()
@@ -925,7 +1015,7 @@ class ScannerWorker:
                     )
                 else:
                     log.info(
-                        f"Stored {inserted}/{len(rows)} rate snapshots "
+                        f"Upserted {inserted}/{len(rows)} rate snapshots "
                         f"(funding_ts range: {min_ts}..{max_ts})"
                     )
 
@@ -1079,6 +1169,7 @@ class ScannerWorker:
         if ih != pos.get("ih", 8):
             log.info(f"  {pos['symbol']}: interval changed {pos.get('ih')}h -> {ih}h, updating")
             pos["ih"] = ih
+            pos["_earnings_updated"] = True   # persiste el ih nuevo (antes el log se repetía cada 30 s)
         interval_secs = max(1, ih * 3600)
         cfr = cur["fr"]
         nts = cur.get("next_funding_ts", 0)
@@ -1093,21 +1184,25 @@ class ScannerWorker:
         if payments < 1:
             return
 
-        # Resolve the actual settled rate from history to avoid the latency
-        # divergence between the scan time and the settlement time.
-        settled_rate = self._resolve_settlement_rate(
-            pos["exchange"], pos["symbol"], last_payment_ts, fallback=cfr
-        )
+        # Un registro por pago, cada uno con SU tasa liquidada (antes N pagos
+        # perdidos se colapsaban en uno a la última tasa).
+        pay_ts = [last_payment_ts - k * interval_secs for k in range(payments)][::-1]
+        settled = self._resolve_settlement_rates(pos["exchange"], pos["symbol"], pay_ts)
+        if settled.get(last_payment_ts) is None and now - last_payment_ts < SETTLEMENT_RETRY_SECS:
+            # El exchange aún no publica la tasa liquidada: se reintenta en el
+            # próximo tick en vez de grabar para siempre la tasa predicha.
+            return
 
         # Short-perp side: receives when settled_rate > 0, PAYS when < 0.
         # Always apply the sign so negative rates are recorded as losses.
         exposure = pos.get("exposure", pos["capital_used"] / 2)
-        earn_per_payment = exposure * settled_rate
-
-        self._record_earnings(
-            pos, earn_per_payment * payments, settled_rate, now, payments,
-            payment_ts=last_payment_ts,
-        )
+        for ts in pay_ts:
+            rate = settled.get(ts)
+            if rate is None:
+                log.warning(f"Settlement rate not found {pos['symbol']}@{pos['exchange']} "
+                            f"ts={int(ts)}; using current={cfr*100:.4f}%")
+                rate = cfr
+            self._record_earnings(pos, exposure * rate, rate, now, 1, payment_ts=ts)
 
     def _update_cross_exchange_earnings(self, pos: dict, all_data: list, now: float):
         """Cross-exchange earnings: track each side's payments independently.
@@ -1242,6 +1337,19 @@ class ScannerWorker:
 
         return count
 
+    def _resolve_settlement_rates(self, exchange: str, symbol: str, ts_list: list) -> dict:
+        """{ts: tasa liquidada | None} — una sola llamada al historial (CEX)."""
+        try:
+            if self.defi_manager and self.defi_manager.is_defi_exchange(exchange):
+                return {ts: self.defi_manager.fetch_settlement_rate(
+                    symbol, exchange, ts, tolerance_secs=SETTLEMENT_RATE_TOLERANCE_SECS)
+                    for ts in ts_list}
+            return self.exchange_manager.fetch_settlement_rates(
+                symbol, exchange, ts_list, tolerance_secs=SETTLEMENT_RATE_TOLERANCE_SECS)
+        except Exception as e:
+            log.warning(f"Settlement rates lookup failed {symbol}@{exchange}: {e}")
+            return {ts: None for ts in ts_list}
+
     def _resolve_settlement_rate(self, exchange: str, symbol: str,
                                   settlement_ts: float,
                                   fallback: float) -> float:
@@ -1319,7 +1427,8 @@ class ScannerWorker:
         pos["earned_real"] = pos.get("earned_real", 0) + earned_now
         pos["last_earn_update"] = now
         pos["last_fr_used"] = rate
-        funding = [p for p in pos["payments"] if "rate" in p]
+        # Los ajustes manuales llevan "rate":0 pero no son pagos de funding.
+        funding = [p for p in pos["payments"] if "rate" in p and p.get("kind") != "manual_adjust"]
         pos["payment_count"] = len(funding)
         pos["avg_rate"] = sum(p["rate"] for p in funding) / len(funding) if funding else rate
         pos["_earnings_updated"] = True
@@ -1331,8 +1440,18 @@ class ScannerWorker:
 
     # ── Alerts ────────────────────────────────────────────────
 
-    def _check_alerts_db(self, positions: list, all_data: list) -> list:
-        """Check DB-loaded positions for alerts. Same logic as _check_alerts."""
+    def _check_alerts_db(self, positions: list, all_data: list, outlook: dict = None) -> list:
+        """Check DB-loaded positions for alerts. Same logic as _check_alerts.
+
+        Salida orientada a ganancia: los fees de salida se pagan igual cierres
+        hoy o después, así que solo conviene cerrar cuando el funding FUTURO
+        esperado deja de ser positivo → CLOSE_SUGGESTED cuando el último pago
+        liquidado fue ≤ 0 y la tasa vigente del próximo también lo es (dos
+        settlements seguidos sin cobrar; la misma regla del label "realista" con
+        que se valida el modelo). RATE_REVERSAL queda informativa, una vez por
+        posición (antes re-disparaba en cada ventana: spam cada hora en 1h).
+        """
+        outlook = outlook or {}
         alerts = []
         alert_mins = self.state_manager.get("alert_minutes_before", 5)
         active_keys = set()
@@ -1380,29 +1499,40 @@ class ScannerWorker:
             # the same condition mid-window doesn't re-fire on every tick.
             bucket = int(funding_ts) if funding_ts else 0
 
-            if (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
-                key = f"RATE_REVERSAL_{sym}_{display_ex}_{uid}_{bucket}"
+            pid = pos.get("id", "")
+            last_settled = pos.get("last_fr_used")
+            if not is_cross and pos["entry_fr"] > 0 and cfr <= 0 \
+                    and last_settled is not None and pos.get("payment_count", 0) > 0 and last_settled <= 0:
+                key = f"CLOSE_SUGGESTED_{sym}_{display_ex}_{uid}_{pid}"
                 active_keys.add(key)
                 if key not in self._notified_alerts:
+                    o = outlook.get(f"{sym}_{pos['exchange']}") or {}
+                    pred_txt = (f" APR neto esperado del par: {o['pred']:.1f}%."
+                                if o.get("pred") is not None else "")
                     alerts.append({
-                        "type": "RATE_REVERSAL", "severity": "CRITICAL",
+                        "type": "CLOSE_SUGGESTED", "severity": "WARNING",
                         "position_idx": i, "symbol": sym, "exchange": display_ex,
                         "user_id": pos.get("user_id"),
                         "funding_ts": bucket,
                         "dedup_key": key,
-                        "message": f"Funding rate cambio de signo: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
+                        "message": (f"Dos settlements seguidos sin cobrar: último pago "
+                                    f"{last_settled*100:.4f}%, próximo {cfr*100:.4f}%. Los fees de "
+                                    f"salida se pagan igual: cerrar ahora evita pagar funding."
+                                    + pred_txt),
                     })
-            elif abs(cfr) < abs(pos["entry_fr"]) * 0.25:
-                key = f"RATE_DROP_{sym}_{display_ex}_{uid}_{bucket}"
+            elif (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
+                key = f"RATE_REVERSAL_{sym}_{display_ex}_{uid}_{pid}"
                 active_keys.add(key)
                 if key not in self._notified_alerts:
                     alerts.append({
-                        "type": "RATE_DROP", "severity": "WARNING",
+                        "type": "RATE_REVERSAL", "severity": "WARNING",
                         "position_idx": i, "symbol": sym, "exchange": display_ex,
                         "user_id": pos.get("user_id"),
                         "funding_ts": bucket,
                         "dedup_key": key,
-                        "message": f"Rate cayo >75%: {pos['entry_fr']*100:.4f}% -> {cfr*100:.4f}%",
+                        "message": (f"La tasa del próximo pago es negativa: {cfr*100:.4f}% "
+                                    f"(entrada {pos['entry_fr']*100:.4f}%). Un pago negativo aislado "
+                                    f"no justifica cerrar; si el siguiente también lo es, se avisará."),
                     })
 
             if 0 < mins_next <= alert_mins:
@@ -1453,7 +1583,7 @@ class ScannerWorker:
         # touches keys for the currently-active alert types/funding windows
         # — leaves daily-bucket keys (EXCEPTIONAL/SWITCH) untouched.
         stale = [k for k in self._notified_alerts if (
-            k.startswith(("RATE_REVERSAL_", "RATE_DROP_",
+            k.startswith(("RATE_REVERSAL_", "CLOSE_SUGGESTED_",
                           "PRE_PAYMENT_UNFAVORABLE_", "LIQUIDATION_PROXIMITY_"))
             and k not in active_keys
         )]

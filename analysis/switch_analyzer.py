@@ -80,19 +80,28 @@ def calculate_switch_cost(current_pos: dict, new_opp: dict,
             capital, vol_new
         )
 
+    # Costo MARGINAL del cambio = round-trip de la NUEVA posición. La salida de la
+    # actual se paga igual (hoy o cuando se cierre) → no es costo del switch.
+    # Antes se sumaban dos round-trips completos (≈4 tramos de más) y el bot
+    # casi nunca recomendaba cambiar a algo mejor.
+    exit_now = exit_fees.get("exit_fees", 0) + exit_fees.get("exit_slip", 0)
     return {
-        "exit_cost": exit_fees["total_cost"],
+        "exit_cost": exit_now,
         "entry_cost": entry_fees["total_cost"],
-        "total_cost": exit_fees["total_cost"] + entry_fees["total_cost"],
+        "total_cost": entry_fees["total_cost"],
     }
 
 
 def calculate_projected_earnings(rate: float, ppd: float,
                                  exposure: float, hours: float) -> float:
-    """Project earnings based on rate, payments per day, and time."""
-    if rate <= 0 or ppd <= 0 or exposure <= 0 or hours <= 0:
+    """Project earnings based on rate, payments per day, and time.
+
+    Con signo: una tasa negativa proyecta PÉRDIDA (el short paga). Antes se
+    pasaba abs() y una posición revertida proyectaba ganancia.
+    """
+    if ppd <= 0 or exposure <= 0 or hours <= 0:
         return 0
-    daily_income = exposure * abs(rate) * ppd
+    daily_income = exposure * rate * ppd
     return daily_income * (hours / 24)
 
 
@@ -250,7 +259,8 @@ def _compute_position_health(position: dict, current_market_rate: float,
 
     # Rate retention: cfr vs entry_fr
     if entry_fr and entry_fr != 0:
-        rate_retention = abs(current_market_rate) / abs(entry_fr) * 100
+        # Con signo: una tasa revertida retiene 0 %, no el 100 % que daba abs().
+        rate_retention = max(0.0, current_market_rate / entry_fr * 100)
     else:
         rate_retention = 100
 
@@ -379,7 +389,7 @@ def analyze_switch(position: dict, opportunities: list,
     # Current projected earnings (next 72h at current rate)
     hours_remaining = 72
     current_projected = calculate_projected_earnings(
-        abs(current_market_rate), ppd, exposure, hours_remaining
+        current_market_rate, ppd, exposure, hours_remaining
     )
 
     # Compute position health
@@ -388,7 +398,7 @@ def analyze_switch(position: dict, opportunities: list,
     )
 
     # Current APR
-    daily_current = exposure * abs(current_market_rate) * ppd
+    daily_current = exposure * current_market_rate * ppd
     current_apr = (daily_current * 365 / capital * 100) if capital > 0 else 0
 
     # Get historical stats for mean reversion analysis
@@ -421,6 +431,13 @@ def analyze_switch(position: dict, opportunities: list,
             current_score = opp.get("score", 0)
             current_net_apr = opp.get("model_prediction")
             break
+    if current_net_apr is None:
+        # La posición ya no está entre las oportunidades (tasa bajo el piso): se
+        # usa el pronóstico del scan para ESTE par y, si no hay, su APR actual
+        # (antes se comparaba contra 0 y cualquier alternativa "ganaba").
+        current_net_apr = position.get("_outlook_pred")
+        if current_net_apr is None:
+            current_net_apr = current_apr
 
     # Evaluate top opportunities as switch candidates
     alternatives = []
@@ -459,7 +476,7 @@ def analyze_switch(position: dict, opportunities: list,
             opp_settlement, opp_ppd, exposure, new_hours
         )
         projected_current = calculate_projected_earnings(
-            abs(current_market_rate), ppd, exposure, new_hours
+            current_market_rate, ppd, exposure, new_hours
         )
 
         # Net switch value
@@ -474,7 +491,7 @@ def analyze_switch(position: dict, opportunities: list,
 
         # Break-even for switch
         hourly_current = calculate_projected_earnings(
-            abs(current_market_rate), ppd, exposure, 1
+            current_market_rate, ppd, exposure, 1
         )
         hourly_new = calculate_projected_earnings(
             opp_settlement, opp_ppd, exposure, 1

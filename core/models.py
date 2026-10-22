@@ -76,6 +76,7 @@ class SpotPerpOpportunity:
     score_heuristic: int = 0      # score v11.0 (fallback / comparación vs modelo)
     model_prediction: float = None  # net_apr crudo predicho por el modelo ML (o None)
     has_spot: bool = True
+    spot_venue: str = ""            # "binance" (spot CEX) | "bsc" (solo on-chain Alpha)
     spot_volume: float = 0
     mins_to_next: float = -1
     next_funding_ts: int = 0
@@ -90,6 +91,7 @@ class SpotPerpOpportunity:
     def to_dict(self) -> dict:
         d = {
             "mode": "spot_perp",
+            "spot_venue": self.spot_venue,
             "symbol": self.symbol, "exchange": self.exchange,
             "funding_rate": self.funding_rate,
             "interval_hours": self.interval_hours,
@@ -118,6 +120,10 @@ class SpotPerpOpportunity:
                 "streak": self.history.get("streak", 0),
                 "fee_drag": self.history.get("fee_drag", 0),
             }
+            # Tasa media liquidada de la ventana (switch_analyzer la usa en vez
+            # de la tasa vigente, que suele ser un pico).
+            if self.history.get("settlement_avg") is not None:
+                d["settlement_avg"] = self.history["settlement_avg"]
         if self.indicators:
             d["indicators"] = {
                 "momentum_signal": self.indicators.get("momentum", {}).get("signal", ""),

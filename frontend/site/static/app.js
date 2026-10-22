@@ -112,7 +112,9 @@ function applyFilters() {
 }
 
 // ── Unified opportunity filters (Filtros panel) ──────────────
-const ALL_EXCHANGES = ['Binance','Bybit','OKX','Bitget','Hyperliquid','GMX','Aster','Lighter','Extended'];
+// Foco Binance (backend ENABLED_EXCHANGES=binance): un filtro guardado con otros
+// exchanges no tiene chip → no filtra nada en vez de ocultarlo todo.
+const ALL_EXCHANGES = ['Binance'];
 let _saveFiltersTimer = null;
 
 function getFilterState() {
@@ -123,11 +125,16 @@ function getFilterState() {
   const exchanges = Array.from(
     document.querySelectorAll('#f-exchanges input:checked')
   ).map(c => c.value);
-  return { apr: num('f-apr'),
+  const hn = document.getElementById('f-hideneg');
+  return { apr: num('f-apr'), napr: num('f-napr'), hideNeg: hn ? hn.checked : true,
            days: num('f-days'), vol: num('f-vol'), exchanges };
 }
 
 function matchesFilters(o, f) {
+  const pred = o.model_prediction;
+  // Predicción ≤ 0 = el modelo espera perder dinero tras fees → oculta por defecto.
+  if (f.hideNeg && pred != null && pred <= 0) return false;
+  if (f.napr != null && pred != null && pred < f.napr) return false;
   if (f.apr != null && (o.apr || 0) < f.apr) return false;
   if (f.days != null && (o.estimated_hold_days || 0) < f.days) return false;
   if (f.vol != null && f.vol > 0) {
@@ -160,10 +167,12 @@ function toggleFilters() {
 }
 
 function resetFilters() {
-  ['f-apr','f-days','f-vol'].forEach(id => {
+  ['f-apr','f-napr','f-days','f-vol'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });
+  const hn = document.getElementById('f-hideneg');
+  if (hn) hn.checked = true;
   renderExchangeChips([]);
   onFilterChange();
 }
@@ -178,6 +187,8 @@ async function saveFilters() {
   const f = getFilterState();
   const data = {
     min_apr: f.apr != null ? f.apr : 0,
+    min_net_apr: f.napr != null ? f.napr : 0,
+    hide_negative: f.hideNeg,
     min_stability_days: f.days != null ? f.days : 0,
     min_volume: f.vol != null ? f.vol : 0,
     allowed_exchanges: f.exchanges.join(','),
@@ -200,6 +211,9 @@ async function loadFilters() {
       if (el && val != null) el.value = val;
     };
     set('f-apr', cfg.min_apr);
+    set('f-napr', cfg.min_net_apr);
+    const hn = document.getElementById('f-hideneg');
+    if (hn) hn.checked = cfg.hide_negative !== false;
     set('f-days', cfg.min_stability_days);
     set('f-vol', cfg.min_volume);
     const allowed = (cfg.allowed_exchanges || '')
@@ -569,6 +583,8 @@ function renderOpps(data) {
     // Net APR predicho por el modelo ML — número principal y discriminante.
     // Fallback al APR estimado si el modelo no predijo (model_prediction null).
     const netApr = o.model_prediction != null ? o.model_prediction : o.apr;
+    // Ganancia neta esperada en 14 d por cada $1.000 (horizonte del modelo).
+    const gain14 = o.model_prediction != null ? (o.model_prediction / 100) * 1000 * 14 / 365 : null;
 
     const isExc = o.is_exceptional;
     const excReasons = (o.exceptional_reasons || []).join(' · ');
@@ -585,11 +601,12 @@ function renderOpps(data) {
         </div>
         <div class="opp-header-right">
           <span class="opp-badge ${grade}">${grade}</span>
-          <span class="opp-score" title="Net APR predicho (modelo ML)">${netApr.toFixed(1)}%</span>
+          <span class="opp-score" title="${o.model_prediction != null ? 'APR neto esperado (modelo ML, descuenta fees)' : 'APR bruto (el modelo no predijo)'}">${netApr.toFixed(1)}%</span>
         </div>
       </div>
 
       <div class="opp-stats">
+        <div class="opp-stat"><span class="label">Neto 14d 1K</span><span class="value ${gain14 == null ? '' : (gain14 >= 0 ? 'green' : 'red')}">${gain14 == null ? '—' : '$' + gain14.toFixed(2)}</span></div>
         <div class="opp-stat"><span class="label">FR</span><span class="value green">${frPct}%</span></div>
         <div class="opp-stat"><span class="label">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
         <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
@@ -635,7 +652,7 @@ function renderOpps(data) {
     _oppMeta[o._id] = {
       symbol: o.symbol, mode: o.mode, exchange: o.exchange,
       long_exchange: o.long_exchange, short_exchange: o.short_exchange,
-      has_spot: o.has_spot,
+      has_spot: o.has_spot, spot_venue: o.spot_venue,
     };
   });
 
@@ -975,7 +992,9 @@ function execEligibility(meta) {
     }
   }
   if (!isCross && meta.has_spot === false) {
-    if ((meta.exchange || '').toLowerCase() === 'binance') {
+    // El scan solo lista pares sin spot CEX cuando el on-chain está activo y el
+    // token está en Alpha (spot_venue='bsc'); cualquier otro caso no es cubrible.
+    if (meta.spot_venue === 'bsc') {
       return { ok: true, tip: 'Spot solo on-chain (Alpha BSC): requiere tu wallet BSC dedicada' };
     }
     return { ok: false, tip: 'Spot no operable por API (Onchain/Web3) → manual' };
@@ -987,7 +1006,7 @@ function execButton(o, i) {
   const el = execEligibility({
     mode: o.mode, exchange: o.exchange,
     long_exchange: o.long_exchange, short_exchange: o.short_exchange,
-    has_spot: o.has_spot,
+    has_spot: o.has_spot, spot_venue: o.spot_venue,
   });
   const dis = el.ok ? '' : 'disabled';
   return `<button class="btn btn-exec" ${dis} title="${el.tip}" onclick="autoExecuteOpen('${o._id}',${i})" data-oid="${o._id}">Ejecutar</button>`;
@@ -1468,6 +1487,7 @@ function renderPositions(data) {
         <div class="pos-field"><span class="label">FR entrada</span><span class="value">${(p.entry_fr*100).toFixed(4)}%</span></div>
         <div class="pos-field"><span class="label">FR actual</span><span class="value" style="color:${frColor}">${(p.current_fr*100).toFixed(4)}%</span></div>
         <div class="pos-field"><span class="label">APR</span><span class="value" style="color:${frColor}">${p.current_apr?.toFixed(1)}%</span></div>
+        <div class="pos-field" title="APR neto esperado del par según el modelo (último scan). ≤ 0: el funding futuro ya no compensa"><span class="label">Neto esp.</span><span class="value" style="color:${p.outlook_net_apr == null ? 'var(--text-secondary)' : (p.outlook_net_apr > 0 ? 'var(--green)' : 'var(--red)')}">${p.outlook_net_apr == null ? '—' : p.outlook_net_apr.toFixed(1) + '%'}</span></div>
         <div class="pos-field"><span class="label">Precio vs entrada</span><span class="value" style="color:${p.price_change_pct > 0 ? 'var(--red)' : p.price_change_pct < 0 ? 'var(--green)' : 'var(--text-secondary)'}" title="Subida del precio acerca la liquidacion del short">${p.price_change_pct != null ? (p.price_change_pct >= 0 ? '+' : '') + p.price_change_pct.toFixed(2) + '%' : '—'}</span></div>
         <div class="pos-field"><span class="label">Prom</span><span class="value">${p.avg_rate ? (p.avg_rate*100).toFixed(4) + '%' : '—'}</span></div>
         <div class="pos-field"><span class="label">Ganancia</span><span class="value fees-clickable" onclick="editPosEarnings('${posId}')" title="Editar ganancia acumulada (si tu exchange muestra otro total)" style="color:var(--green); cursor:pointer; text-decoration:underline dotted">$${p.est_earned?.toFixed(2)}</span></div>

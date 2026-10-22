@@ -50,7 +50,8 @@ exchange_manager = ExchangeManager(Config)
 # ── DeFi Exchange Manager ─────────────────────────────────────
 from exchanges.defi_manager import DefiExchangeManager
 
-defi_manager = DefiExchangeManager(Config)
+# Apagado por defecto: sin DeFi no hay fetch de 5 venues por scan ni cross mixto.
+defi_manager = DefiExchangeManager(Config) if Config.DEFI_ENABLED else None
 
 # ── Arbitrage Scanner ─────────────────────────────────────────
 from analysis.arbitrage import ArbitrageScanner
@@ -180,6 +181,7 @@ init_routes(app, state_manager, scanner_worker, Config,
 log.info(
     f"Bot v10.0 [SaaS]: "
     f"Exchanges: {', '.join(Config.ENABLED_EXCHANGES)} | "
+    f"Modes: {', '.join(Config.ARBITRAGE_MODES)} | DeFi: {'on' if defi_manager else 'off'} | "
     f"DB: {'connected' if db_enabled else 'not configured'}"
 )
 

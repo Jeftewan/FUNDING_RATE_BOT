@@ -186,9 +186,13 @@ class EmailNotifier:
         lines.append(f"Hora: {now}")
 
         if alert_type == "RATE_REVERSAL":
-            lines.append("\n\U0001f534 *CERRAR POSICION INMEDIATAMENTE*")
-        elif alert_type == "RATE_DROP":
-            lines.append("\n\U0001f7e1 Considerar cerrar posicion")
+            lines.append("\n\U0001f7e1 Tasa negativa en el próximo pago — vigilar")
+        elif alert_type == "CLOSE_SUGGESTED":
+            lines.append("\n\U0001f534 *Cerrar: el funding esperado dejó de ser positivo*")
+        elif alert_type == "NAKED_SPOT":
+            lines.append("\n\U0001f6a8 *SPOT SIN COBERTURA — actuar YA*")
+        elif alert_type == "LIQUIDATION_RISK":
+            lines.append("\n\U0001f6a8 *Short cerca de liquidación — agregar margen*")
         elif alert_type == "PRE_PAYMENT_UNFAVORABLE":
             lines.append("\n\U0001f7e1 Tasa desfavorable antes del pago")
         elif alert_type == "SL_TP_REVIEW":

@@ -101,6 +101,9 @@ def _run_migrations(db):
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS auto_executed BOOLEAN DEFAULT FALSE",
         # Opportunity-list exchange filter (CSV of exchange names, "" = all).
         "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS allowed_exchanges VARCHAR(256) DEFAULT ''",
+        # Filtro por APR NETO esperado + ocultar predicciones ≤ 0 (auditoría 2026-10-22).
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS min_net_apr FLOAT DEFAULT 10",
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS hide_negative BOOLEAN DEFAULT TRUE",
         # ML scoring: predicción cruda del modelo + versión, para auditar y
         # validar predicciones previas contra el resultado real (ml_train.py).
         "ALTER TABLE score_snapshots ADD COLUMN IF NOT EXISTS model_prediction FLOAT",

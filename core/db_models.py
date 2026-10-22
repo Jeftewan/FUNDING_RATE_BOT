@@ -53,6 +53,9 @@ class UserConfig(db.Model):
     tg_bot_token_encrypted = db.Column(db.String(512), default="")
     # CSV of exchange names to show in the opportunities list ("" = all).
     allowed_exchanges = db.Column(db.String(256), default="")
+    # Filtros por APR NETO esperado (model_prediction) y ocultar predicciones ≤ 0.
+    min_net_apr = db.Column(db.Float, default=10)
+    hide_negative = db.Column(db.Boolean, default=True)
     # Auto-transfer USDT spot↔futuros (Binance) antes de abrir, si la key lo permite.
     auto_transfer = db.Column(db.Boolean, default=False)
     # Legacy WhatsApp columns kept for migration; unused by new code.
