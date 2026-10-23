@@ -949,6 +949,39 @@ def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = No
     return out
 
 
+_BSC_LIVE = ("open", "partially_filled")
+
+
+def _cancel_bsc_limit(wallet, spot) -> tuple:
+    """Cancela la venta límite Kyber de forma idempotente → (viva, base_llenada, usdt).
+
+    Una orden ya cancelada/expirada no es error: el reintento del cierre de AGT #44
+    (2026-10-23) abortaba con PROTECTION_CANCEL porque el job anterior ya la había
+    cancelado. 'cancelling' cuenta como cancelada (al vender, la orden queda sin saldo).
+    """
+    from exchanges import kyber_limit_order as klo
+    oid, o, cancelled = spot["id"], None, False
+    for attempt in range(3):
+        try:
+            o = klo.get_order(wallet["address"], oid)
+            if o is None or o.get("status") in _BSC_LIVE:
+                klo.cancel(wallet, [oid])
+                cancelled = True
+                o = klo.get_order(wallet["address"], oid)
+            if (o is None and cancelled) or (o is not None and o.get("status") not in _BSC_LIVE):
+                break
+        except Exception as e:
+            log.warning(f"cancel venta límite BSC {oid} intento {attempt + 1}: {e}")
+        time.sleep(1)
+    alive = o.get("status") in _BSC_LIVE if o is not None else not cancelled
+    o = o or {}
+    filled, making = int(o.get("filledMakingAmount") or 0), int(o.get("makingAmount") or 0)
+    if not (filled and making):
+        return alive, 0.0, 0.0
+    taking = int(o.get("filledTakingAmount") or 0) or int(o.get("takingAmount") or 0) * filled // making
+    return alive, float(spot.get("qty") or 0) * filled / making, taking / 1e18   # USDT BSC: 18 dec
+
+
 def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None) -> dict:
     """Cancela las órdenes de seguro vivas. Devuelve fees/qty de lo que ya se
     había llenado (para sumarlo al cierre)."""
@@ -979,13 +1012,11 @@ def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wal
     spot = prot.get("spot")
     if _leg_active(spot):
         if spot.get("venue") == "bsc":
-            try:
-                from exchanges import kyber_limit_order as klo
-                if wallet:
-                    klo.cancel(wallet, [spot["id"]])
-            except Exception as e:
-                log.warning(f"cancel venta límite BSC {spot_sym}: {e}")
-                alive.append(f"venta límite BSC {spot['id']}")
+            if wallet:
+                bsc_alive, filled, cost = _cancel_bsc_limit(wallet, spot)
+                if bsc_alive:
+                    alive.append(f"venta límite BSC {spot['id']}")
+                out["spot_filled"], out["spot_cost"] = filled, cost
         else:
             o = None
             for attempt in range(3):
@@ -1817,6 +1848,9 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         raise ExecError("No se pudo leer la posición perp tras cancelar los seguros; cierre "
                         "abortado sin operar (los seguros se re-colocan).", code="POSITION_READ")
     perp_to_close = min(perp_qty, actual_short) if actual_short else 0.0
+    if onchain and not actual_short and hasattr(leg, "exit_max_impact"):
+        # Spot desnudo (SL o liquidación ya cerraron el short): vender pesa más que el precio.
+        leg.max_impact = leg.exit_max_impact
     if onchain:
         spot_held = leg.held_base()
     else:

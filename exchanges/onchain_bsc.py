@@ -29,6 +29,7 @@ USDT_DECIMALS = 18
 NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 DEFAULT_SLIPPAGE = 0.005          # 0.5%
 MAX_PRICE_IMPACT = 0.01           # 1%
+MAX_PRICE_IMPACT_EXIT = 0.05      # vender spot desnudo (short ya cerrado): peor es quedarse sin cobertura
 ONCHAIN_MAX_BASIS = 0.005         # compra on-chain hasta 0.5% sobre el perp bid (incluye fee del DEX)
 MIN_LIQUIDITY_USD = 200_000       # liquidez mínima del token (lista Alpha)
 RECEIPT_TIMEOUT = 90
@@ -236,6 +237,7 @@ class BscSpotLeg:
     """
 
     venue = "bsc"
+    exit_max_impact = MAX_PRICE_IMPACT_EXIT
 
     def __init__(self, wallet: dict, token: dict, ctx, perp_cli, perp_sym,
                  max_slippage: float = DEFAULT_SLIPPAGE, aggregator=None):
@@ -248,6 +250,7 @@ class BscSpotLeg:
         self.perp_cli = perp_cli
         self.perp_sym = perp_sym
         self.max_slippage = max_slippage
+        self.max_impact = MAX_PRICE_IMPACT
         self.agg = aggregator or get_aggregator()
         self.order_ids = []   # tx hashes
         self.fee_usd = 0.0
@@ -292,14 +295,16 @@ class BscSpotLeg:
             amt_wei = min(amt_wei, erc20_balance(src, self.address))
         if amt_wei <= 0:
             raise RuntimeError("saldo insuficiente para el swap")
-        q = self.agg.swap_tx(src, dst, amt_wei, self.address, self.max_slippage, MAX_PRICE_IMPACT)
+        q = self.agg.swap_tx(src, dst, amt_wei, self.address, self.max_slippage, self.max_impact)
         if src.lower() != NATIVE.lower() and \
                 erc20_allowance(src, self.address, q["spender"]) < amt_wei:
             self._ensure_allowance(src, amt_wei, q["spender"])
-            q = self.agg.swap_tx(src, dst, amt_wei, self.address, self.max_slippage, MAX_PRICE_IMPACT)
-        impact = q.get("price_impact")
-        if impact is not None and impact > MAX_PRICE_IMPACT:
-            raise RuntimeError(f"impacto de precio {impact * 100:.2f}% > máx {MAX_PRICE_IMPACT * 100:.1f}%")
+            q = self.agg.swap_tx(src, dst, amt_wei, self.address, self.max_slippage, self.max_impact)
+        impact = self._impact_vs_mid(src, src_dec, dst, dst_dec, amt_wei, q)
+        if impact is None:
+            impact = q.get("price_impact")
+        if impact is not None and impact > self.max_impact:
+            raise RuntimeError(f"impacto de precio {impact * 100:.2f}% > máx {self.max_impact * 100:.1f}%")
         before_in = erc20_balance(src, self.address)
         before_out = erc20_balance(dst, self.address)
         txh = _sign_and_send(self.wallet, q["tx"], self.agg)
@@ -311,6 +316,27 @@ class BscSpotLeg:
         spent = from_wei(before_in - erc20_balance(src, self.address), src_dec)
         got = from_wei(erc20_balance(dst, self.address) - before_out, dst_dec)
         return spent, got, txh
+
+    def _impact_vs_mid(self, src, src_dec, dst, dst_dec, amt_wei, q):
+        """Impacto real: precio efectivo del swap vs mid on-chain (cotizaciones chicas).
+        El price_impact de Kyber sale de su oráculo USD y en un pico se separa del pool
+        (AGT 2026-10-23: 9.86 % reportado, ~0 % real). None si no se pudo medir."""
+        selling = dst.lower() == USDT.lower()
+        if not selling and src.lower() != USDT.lower():
+            return None
+        try:
+            out = q.get("to_amount") or self.agg.quote(src, dst, amt_wei, self.address)["to_amount"]
+            a_in, a_out = from_wei(amt_wei, src_dec), from_wei(int(out), dst_dec)
+            if a_in <= 0 or a_out <= 0:
+                return None
+            px = a_out / a_in if selling else a_in / a_out   # USDT por token
+            mid = self.mid_price(px)
+            if not mid:
+                return None
+            return max(0.0, 1 - px / mid) if selling else max(0.0, px / mid - 1)
+        except Exception as e:
+            log.warning(f"impacto vs mid {self.token.get('symbol')}: {e}")
+            return None
 
     def quote_price(self, base_amt: float, side: str, ref_px: float = 0.0) -> float:
         """Precio medio estimado (USDT por token) para comprar/vender base_amt."""

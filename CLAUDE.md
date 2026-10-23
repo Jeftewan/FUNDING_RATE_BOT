@@ -440,6 +440,11 @@ Al abrir por API (`jobs._run_open` → `trade_executor.place_protection`), solo 
 - **Spot BSC**: orden límite **KyberSwap Limit Order** (`exchanges/kyber_limit_order.py`): sign-message → approve del contrato DSLO → firma EIP-712 local → `POST /write/api/v1/orders`; expira a **7 días**, cancelación gasless.
 - Persistido en `user_positions.protection_json` (`status`, `sl_price`, `liq_price`, `perp{id,status}`, `spot{venue,id,status,qty,expires_at}`, `errors`). Fallo → la posición queda abierta + alerta CRITICAL "Seguros NO colocados" (`status=failed`, badge "SIN SEGUROS").
 - **Cierre**: `_close_spot_perp` cancela los seguros ANTES de leer el saldo libre; lo que ya llenaron suma a `exit_fees_usd` (`protection_filled`). Si el cierre falla/parcial, `jobs._restore_protection` los vuelve a poner sobre lo que queda.
+- **Lecciones de AGT #44 (2026-10-23)**: el SL cerró el short en un pico y el job del vigilante no vendió el spot BSC porque Kyber marcaba un impacto de 9.86 % (sale de su oráculo USD, no del pool; el real era ~0 %). El reintento abortó al intentar cancelar una venta límite que ya estaba cancelada. Cambios:
+  - (a) `_cancel_bsc_limit` es idempotente: lee el estado primero; `cancelled`/`expired`/`cancelling` no cuentan como vivas, y cuenta los llenados parciales.
+  - (b) `BscSpotLeg._impact_vs_mid` compara el precio efectivo contra el mid on-chain (cotizaciones chicas); Kyber `swap_tx` ya no aborta por su oráculo.
+  - (c) Con el short ya cerrado (spot desnudo), el límite de impacto de la venta sube a `MAX_PRICE_IMPACT_EXIT` = 5 %.
+  - (d) Si el cierre falla, `_apply_partial_close` igual registra lo que llenaron los seguros (cantidades, `realized_price_pnl`, fees) y marca esas piernas `filled`/`canceled` en `protection_json`.
 - **Vigilante** (`execution/protection.py`, cada 60 s, lo arranca `JobRunner.start`): si se llenó el SL o la venta → lanza un job de cierre normal (`trigger:"protection"`) que cierra la otra pierna; orden BSC a <12 h de expirar → la renueva + Telegram `PROTECTION_RENEWED`; seguro cancelado fuera de basyo → `PROTECTION_CANCELED`.
 - Solo posiciones nuevas (las previas al cambio no tienen seguros).
 

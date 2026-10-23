@@ -286,3 +286,156 @@ def test_fakeex_baseline_still_hedges():
     # Guardia: el FakeEx base (sin fetch por coid) sigue funcionando con el hedge idempotente.
     ex = FakeEx()
     assert te._find_by_coid(ex, "BTC/USDT:USDT", None) is None
+
+
+# ── Cierre de AGT #44 (2026-10-23): SL disparado + spot BSC sin vender ─────────
+class _Klo:
+    """kyber_limit_order simulado: una orden con estado y un cancel que puede fallar."""
+
+    def __init__(self, status="open", cancel_fails=False, **order):
+        self.order = {"id": 7, "status": status, "makingAmount": str(10 ** 21), **order}
+        self.cancel_fails = cancel_fails
+        self.cancels = 0
+
+    def get_order(self, maker, oid):
+        return dict(self.order)
+
+    def cancel(self, wallet, ids):
+        self.cancels += 1
+        if self.cancel_fails:
+            raise RuntimeError("Kyber LO 4001: order is not active")
+        self.order["status"] = "cancelling"
+
+
+@pytest.fixture
+def klo(monkeypatch):
+    from exchanges import kyber_limit_order as real
+
+    def make(**kw):
+        k = _Klo(**kw)
+        monkeypatch.setattr(real, "get_order", k.get_order)
+        monkeypatch.setattr(real, "cancel", k.cancel)
+        return k
+    monkeypatch.setattr(te.time, "sleep", lambda s: None)
+    return make
+
+
+WALLET_BSC = {"address": "0x" + "cd" * 20, "private_key": "0x" + "11" * 32}
+SPOT_LO = {"venue": "bsc", "id": 7, "status": "open", "qty": 1000.0}
+
+
+def test_bsc_limit_already_canceled_is_not_alive(klo):
+    k = klo(status="cancelled")
+    assert te._cancel_bsc_limit(WALLET_BSC, SPOT_LO) == (False, 0.0, 0.0)
+    assert k.cancels == 0
+
+
+def test_bsc_limit_cancel_error_rechecks_state(klo):
+    k = klo(status="open", cancel_fails=True)
+    assert te._cancel_bsc_limit(WALLET_BSC, SPOT_LO)[0] is True        # sigue viva → abortar
+    k.order["status"] = "cancelled"                                    # otro job ya la canceló
+    assert te._cancel_bsc_limit(WALLET_BSC, SPOT_LO)[0] is False
+
+
+def test_bsc_limit_cancel_ok_and_partial_fill_counted(klo):
+    k = klo(status="open", filledMakingAmount=str(25 * 10 ** 19), takingAmount=str(400 * 10 ** 18))
+    alive, filled, cost = te._cancel_bsc_limit(WALLET_BSC, SPOT_LO)
+    assert not alive and k.cancels == 1
+    assert filled == pytest.approx(250.0) and cost == pytest.approx(100.0)
+
+
+class _OracleAgg:
+    """Agregador sobre test_onchain_bsc.Chain: impacto REAL configurable para montos
+    > 100 unidades y un price_impact de oráculo arbitrario (lo que reporta Kyber)."""
+
+    def __init__(self, chain, real_impact=0.0, oracle_impact=0.0986):
+        self.c, self.real, self.oracle = chain, real_impact, oracle_impact
+
+    def out(self, src, amt):
+        o = self.c._out(src, amt)
+        return int(o * (1 - self.real)) if amt > 10 ** 20 else o
+
+    def quote(self, src, dst, amt, wallet):
+        return {"to_amount": self.out(src, amt), "price_impact": self.oracle}
+
+    def swap_tx(self, src, dst, amt, wallet, slippage, max_impact=0.01):
+        q = self.c.swap_tx(src, dst, amt, wallet, slippage, max_impact)
+        return {**q, "to_amount": self.out(src, amt), "price_impact": self.oracle}
+
+
+@pytest.fixture
+def bsc_env(monkeypatch):
+    """Cadena + perp simulados para cerrar una posición XYZ on-chain."""
+    from exchanges import onchain_bsc as ob
+    from tests import test_onchain_bsc as t
+    c = t.Chain()
+    box = {}
+    monkeypatch.setattr(ob, "erc20_balance", lambda tok, owner: c.bal.get(tok.lower(), 0))
+    monkeypatch.setattr(ob, "erc20_allowance", lambda tok, o, sp: 10 ** 40)
+
+    def send(wallet, tx, agg=None):
+        src, dst, amt = tx["_swap"]
+        c.bal[src.lower()] -= amt
+        c.bal[dst.lower()] = c.bal.get(dst.lower(), 0) + box["agg"].out(src, amt)
+        return "0xtx"
+    monkeypatch.setattr(ob, "_sign_and_send", send)
+    monkeypatch.setattr(ob, "wait_receipt", lambda h, timeout=0: {
+        "status": "0x1", "gasUsed": hex(150000), "effectiveGasPrice": hex(50_000_000)})
+    ex = FakeEx()
+    ex.book["XYZ/USDT:USDT"] = (2.0, 2.002)
+    ex.book["BNB/USDT:USDT"] = (600, 600)
+    ex.markets["XYZ/USDT:USDT"] = {"id": "XYZUSDT", "base": "XYZ", "spot": False, "contract": True,
+                                   "contractSize": 1, "precision": {"amount": 1},
+                                   "limits": {"amount": {"min": 1}, "cost": {"min": 5}}}
+    monkeypatch.setattr(te, "_build_client", lambda *a, **k: ex)
+    monkeypatch.setattr(te, "_ensure_markets", lambda cl: None)
+    monkeypatch.setattr(te.time, "sleep", lambda s: None)
+
+    def close(real_impact, oracle_impact, short, qty=500.0):
+        box["agg"] = agg = _OracleAgg(c, real_impact, oracle_impact)
+        c.bal[t.TOKEN["address"].lower()] = ob.to_wei(qty, 18)
+        ex.short = short
+        pos = {"mode": "spot_perp", "symbol": "XYZ", "exchange": "Binance", "spot_venue": "bsc",
+               "spot_qty": qty, "perp_qty": qty, "entry_price": 2.0}
+        return te.execute_close(t.CREDS, pos, spot_leg_factory=lambda pc, ps, ctx: ob.BscSpotLeg(
+            t.WALLET, t.TOKEN, ctx, pc, ps, aggregator=agg))
+    return close, ex
+
+
+def test_bsc_sell_ignores_oracle_impact_when_pool_is_fine(bsc_env):
+    close, ex = bsc_env
+    res = close(real_impact=0.0, oracle_impact=0.0986, short=500)   # 9.86 % "reportado"
+    assert res["ok"] and res["spot_sold"] == pytest.approx(500), res
+    assert ex.short == pytest.approx(0)
+
+
+def test_naked_bsc_close_accepts_real_impact_but_hedged_close_does_not(bsc_env):
+    close, ex = bsc_env
+    res = close(real_impact=0.03, oracle_impact=None, short=500)    # short vivo: 3 % se bloquea
+    assert res["spot_sold"] == 0 and "impacto" in (res.get("partial_note") or ""), res
+    assert ex.short == pytest.approx(500)
+    res = close(real_impact=0.03, oracle_impact=None, short=0)      # spot desnudo: se vende
+    assert res["ok"] and res["spot_sold"] == pytest.approx(500), res
+
+
+def test_failed_close_after_sl_fill_records_perp_leg(env, monkeypatch):
+    ex = SafeEx()
+    app, runner, uid = _env_with(monkeypatch, env, ex)
+    pos_id = _open(runner, app, uid)
+    from core.db_models import UserPosition
+    # Lo que devolvió el job #10: el SL llenó el perp y la venta del spot falló.
+    res10 = {"ok": True, "dry_run": False, "exit_fees_usd": 0.2,
+             "protection_filled": {"perp_filled": 2.0, "perp_cost": 260.0, "spot_filled": 0.0,
+                                   "spot_cost": 0.0, "fee_usd": 0.2},
+             "spot_sold": 0.0, "perp_closed": 0.0, "complete": False, "order_ids": [], "legs": [],
+             "price_pnl": -60.0, "partial_note": "Error vendiendo el spot: impacto de precio 9.86% > máx 1.0%"}
+    monkeypatch.setattr(te, "execute_close", lambda *a, **k: dict(res10))
+    monkeypatch.setattr(runner, "_alert", lambda *a, **k: None)
+    status, _, _, err = _run_sync(runner, app, uid, "close", {"position_id": pos_id, "symbol": "BTC"})
+    assert status == "failed" and "impacto" in err
+    with app.app_context():
+        p = UserPosition.query.get(pos_id)
+        assert p.status == "active" and p.perp_qty == pytest.approx(0) and p.spot_qty > 0
+        assert p.realized_price_pnl == pytest.approx(-60.0)
+        assert p.protection_json["perp"]["status"] == "filled"
+        assert p.protection_json["spot"]["status"] == "canceled"    # el reintento no la cancela
