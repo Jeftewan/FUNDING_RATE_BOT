@@ -314,3 +314,43 @@ def test_periodic_scan_key_runs_hourly_after_settlement():
     assert w._periodic_scan_key(hour + 300) == f"periodic_{hour}"
     w._last_scan_ts = hour + 400
     assert w._periodic_scan_key(hour + 900) is None           # ya escaneó esta hora
+
+
+def test_rate_snapshot_upsert_dedups_batch_keys(monkeypatch):
+    # ON CONFLICT DO UPDATE falla (CardinalityViolation) si el lote repite una clave.
+    import contextlib
+    import sqlalchemy.dialects.postgresql as pg
+    import core.database as cdb
+
+    sent = {}
+
+    class _Stmt:
+        excluded = type("X", (), {"__getattr__": lambda self, k: k})()
+
+        def values(self, rows):
+            sent["rows"] = rows
+            return self
+
+        def on_conflict_do_update(self, **kw):
+            return self
+
+    class _Sess:
+        def execute(self, stmt):
+            return type("R", (), {"rowcount": len(sent["rows"])})()
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(pg, "insert", lambda table: _Stmt())
+    monkeypatch.setattr(cdb, "db", type("DB", (), {"session": _Sess()})())
+    w = _worker(_EMSettle({}))
+    w.state_manager.state["scan_count"] = 1
+    w._flask_app = type("App", (), {"app_context": lambda self: contextlib.nullcontext()})()
+    ts = 1_800_000_000_000
+    w._store_rate_snapshots([
+        {"symbol": "AAA", "exchange": "Binance", "fr": 0.01, "next_funding_ts": ts},
+        {"symbol": "AAA", "exchange": "Binance", "fr": 0.02, "next_funding_ts": ts},
+        {"symbol": "BBB", "exchange": "Binance", "fr": 0.03, "next_funding_ts": ts},
+    ])
+    assert len(sent["rows"]) == 2
+    assert next(r for r in sent["rows"] if r["symbol"] == "AAA")["rate"] == 0.02  # gana la última

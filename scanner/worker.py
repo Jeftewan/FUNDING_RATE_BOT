@@ -942,7 +942,9 @@ class ScannerWorker:
 
                 # Build batch of rows to insert.  Track per-exchange skip
                 # counts so we can spot adapters returning next_funding_ts=0.
-                rows = []
+                # Keyed por la constraint única: ON CONFLICT DO UPDATE rechaza el
+                # lote entero si trae dos veces la misma clave (CardinalityViolation).
+                by_key: dict = {}
                 skipped_by_exchange: dict = {}
                 for d in all_data:
                     funding_ts = d.get("next_funding_ts", 0)
@@ -950,7 +952,8 @@ class ScannerWorker:
                         ex = d.get("exchange", "?")
                         skipped_by_exchange[ex] = skipped_by_exchange.get(ex, 0) + 1
                         continue
-                    rows.append({
+                    key = (d.get("symbol", ""), d.get("exchange", ""), int(funding_ts))
+                    by_key[key] = {
                         "symbol": d.get("symbol", ""),
                         "exchange": d.get("exchange", ""),
                         "rate": d.get("fr", 0),
@@ -959,7 +962,11 @@ class ScannerWorker:
                         "interval_hours": int(d.get("ih", 8)),
                         "funding_ts": int(funding_ts),
                         "captured_at": now,
-                    })
+                    }
+                rows = list(by_key.values())
+                n_valid = len(all_data) - sum(skipped_by_exchange.values())
+                if n_valid > len(rows):
+                    log.debug(f"Snapshot dedup: {n_valid - len(rows)} filas repetidas en el lote")
 
                 if skipped_by_exchange:
                     log.warning(
