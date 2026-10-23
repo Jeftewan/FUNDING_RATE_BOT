@@ -3,7 +3,7 @@
 Interfaz común (la usa onchain_bsc.BscSpotLeg):
   quote(src, dst, amount_wei, wallet)            → {"to_amount": int, "price_impact": float|None}
   swap_tx(src, dst, amount_wei, wallet, slip)    → {"tx": {...}, "min_out": int, "spender": str,
-                                                    "price_impact": float|None}
+                                                    "to_amount": int, "price_impact": float|None}
   broadcast(raw_hex, wallet) (opcional)          → tx hash
 
 Binance Wallet Web3 API (por defecto) — https://web3.binance.com/build
@@ -138,6 +138,7 @@ class BinanceWeb3Aggregator:
                        "maxPriorityFeePerGas": int(tx["maxPriorityFeePerGas"])
                        if tx.get("maxPriorityFeePerGas") else None},
                 "min_out": int(tx.get("minReceiveAmount") or 0),
+                "to_amount": int(r.get("toTokenAmount") or 0),
                 "spender": self.spender(src, amount_wei),
                 "price_impact": self._impact(d.get("routerResult") or r)}
 
@@ -184,6 +185,7 @@ class ZeroExAggregator:
                        "gas": int(t["gas"]) if t.get("gas") else None,
                        "gasPrice": int(t["gasPrice"]) if t.get("gasPrice") else None},
                 "min_out": int(j.get("minBuyAmount") or 0), "price_impact": None,
+                "to_amount": int(j.get("buyAmount") or 0),
                 "spender": allow.get("spender") or t["to"]}
 
 
@@ -227,10 +229,10 @@ class KyberSwapAggregator:
         return {"to_amount": int(s["amountOut"]), "price_impact": self._impact(s)}
 
     def swap_tx(self, src, dst, amount_wei, wallet, slippage, max_impact=0.01):
+        # Sin guard de impacto aquí: el de Kyber sale de su oráculo USD (se desfasa en
+        # picos); BscSpotLeg lo mide contra el mid on-chain con max_impact.
         route = self._route(src, dst, amount_wei)
         impact = self._impact(route["routeSummary"])
-        if impact is not None and impact > max_impact:
-            raise AggregatorError(f"impacto de precio {impact * 100:.2f}% > máx {max_impact * 100:.1f}%")
         d = self._req("POST", "/route/build", body={
             "routeSummary": route["routeSummary"], "sender": wallet, "recipient": wallet,
             "slippageTolerance": int(round(slippage * 10000)), "source": self.CLIENT_ID})
@@ -240,7 +242,7 @@ class KyberSwapAggregator:
         amount_out = int(d.get("amountOut") or route["routeSummary"]["amountOut"])
         return {"tx": {"to": router, "data": d["data"], "value": int(d.get("transactionValue") or 0),
                        "gas": int(d["gas"]) if d.get("gas") else None, "gasPrice": None},
-                "min_out": int(amount_out * (1 - slippage)), "spender": router,
+                "min_out": int(amount_out * (1 - slippage)), "to_amount": amount_out, "spender": router,
                 "price_impact": self._impact(d) if d.get("amountInUsd") else impact}
 
 

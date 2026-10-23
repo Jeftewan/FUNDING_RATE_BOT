@@ -370,7 +370,7 @@ class JobRunner:
             self._update(jid, status="failed", result_json=_jsonable(res), error=res.get("msg"))
             self._alert(uid, sym, f"Fallo al cerrar {sym} (auto): {res.get('msg', '')}")
             # Si algo se ejecutó, ajustar cantidades registradas (y sus fees reales).
-            if res.get("spot_sold") or res.get("perp_closed"):
+            if res.get("spot_sold") or res.get("perp_closed") or _protection_qty(res):
                 self._apply_partial_close(pos, res, add_fees=float(res.get("exit_fees_usd") or 0))
             self._restore_protection(uid, self._load_pos(pos["id"]) or pos, creds, p.get("token"))
             return
@@ -382,6 +382,10 @@ class JobRunner:
             msg = res.get("partial_note") or "No se ejecutó ninguna orden"
             self._update(jid, status="failed", result_json=_jsonable(res), error=msg)
             self._alert(uid, sym, f"Fallo al cerrar {sym} (auto): {msg}. La posición sigue abierta.")
+            if _protection_qty(res):
+                # Los seguros sí cerraron una pierna (p. ej. el SL): registrarla, o el
+                # reintento la daría por abierta y perdería su PnL (AGT #44, 2026-10-23).
+                self._apply_partial_close(pos, res, add_fees=exit_fees)
             self._restore_protection(uid, pos, creds, p.get("token"))
             return
         if res.get("complete", True) and not res.get("partial_note"):
@@ -408,10 +412,21 @@ class JobRunner:
             row = UserPosition.query.get(int(pos["id"]))
             if not row:
                 return
+            pf = res.get("protection_filled") or {}
             if row.spot_qty is not None:
-                row.spot_qty = max(0.0, (row.spot_qty or 0) - float(res.get("spot_sold") or 0))
+                row.spot_qty = max(0.0, (row.spot_qty or 0) - float(res.get("spot_sold") or 0)
+                                   - float(pf.get("spot_filled") or 0))
             if row.perp_qty is not None:
-                row.perp_qty = max(0.0, (row.perp_qty or 0) - float(res.get("perp_closed") or 0))
+                row.perp_qty = max(0.0, (row.perp_qty or 0) - float(res.get("perp_closed") or 0)
+                                   - float(pf.get("perp_filled") or 0))
+            if res.get("protection_filled") is not None and row.protection_json:
+                # El cierre ya canceló (o vio llenados) los seguros: que un reintento no
+                # intente cancelarlos otra vez. _restore_protection los repone si aplica.
+                prot = dict(row.protection_json)
+                for leg, key in (("perp", "perp_filled"), ("spot", "spot_filled")):
+                    if (prot.get(leg) or {}).get("status") == "open":
+                        prot[leg] = {**prot[leg], "status": "filled" if pf.get(key) else "canceled"}
+                row.protection_json = prot
             if add_fees:
                 row.exit_fees_real = (row.exit_fees_real or 0) + add_fees
             if res.get("price_pnl") is not None:
@@ -569,6 +584,12 @@ def real_net_breakdown(row, res) -> dict:
     ex.update({"entry_basis_pct": getattr(row, "entry_basis_pct", None),
                "entry_slippage_usd": entry_slip, "partial_price_pnl": partial})
     return {"price_pnl": price_pnl, "slippage_usd": slip, "exec": _jsonable(ex)}
+
+
+def _protection_qty(res) -> float:
+    """Cantidad que llenaron los seguros (SL / venta límite) durante el cierre."""
+    pf = res.get("protection_filled") or {}
+    return float(pf.get("perp_filled") or 0) + float(pf.get("spot_filled") or 0)
 
 
 def _jsonable(obj):
