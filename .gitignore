@@ -24,3 +24,6 @@ reports/scoring_candidate_*.py
 reports/profit_sim_*.csv
 # Added by code-review-graph
 .code-review-graph/
+
+# Dataset local de Binance (scripts/binance_dataset.py)
+cache/binance/

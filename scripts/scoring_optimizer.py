@@ -88,9 +88,27 @@ FEE_RATIOS   = [1.0, 0.8, 0.4, 0.2]                             # +0
 # ══════════════════════════════════════════════════════════════════════════════
 # Espeja analysis/scoring.py vigente. ACTUALIZAR aquí cada vez que se adopte un
 # candidato, para que el reporte compare contra lo que está realmente en prod.
-BASELINE_LABEL = "v10.6"
+BASELINE_LABEL = "v11.0"
 
+# v11.0 = mejor trial de reports/optimizer_20260617_trials.csv (pesos re-normalizados
+# a 100, ml_diagnostic.reconstruct_v11_params); se evalúa con
+# parametric_score_candidate, la función con la que se optimizó.
 BASELINE_PARAMS = {
+    "w_stab": 3.571, "w_cons": 50.0, "w_liq": 0.0, "w_yield": 30.357, "w_fee": 16.071,
+    "w_trend": 0.0,
+    "z_t1": 0.7, "z_p1": 0.0, "z_t2": 0.9, "z_p2": -4.0, "z_t3": 1.5, "z_p3": -5.0,
+    "z_t4": 1.8, "z_p4": -13.0, "z_t5": 2.6, "z_p5": -17.0, "z_t6": 3.3, "z_p6": -23.0,
+    "mom_accel": -1.0, "mom_decel": -8.0, "mom_neg": -4.0,
+    "caps_enabled": True,
+    "cap_z_thresh": 2.0, "cap_z_val": 47.0,
+    "cap_streak_thresh": 3.0, "cap_streak_pctl": 85.0, "cap_streak_val": 36.0,
+    "reality_thresh": 4.0, "reality_mult": 0.9,
+    "y_t1": 0.025, "y_t2": 0.08, "y_t3": 0.19, "y_sat": 0.44,
+    "y_r0": 0.25, "y_r1": 0.4, "y_r2": 0.6, "y_r3": 0.9,
+}
+
+# v10.6 (histórico, se evalúa con score_v106_baseline).
+BASELINE_V106_PARAMS = {
     "w_stab": 21, "w_cons": 46, "w_liq": 6, "w_yield": 17, "w_fee": 8, "w_trend": 1,
     "z_t1": 0.5, "z_p1": -5,
     "z_t2": 0.9, "z_p2": -9,
@@ -1024,8 +1042,8 @@ def main():
         search_df = train_df
 
     print(f"[4/6] Evaluando baseline {BASELINE_LABEL}...")
-    base_train = evaluate_params(train_df, BASELINE_PARAMS, scorer=score_v106_baseline)
-    base_val   = evaluate_params(val_df,   BASELINE_PARAMS, scorer=score_v106_baseline)
+    base_train = evaluate_params(train_df, BASELINE_PARAMS, scorer=parametric_score_candidate)
+    base_val   = evaluate_params(val_df,   BASELINE_PARAMS, scorer=parametric_score_candidate)
     print(f"  {BASELINE_LABEL} Val: Sp(net)={base_val['spearman_net']:.3f} "
           f"Sharpe_top={base_val['sharpe_top']:.3f} Mono={base_val['monotonicity']:.2f}")
 

@@ -18,6 +18,12 @@ EXCHANGE_NAMES = {
 
 # Minimum seconds between API calls per exchange
 MIN_FETCH_INTERVAL = 120
+# Binance cambia intervalos de funding (8h→4h→1h) sin aviso: /fapi/v1/fundingInfo
+# se re-lee cada FUNDING_INTERVALS_TTL (antes se cacheaba hasta reiniciar).
+FUNDING_INTERVALS_TTL = 900
+# Historial de funding cacheado por símbolo: válido hasta el próximo settlement
+# (+ margen para que el exchange publique la tasa liquidada).
+HISTORY_SETTLE_GRACE_SECS = 180
 
 
 class ExchangeManager:
@@ -26,6 +32,9 @@ class ExchangeManager:
         self._exchanges = {}
         self._spot_caches = {}  # {exchange: set of spot symbols}
         self._funding_intervals = {}  # {exchange: {symbol: hours}}
+        self._funding_intervals_ts = {}  # {exchange: loaded_ts}
+        self._history_cache = {}  # {(exchange, symbol, limit): (FundingHistory, valid_until)}
+        self._history_lock = __import__("threading").Lock()
         # Rate limit / ban tracking
         self._last_fetch_ts = {}    # {exchange: timestamp}
         self._rate_cache = {}       # {exchange: [FundingRate, ...]}
@@ -214,7 +223,8 @@ class ExchangeManager:
 
             # For Binance: fetch funding intervals (separate API call)
             # since fetch_funding_rates() doesn't include interval info
-            if exchange_name == "binance" and exchange_name not in self._funding_intervals:
+            if exchange_name == "binance" and (
+                    time.time() - self._funding_intervals_ts.get(exchange_name, 0) > FUNDING_INTERVALS_TTL):
                 try:
                     fi_data = ex.fetch_funding_intervals()
                     iv_map = {}
@@ -225,11 +235,16 @@ class ExchangeManager:
                                 iv_map[sym] = int(interval_str.replace("h", ""))
                             except (ValueError, TypeError):
                                 pass
+                    prev = self._funding_intervals.get("binance") or {}
+                    changed = [s for s, h in iv_map.items() if prev and prev.get(s, 8) != h]
                     self._funding_intervals["binance"] = iv_map
-                    log.info(f"Binance: cached {len(iv_map)} funding intervals")
+                    self._funding_intervals_ts["binance"] = time.time()
+                    log.info(f"Binance: cached {len(iv_map)} funding intervals"
+                             + (f" ({len(changed)} cambiaron: {changed[:5]})" if changed else ""))
                 except Exception as e:
+                    # Se conserva el mapa anterior (mejor que volver a 8h para todos).
                     log.warning(f"Binance funding intervals fetch failed: {e}")
-                    self._funding_intervals["binance"] = {}
+                    self._funding_intervals.setdefault("binance", {})
 
             # Fetch funding rates
             funding_rates = ex.fetch_funding_rates()
@@ -384,8 +399,13 @@ class ExchangeManager:
             log.warning(f"Volume enrichment failed for {exchange_name}: {e}")
 
     def fetch_funding_history(self, symbol: str, exchange_name: str,
-                              limit: int = 30) -> FundingHistory:
-        """Fetch historical funding rates for a symbol."""
+                              limit: int = 30, use_cache: bool = True) -> FundingHistory:
+        """Fetch historical funding rates for a symbol.
+
+        Cacheado por (exchange, símbolo, limit) hasta el próximo settlement del
+        par (+HISTORY_SETTLE_GRACE_SECS): entre pagos el historial no cambia, así
+        que un scan horario sobre ~150 candidatos casi no gasta llamadas.
+        """
         exchange_name = exchange_name.lower()
         # Map display names back
         name_map = {v.lower(): k for k, v in EXCHANGE_NAMES.items()}
@@ -397,6 +417,12 @@ class ExchangeManager:
 
         display = EXCHANGE_NAMES.get(exchange_name, exchange_name)
         pair = f"{symbol}/USDT:USDT"
+        key = (exchange_name, symbol, int(limit))
+        if use_cache:
+            with self._history_lock:
+                hit = self._history_cache.get(key)
+            if hit and time.time() < hit[1]:
+                return hit[0]
 
         try:
             self._ensure_markets(ex)
@@ -413,37 +439,50 @@ class ExchangeManager:
                 rates.reverse()
                 timestamps.reverse()
 
-            return self._build_history(symbol, display, rates, timestamps)
+            hist = self._build_history(symbol, display, rates, timestamps)
+            if len(timestamps) >= 2:
+                ih_ms = max(3600_000, timestamps[-1] - timestamps[-2])
+                # Tope 1 h: si el intervalo se acortó (8h→1h) el próximo pago llega antes.
+                valid_until = min((timestamps[-1] + ih_ms) / 1000 + HISTORY_SETTLE_GRACE_SECS,
+                                  time.time() + 3600)
+                with self._history_lock:
+                    if len(self._history_cache) > 2000:
+                        self._history_cache.clear()
+                    self._history_cache[key] = (hist, valid_until)
+            return hist
 
         except Exception as e:
             log.warning(f"History fetch failed {symbol}@{display}: {e}")
             return FundingHistory(symbol=symbol, exchange=display)
+
+    def fetch_settlement_rates(self, symbol: str, exchange_name: str, target_ts_list: list,
+                               tolerance_secs: int = 120) -> dict:
+        """{target_ts: tasa liquidada | None} con UNA llamada sin caché (justo
+        después de un settlement el historial cacheado aún no lo tiene)."""
+        n = max(10, len(target_ts_list) + 3)
+        history = self.fetch_funding_history(symbol, exchange_name, limit=n, use_cache=False)
+        out = {}
+        for target_ts in target_ts_list:
+            out[target_ts] = None
+            if not history or not history.timestamps:
+                continue
+            target_ms = int(target_ts * 1000)
+            best = min(zip(history.rates, history.timestamps),
+                       key=lambda rt: abs(int(rt[1]) - target_ms))
+            if abs(int(best[1]) - target_ms) <= tolerance_secs * 1000:
+                out[target_ts] = float(best[0])
+        return out
 
     def fetch_settlement_rate(self, symbol: str, exchange_name: str,
                               target_ts: float,
                               tolerance_secs: int = 120) -> float | None:
         """Return the historic funding rate closest to target_ts (seconds, UTC).
 
-        Uses CCXT fetch_funding_rate_history via fetch_funding_history.
+        Uses CCXT fetch_funding_rate_history (sin caché).
         Returns None if no entry within tolerance.
         """
-        history = self.fetch_funding_history(symbol, exchange_name, limit=10)
-        if not history or not history.timestamps or not history.rates:
-            return None
-
-        target_ms = int(target_ts * 1000)
-        tolerance_ms = tolerance_secs * 1000
-        best_rate = None
-        best_diff = None
-        for r, ts in zip(history.rates, history.timestamps):
-            diff = abs(int(ts) - target_ms)
-            if best_diff is None or diff < best_diff:
-                best_diff = diff
-                best_rate = r
-
-        if best_diff is None or best_diff > tolerance_ms:
-            return None
-        return float(best_rate)
+        return self.fetch_settlement_rates(symbol, exchange_name, [target_ts],
+                                           tolerance_secs).get(target_ts)
 
     def _build_history(self, symbol: str, exchange: str,
                        rates: list, timestamps: list) -> FundingHistory:
@@ -510,11 +549,10 @@ class ExchangeManager:
             return symbol in spot_symbols
 
         except Exception as e:
-            # Sin cache: el próximo scan reintenta. El gate real de ejecución es
-            # trade_executor.spot_tradeable, así que asumir disponible solo afecta
-            # el display y no hace operable un par que no lo es.
+            # Sin cache: el próximo scan reintenta. Ante la duda NO se muestra el
+            # par como cubrible (el scan filtra por spot operable).
             log.warning(f"Spot check failed for {exchange_name}: {e}")
-            return True
+            return False
 
     def fetch_klines(self, symbol: str, exchange_name: str,
                      interval: str = "1d", limit: int = 16) -> list:

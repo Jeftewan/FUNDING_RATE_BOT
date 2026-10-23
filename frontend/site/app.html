@@ -54,7 +54,7 @@
       </div>
       <div class="sub-tabs">
         <button class="sub-tab active" id="subtab-cex" onclick="switchSubTab('cex')">CEX</button>
-        <button class="sub-tab" id="subtab-defi" onclick="switchSubTab('defi')">DeFi</button>
+        <button class="sub-tab" id="subtab-defi" onclick="switchSubTab('defi')" style="display:none">DeFi</button>
       </div>
       <button class="btn btn-secondary btn-filtros" id="btn-filtros" onclick="toggleFilters()">Filtros</button>
       <span class="count" id="opp-count">0</span>
@@ -62,11 +62,13 @@
 
     <div class="filter-panel" id="filter-panel" style="display:none">
       <div class="filter-row">
-        <label>APR mín %<input type="number" id="f-apr" class="inp-sm" oninput="onFilterChange()"></label>
+        <label title="APR neto esperado por el modelo (descuenta fees)">APR neto mín %<input type="number" id="f-napr" class="inp-sm" oninput="onFilterChange()"></label>
+        <label><input type="checkbox" id="f-hideneg" checked onchange="onFilterChange()"> Ocultar neto ≤ 0</label>
+        <label>APR bruto mín %<input type="number" id="f-apr" class="inp-sm" oninput="onFilterChange()"></label>
         <label>Días estab.<input type="number" id="f-days" class="inp-sm" oninput="onFilterChange()"></label>
         <label>Vol 24h mín<input type="number" id="f-vol" class="inp-sm" style="width:90px" oninput="onFilterChange()"></label>
       </div>
-      <div class="filter-exchanges" id="f-exchanges"></div>
+      <div class="filter-exchanges" id="f-exchanges" style="display:none"></div>
       <div class="filter-actions">
         <button class="btn btn-secondary" onclick="resetFilters()">Limpiar</button>
         <span class="filter-hint">Se aplican en vivo y se recuerdan. Exchanges vacío = todos.</span>

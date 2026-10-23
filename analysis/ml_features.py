@@ -31,6 +31,42 @@ FEATURE_NAMES = [
 ROUND_TRIP_FEE = 0.003
 HOLD_DAYS_FEE = 30
 
+# Ventana de liquidaciones para los features de historia. MISMO valor que
+# scripts/scoring_optimizer.py:LOOKBACK (con el que se entrenó el modelo y se
+# optimizó el heurístico v11.0). Antes prod usaba max(pagos_3d+5, 15): 15
+# muestras en 8h, 23 en 4h, 77 en 1h → streak/pct/cv fuera de distribución.
+LOOKBACK = 30
+MIN_NONZERO = 5   # gate: < 5 tasas no triviales → sin features (thin history)
+
+
+def window_stats(hist: list) -> dict | None:
+    """Estadísticos de la ventana de liquidaciones `hist` (oldest→newest, ya
+    recortada a LOOKBACK). Fuente única para prod y offline
+    (scripts/_scoring_data.py:base_window_features la usa).
+
+    Devuelve {cv, min_ratio, streak, pct, settlement_avg} o None si la ventana
+    no tiene ≥ MIN_NONZERO tasas con magnitud no trivial.
+    """
+    import statistics
+    abs_hist = [abs(r) for r in hist if abs(r) > 1e-12]
+    if len(abs_hist) < MIN_NONZERO:
+        return None
+    mean_h = statistics.mean(abs_hist)
+    std_h = statistics.stdev(abs_hist) if len(abs_hist) > 1 else 0.0
+    streak = 0
+    for r in reversed(hist):            # positivos consecutivos desde el final
+        if r > 0:
+            streak += 1
+        else:
+            break
+    return {
+        "cv": std_h / mean_h if mean_h > 1e-12 else 999.0,
+        "min_ratio": min(abs_hist) / mean_h if mean_h > 1e-12 else 0.0,
+        "streak": streak,
+        "pct": sum(1 for r in hist if r > 0) / len(hist) * 100,
+        "settlement_avg": mean_h,
+    }
+
 
 def fee_drag_deterministic(settlement_avg: float, ppd: float) -> float:
     """fee_drag = fee round-trip / revenue esperado en HOLD_DAYS_FEE días.

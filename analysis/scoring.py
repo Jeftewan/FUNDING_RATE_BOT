@@ -163,13 +163,15 @@ def grade_from_net_apr(net_apr: float) -> str:
     return "D"
 
 
-def estimated_hold_days(hist: dict) -> int:
+def estimated_hold_days(hist: dict, payments_per_day: float = 3) -> int:
     streak = hist.get("streak", 0)
     pct = hist.get("pct", 0)
     rates = hist.get("_rates", [])
     if not rates:
         return 0
-    intervals_per_day = 3
+    # Pagos/día reales del par (1h=24, 4h=6, 8h=3): antes fijo en 3 → un streak
+    # de 30 pagos de 1h (30 h) se leía como 10 días.
+    intervals_per_day = payments_per_day or 3
     streak_days = streak / intervals_per_day
     if pct >= 90 and streak_days >= 5:
         return min(int(streak_days * 0.7), 14)

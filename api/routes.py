@@ -2,6 +2,7 @@
 import time
 import threading
 import logging
+from contextlib import nullcontext
 from datetime import datetime
 from functools import wraps
 from flask import Blueprint, jsonify, request as flask_req, redirect
@@ -113,6 +114,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "tg_chat_id": us.get("tg_chat_id", ""),
                     "tg_bot_token": us.get("tg_bot_token", ""),
                     "allowed_exchanges": us.get("allowed_exchanges", ""),
+                    "min_net_apr": us.get("min_net_apr", 10),
+                    "hide_negative": us.get("hide_negative", True),
                     "capital_source": us.get("capital_source", "manual"),
                     "real_balances": us.get("real_balances"),
                     "auto_transfer": us.get("auto_transfer", False),
@@ -154,6 +157,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 db_data["tg_bot_token"] = str(data["tg_bot_token"]).strip()
             if "allowed_exchanges" in data:
                 db_data["allowed_exchanges"] = str(data["allowed_exchanges"]).strip()
+            if "min_net_apr" in data:
+                db_data["min_net_apr"] = float(data["min_net_apr"])
+            if "hide_negative" in data:
+                db_data["hide_negative"] = bool(data["hide_negative"])
 
             get_db_persist().save_user_config(uid, db_data)
 
@@ -323,11 +330,18 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         """Active positions with real-time data."""
         uid = get_current_user_id()
         with state_manager.lock:
-            s = state_manager.state
+            _s = state_manager.state
             # Merge CEX and DeFi rates so cross-exchange positions with a DeFi
             # leg can resolve both sides (current_fr = short - long, mins_next
             # = earliest of the two).
-            all_data = s.get("all_data", []) + s.get("defi_data", [])
+            _all_data = _s.get("all_data", []) + _s.get("defi_data", [])
+            _alerts = list(_s.get("alerts", []))
+            outlook = dict(_s.get("position_outlook") or {})
+        # La lectura de la DB va FUERA del lock global (antes bloqueaba al monitor
+        # y al resto de rutas mientras cargaba posiciones y snapshots).
+        with nullcontext():
+            s = {"alerts": _alerts}
+            all_data = _all_data
 
             if uid and get_db_persist():
                 user_state = get_db_persist().load_user_state(uid)
@@ -459,6 +473,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "real": (real_by_sym.get((pos.get("symbol") or "").upper())
                              if (pos.get("exchange") or "").lower() == "binance" else None),
                     "drift": drift_by_pos.get(str(pos.get("id")), []),
+                    # APR neto esperado del par (modelo, último scan): si es ≤ 0 el
+                    # funding futuro esperado ya no compensa.
+                    "outlook_net_apr": (outlook.get(f"{pos.get('symbol')}_{pos.get('exchange')}")
+                                        or {}).get("pred"),
                 })
 
             # Calculate total_earned from active positions
@@ -496,7 +514,17 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 return jsonify({"ok": True, "analyses": {}, "switch_results": {}})
 
         # ── Run switch analysis on-demand ──────────────────────
-        scanner_worker.run_switch_analysis(positions_list)
+        # Con lista de alertas: antes se llamaba sin ella y SWITCH_OPPORTUNITY
+        # nunca llegaba a Telegram.
+        for p in positions_list:
+            p.setdefault("user_id", uid)
+        switch_alerts = []
+        scanner_worker.run_switch_analysis(positions_list, alerts=switch_alerts)
+        if switch_alerts and scanner_worker.email_notifier:
+            try:
+                scanner_worker._dispatch_alerts_per_user(switch_alerts)
+            except Exception as e:
+                log.warning(f"switch alert dispatch: {e}")
 
         # ── Build enriched position data ───────────────────────
         with state_manager.lock:
@@ -604,6 +632,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             })
             net_earned = earned - fees
 
+            # Seguros vivos en el exchange (SL closePosition + venta límite): si se
+            # dejaran, cerrarían/venderían sobre una posición futura del símbolo.
+            prot_warn = _cancel_live_protection(uid, pos)
+
             result_data = {
                 "reason": reason,
                 "hours": el_h,
@@ -661,7 +693,27 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             except Exception as e:
                 log.warning(f"Telegram close notification failed: {e}")
 
-        return jsonify({"ok": True, "result": result})
+        return jsonify({"ok": True, "result": result, "warning": prot_warn})
+
+    def _cancel_live_protection(uid, row):
+        """Cancela los seguros activos de una posición que se cierra a mano.
+        Devuelve un aviso (str) si no se pudieron cancelar, o None."""
+        prot = row.protection_json or {}
+        if prot.get("status") != "active":
+            return None
+        try:
+            from exchanges import trade_executor as texec
+            dbp = get_db_persist()
+            creds = dbp.load_user_exchange_keys(uid, row.exchange)
+            if not creds:
+                raise RuntimeError(f"sin API keys de {row.exchange}")
+            wallet = dbp.load_user_wallet(uid, "bsc") if row.spot_venue == "bsc" else None
+            texec.cancel_protection({row.exchange.lower(): creds}, dbp._pos_to_dict(row), wallet)
+            return None
+        except Exception as e:
+            log.warning(f"manual close: cancel protection pos={row.id}: {e}")
+            return (f"No se pudieron cancelar los seguros en {row.exchange} ({e}). "
+                    f"Cancela el SL y la venta límite de {row.symbol} manualmente.")
 
     # ── Auto-execution: place REAL orders via the user's API keys ──
     def _find_opp(opp_id):
@@ -726,12 +778,11 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         mode = opp.get("mode", "spot_perp")
         is_binance_sp = mode == "spot_perp" and opp.get("exchange", "").lower() == "binance"
 
-        if mode == "spot_perp":
-            needed = [opp.get("exchange", "")]
-        elif mode == "cross_exchange":
-            needed = [opp.get("long_exchange", ""), opp.get("short_exchange", "")]
-        else:
-            return jsonify({"ok": False, "msg": "DeFi no soportado en auto — usa el flujo manual"})
+        if mode != "spot_perp":
+            # cross_exchange/DeFi: sin seguros automáticos ni cierre pareado → no se
+            # ejecutan con dinero real (el cierre cross va pierna por pierna).
+            return jsonify({"ok": False, "msg": "La auto-ejecución solo opera spot_perp en Binance."})
+        needed = [opp.get("exchange", "")]
         for ex in needed:
             if not texec.is_cex(ex):
                 return jsonify({"ok": False, "msg": f"{ex} no es un CEX soportado para auto-ejecución"})
@@ -806,7 +857,9 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             "allow_market_fallback": bool(data.get("allow_market_fallback", True)),
             "spot_venue": "bsc" if spot_venue == "bsc" else "", "token": token or {},
         }
-        jid = job_runner.submit(uid, "open", params)
+        jid = job_runner.submit_exclusive(uid, "open", params)
+        if jid is None:
+            return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
         log.info(f"Exec job #{jid} open {opp.get('symbol')} user={uid} cap={capital} lev={leverage} twap={twap}")
         return jsonify({"ok": True, "job_id": jid})
 
@@ -921,8 +974,11 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
         if job_runner.active_job(uid):
             return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
-        jid = job_runner.submit(uid, "close", {"position_id": db_pos_id, "symbol": pos.get("symbol"),
-                                               "twap": twap, "token": token})
+        jid = job_runner.submit_exclusive(uid, "close", {"position_id": db_pos_id,
+                                                         "symbol": pos.get("symbol"),
+                                                         "twap": twap, "token": token})
+        if jid is None:
+            return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
         log.info(f"Exec job #{jid} close pos={db_pos_id} user={uid}")
         return jsonify({"ok": True, "job_id": jid})
 

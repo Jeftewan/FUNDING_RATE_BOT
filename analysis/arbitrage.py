@@ -7,10 +7,23 @@ from analysis.fees import (calculate_spot_perp_fees, calculate_cross_exchange_fe
                            calculate_break_even_hours)
 from analysis.scoring import opportunity_score, stability_grade, grade_from_net_apr, estimated_hold_days
 from analysis import ml_scorer
+from analysis.ml_features import LOOKBACK, window_stats, fee_drag_deterministic
 
 log = logging.getLogger("bot")
 
 NOTIONAL = 1000  # Reference notional for comparison
+# Piso de tasa DIARIA (rate × pagos/día) para analizar un par spot_perp: la tasa
+# base de Binance (interés 0.01 %/8h = 0.03 %/día, sin prima) INCLUIDA. Cientos
+# de pares la pagan; la mayoría el modelo los da negativos tras fees, pero
+# algunos con historia fuerte salen positivos (VELODROME +16 % el 2026-10-22),
+# por eso no se excluyen. Antes el piso era por pago (0.01 %): dejaba fuera los
+# 1h/4h buenos y admitía 8h mediocres.
+SCAN_MIN_DAILY_RATE = 0.0003
+# Tope de candidatos por exchange: primero los que pagan prima sobre la tasa
+# base (por tasa diaria), luego los de tasa base por volumen. El historial se
+# cachea por símbolo hasta el próximo settlement (máx. 1 h) → el primer scan
+# hace ≤ 250 llamadas y los siguientes casi ninguna.
+SPOT_PERP_MAX_CANDIDATES = 250
 
 
 class ArbitrageScanner:
@@ -20,6 +33,29 @@ class ArbitrageScanner:
         self.config = config
         self.aggregator = FundingAggregator()
         self._defi_exchanges = set(getattr(config, "DEFI_EXCHANGES", []))
+
+    @staticmethod
+    def _model_params(all_rates_hist: list, fr, score_params: dict) -> dict:
+        """Params para el MODELO según el feature_spec del artefacto cargado.
+
+        settled_v1 (dataset Binance): ventana = las LOOKBACK liquidaciones
+        anteriores a la última y "tasa actual" = la última liquidada — igual que
+        scripts/ml_binance.py; ambas salen del mismo endpoint (/fapi/v1/fundingRate).
+        """
+        if ml_scorer.feature_spec() != "settled_v1":
+            return score_params
+        from analysis.indicators import compute_all_indicators
+        if len(all_rates_hist) < LOOKBACK + 1:
+            return {**score_params, "_thin": True}
+        window = all_rates_hist[-(LOOKBACK + 1):-1]
+        cur = all_rates_hist[-1]
+        ws = window_stats(window)
+        if ws is None:
+            return {**score_params, "_thin": True}
+        return {"cv": ws["cv"], "min_ratio": ws["min_ratio"], "streak": ws["streak"],
+                "pct": ws["pct"], "volume": fr.volume_24h, "settlement_avg": ws["settlement_avg"],
+                "payments_per_day": fr.payments_per_day, "current_rate": cur,
+                "mode": "spot_perp", "_indicators": compute_all_indicators(abs(cur), window)}
 
     @staticmethod
     def _resolve_score(heuristic_score: int, score_params: dict):
@@ -33,7 +69,7 @@ class ArbitrageScanner:
         cross_exchange/defi no hay label válido para validarlo (IC en vivo
         −0.105, reports/ml_train_20260913.md) → esos modos usan el heurístico.
         """
-        if score_params.get("mode", "spot_perp") != "spot_perp":
+        if score_params.get("mode", "spot_perp") != "spot_perp" or score_params.get("_thin"):
             return heuristic_score, heuristic_score, None
         ms = ml_scorer.predict_score(score_params, score_params.get("_indicators"))
         if ms is not None:
@@ -51,13 +87,29 @@ class ArbitrageScanner:
             symbol, exchange, limit=limit
         )
 
+    def _spot_venue(self, fr: FundingRate):
+        """'cex' si hay spot centralizado activo, 'bsc' si solo existe on-chain
+        (Alpha BSC) y el on-chain está habilitado, None si no es cubrible."""
+        if self.exchange_manager.fetch_spot_availability(fr.symbol, fr.exchange):
+            return "cex"
+        if fr.exchange.lower() == "binance":
+            try:
+                from exchanges import onchain_bsc
+                if onchain_bsc.enabled() and onchain_bsc.alpha_token(fr.symbol):
+                    return "bsc"
+            except Exception as e:
+                log.debug(f"alpha check {fr.symbol}: {e}")
+        return None
+
     def scan_spot_perp_opportunities(
-        self, all_rates: dict, min_volume: float = None, limit: int = 20
+        self, all_rates: dict, min_volume: float = None,
+        limit: int = SPOT_PERP_MAX_CANDIDATES
     ) -> list:
         """
         Mode 1: Same-exchange spot+perp hedge.
-        Find symbols where funding rate > 0, spot available, and
-        3-day revenue is attractive after fees.
+        Candidatos: tasa DIARIA > SCAN_MIN_DAILY_RATE, volumen ≥ piso y spot
+        cubrible (CEX, o BSC si el on-chain está activo). Los pares sin spot
+        operable ya no se muestran: no se pueden ejecutar delta-neutral.
         """
         if "spot_perp" not in self.config.ARBITRAGE_MODES:
             return []
@@ -66,29 +118,40 @@ class ArbitrageScanner:
         opportunities = []
 
         for exchange_name, rates in all_rates.items():
-            candidates = sorted(
-                [r for r in rates
-                 if r.rate > 0.0001 and r.volume_24h >= mv],
-                key=lambda r: r.rate, reverse=True
-            )[:limit]
-
-            for fr in candidates:
+            eligible = [r for r in rates
+                        if r.rate * r.payments_per_day >= SCAN_MIN_DAILY_RATE * (1 - 1e-6)
+                        and r.volume_24h >= mv]
+            # Tasa diaria redondeada (los de tasa base empatan) y, a igualdad, volumen.
+            eligible.sort(key=lambda r: (round(r.rate * r.payments_per_day, 7), r.volume_24h),
+                          reverse=True)
+            n_done = 0
+            for fr in eligible:
+                if n_done >= limit:
+                    break
+                venue = self._spot_venue(fr)
+                if not venue:
+                    continue
+                n_done += 1
                 try:
-                    opp = self._analyze_spot_perp(fr)
-                    if opp and opp.net_3d_revenue_per_1000 > 0:
+                    opp = self._analyze_spot_perp(fr, spot_venue=venue)
+                    # Antes: net_3d > 0 (recuperar el round-trip de fees en 3 días)
+                    # exigía ~73 % APR → solo pasaban picos y nunca los pares
+                    # persistentes de tasa moderada, que son los que más rinden en el
+                    # tiempo. Basta funding acumulado positivo; el ranking/filtro lo
+                    # decide el APR neto esperado del modelo (ya descuenta fees).
+                    if opp and opp.accumulated_3d_pct > 0:
                         opportunities.append(opp)
                 except Exception as e:
                     log.warning(f"Spot-perp analysis error {fr.symbol}@{fr.exchange}: {e}")
-                time.sleep(0.05)
 
         opportunities.sort(key=lambda o: o.score, reverse=True)
         return opportunities
 
-    def _analyze_spot_perp(self, fr: FundingRate) -> SpotPerpOpportunity:
+    def _analyze_spot_perp(self, fr: FundingRate, spot_venue: str = "cex") -> SpotPerpOpportunity:
         """Analyze a single spot-perp opportunity."""
         n_payments_3d = int(fr.payments_per_day * 3)
         history_obj = self._fetch_history(
-            fr.symbol, fr.exchange, limit=max(n_payments_3d + 5, 15)
+            fr.symbol, fr.exchange, limit=max(n_payments_3d, LOOKBACK + 1)
         )
 
         accumulated_3d = self.aggregator.calculate_3day_accumulated(
@@ -99,7 +162,10 @@ class ArbitrageScanner:
             fr.exchange, NOTIONAL, fr.volume_24h
         )
 
-        revenue_3d_usd = NOTIONAL * abs(accumulated_3d)
+        # El funding se cobra sobre la pierna perp = NOTIONAL/2 (la otra mitad es
+        # el spot). Con signo: un acumulado negativo es pérdida, no ingreso
+        # (antes NOTIONAL·abs() inflaba ×2 y convertía pérdidas en revenue).
+        revenue_3d_usd = (NOTIONAL / 2) * accumulated_3d
         net_3d = revenue_3d_usd - fees["total_cost"]
 
         daily_income = self.aggregator.calculate_daily_income(
@@ -110,46 +176,48 @@ class ArbitrageScanner:
         hourly_income = daily_income / 24
         break_even_h = calculate_break_even_hours(fees["total_cost"], hourly_income)
 
+        # Features de historia: últimas LOOKBACK liquidaciones con la MISMA
+        # función que el entrenamiento (paridad por construcción).
+        all_rates_hist = list(history_obj.rates or [])
+        rates = all_rates_hist[-LOOKBACK:]
+        ws = window_stats(rates)
         hist_dict = history_obj.to_dict()
-        rates = hist_dict.get("_rates", [])
-        avg_abs = history_obj.avg if history_obj.avg else abs(fr.rate)
-        stddev = history_obj.stddev if history_obj.stddev < 999 else 0
-        cv = stddev / abs(avg_abs) if abs(avg_abs) > 1e-10 else 999
-
-        # Favorable rates for min_ratio
-        favorable = [abs(r) for r in rates
-                     if (fr.rate > 0 and r > 0) or (fr.rate < 0 and r < 0)]
-        min_ratio = min(favorable) / abs(avg_abs) if favorable and abs(avg_abs) > 1e-10 else 0
-
-        # Settlement-based yield: avg of actual historical settlement rates
-        settlement_avg = sum(abs(r) for r in rates) / len(rates) if rates else abs(fr.rate)
-
-        # Fee drag
-        gross_3d_usd = NOTIONAL * abs(accumulated_3d) if abs(accumulated_3d) > 0 else 1
-        fee_drag = fees["total_cost"] / gross_3d_usd
+        hist_dict["_rates"] = rates
+        if ws:
+            hist_dict.update(pct=ws["pct"], streak=ws["streak"])
+            cv, min_ratio, settlement_avg = ws["cv"], ws["min_ratio"], ws["settlement_avg"]
+        else:
+            cv, min_ratio, settlement_avg = 999.0, 0.0, abs(fr.rate)
+            hist_dict.update(pct=0, streak=0)
+        # Fee drag determinista (el mismo con el que se optimizó v11.0 y se entrenó el modelo).
+        fee_drag = fee_drag_deterministic(settlement_avg, fr.payments_per_day)
         hist_dict["fee_drag"] = fee_drag
+        hist_dict["settlement_avg"] = settlement_avg
 
         score_params = {
             "cv": cv,
             "min_ratio": min_ratio,
-            "streak": history_obj.streak,
-            "pct": history_obj.favorable_pct,
+            "streak": hist_dict["streak"],
+            "pct": hist_dict["pct"],
             "volume": fr.volume_24h,
             "settlement_avg": settlement_avg,
             "payments_per_day": fr.payments_per_day,
             "fee_drag": fee_drag,
             "current_rate": fr.rate,
-            "rates": rates,
+            # thin history (<5 no triviales) → el heurístico usa sus neutros y
+            # el modelo NO predice (fuera de su distribución de entrenamiento).
+            "rates": rates if ws else rates[:4],
             "mode": "spot_perp",
+            "_thin": ws is None,
         }
         sc = opportunity_score(score_params)
-        display_score, score_heuristic, model_pred = self._resolve_score(sc, score_params)
+        model_params = self._model_params(all_rates_hist, fr, score_params)
+        display_score, _, model_pred = self._resolve_score(sc, model_params)
+        score_heuristic = sc
         grade = grade_from_net_apr(model_pred) if model_pred is not None else stability_grade(display_score)
-        est_days = estimated_hold_days(hist_dict)
+        est_days = estimated_hold_days(hist_dict, fr.payments_per_day)
 
-        has_spot = self.exchange_manager.fetch_spot_availability(
-            fr.symbol, fr.exchange
-        )
+        has_spot = spot_venue == "cex"
 
         return SpotPerpOpportunity(
             symbol=fr.symbol,
@@ -169,6 +237,7 @@ class ArbitrageScanner:
             score_heuristic=score_heuristic,
             model_prediction=model_pred,
             has_spot=has_spot,
+            spot_venue="bsc" if spot_venue == "bsc" else fr.exchange.lower(),
             mins_to_next=fr.mins_to_next,
             next_funding_ts=fr.next_funding_ts,
             history=hist_dict,

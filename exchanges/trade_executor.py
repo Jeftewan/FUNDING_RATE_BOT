@@ -327,13 +327,42 @@ def _order_fee_usd(order: dict) -> float:
     return total
 
 
-def order_fills(client, ccxt_symbol: str, order_id: str, px_cache: dict = None) -> dict:
+def order_fills(client, ccxt_symbol: str, order_id: str, px_cache: dict = None,
+                expected_filled: float = None) -> dict:
     """Real fills of one order from its trades.
 
     Returns {gross, cost, avg, fee_usd, fee_base} where gross is in base units
     (contracts × contractSize for derivatives) and fee_base is the commission
     charged in the base asset (reduces what you actually hold after a buy).
+
+    `expected_filled` (en unidades de la orden): si los trades aún no reflejan
+    todo lo llenado (lag del endpoint), cantidad/costo salen del propio order
+    para no subestimar el precio de entrada.
     """
+    out = _order_fills_trades(client, ccxt_symbol, order_id, px_cache)
+    if not order_id or out.get("_from_order"):
+        out.pop("_from_order", None)
+        return out
+    market = client.market(ccxt_symbol)
+    mult = (market.get("contractSize") or 1) if market.get("contract") else 1
+    need_order = out["gross"] <= 0 or (expected_filled is not None
+                                       and out["gross"] < float(expected_filled) * mult * 0.999)
+    if need_order:
+        try:
+            o = client.fetch_order(order_id, ccxt_symbol)
+            g = float(o.get("filled") or 0) * mult
+            if g > out["gross"]:
+                avg = float(o.get("average") or 0) or (out["avg"] if out["avg"] else 0)
+                cost = float(o.get("cost") or 0) or g * avg
+                fee_usd = max(out["fee_usd"], _order_fee_usd(o))
+                out.update(gross=g, cost=cost, avg=cost / g if g else avg, fee_usd=fee_usd)
+        except Exception as e:
+            log.warning(f"fetch_order fallback {ccxt_symbol} order={order_id}: {e}")
+    return out
+
+
+def _order_fills_trades(client, ccxt_symbol: str, order_id: str, px_cache: dict = None) -> dict:
+    """Fills desde fetch_my_trades (o, si no se pueden leer, desde el order)."""
     px_cache = px_cache if px_cache is not None else {}
     out = {"gross": 0.0, "cost": 0.0, "avg": 0.0, "fee_usd": 0.0, "fee_base": 0.0}
     if not order_id:
@@ -355,6 +384,7 @@ def order_fills(client, ccxt_symbol: str, order_id: str, px_cache: dict = None) 
                        cost=float(o.get("cost") or 0), fee_usd=_order_fee_usd(o))
         except Exception:
             pass
+        out["_from_order"] = True
         return out
     for t in trades:
         if str(t.get("order")) != str(order_id):
@@ -584,13 +614,22 @@ def _spot_sellable(client, ccxt_symbol: str, desired: float) -> float:
     return _norm_amount(client, ccxt_symbol, amt)
 
 
-def _open_perp_size(client, ccxt_symbol: str, side: str) -> float:
-    """Tamaño realmente abierto en el perp para `side`, en BASE (no contratos)."""
-    try:
-        positions = client.fetch_positions([ccxt_symbol])
-    except Exception as e:
-        log.warning(f"fetch_positions {ccxt_symbol} falló: {e}")
-        return 0.0
+def _open_perp_size(client, ccxt_symbol: str, side: str):
+    """Tamaño realmente abierto en el perp para `side`, en BASE (no contratos).
+
+    None si no se pudo leer (tras reintentos): el caller NO debe tratarlo como 0
+    — vender el spot creyendo que no hay short dejaría el short desnudo.
+    """
+    positions = None
+    for attempt in range(3):
+        try:
+            positions = client.fetch_positions([ccxt_symbol])
+            break
+        except Exception as e:
+            log.warning(f"fetch_positions {ccxt_symbol} intento {attempt + 1} falló: {e}")
+            time.sleep(1 + attempt)
+    if positions is None:
+        return None
     cs = _contract_size(client, ccxt_symbol)
     for p in positions:
         contracts = p.get("contracts")
@@ -626,11 +665,46 @@ def _poll_fill(client, order_id: str, ccxt_symbol: str, timeout: float):
     return False, last
 
 
-def _safe_cancel(client, order_id: str, ccxt_symbol: str):
+def _safe_cancel(client, order_id: str, ccxt_symbol: str) -> bool:
     try:
         client.cancel_order(order_id, ccxt_symbol)
+        return True
     except Exception as e:
         log.warning(f"cancel_order {order_id} failed: {e}")
+        return False
+
+
+def _find_by_coid(client, ccxt_symbol: str, coid):
+    """Orden por clientOrderId (Binance: origClientOrderId), o None.
+
+    Tras un create_order que lanzó (timeout, 5xx) la orden pudo haber entrado:
+    se consulta antes de reintentar para no duplicarla.
+    """
+    if not coid:
+        return None
+    for attempt in range(2):
+        try:
+            return client.fetch_order(None, ccxt_symbol, {"origClientOrderId": coid})
+        except Exception as e:
+            if "not exist" in str(e).lower() or "notfound" in type(e).__name__.lower():
+                return None
+            log.warning(f"fetch_order coid={coid} intento {attempt + 1}: {e}")
+            time.sleep(1)
+    return None
+
+
+def _create_idempotent(client, ccxt_symbol, typ, side, amount, price, params):
+    """create_order que, si lanza, busca la orden por su clientOrderId antes de
+    rendirse. Devuelve la orden (creada o encontrada) o re-lanza el error."""
+    try:
+        return client.create_order(ccxt_symbol, typ, side, amount, price, params)
+    except Exception:
+        found = _find_by_coid(client, ccxt_symbol, (params or {}).get("clientOrderId"))
+        if found and found.get("id"):
+            log.warning(f"create_order {ccxt_symbol} lanzó pero la orden existe "
+                        f"(coid={params.get('clientOrderId')}): se sigue con ella")
+            return found
+        raise
 
 
 def _final_order(client, order_id, ccxt_symbol):
@@ -801,6 +875,39 @@ def _leg_active(leg) -> bool:
     return bool(leg and leg.get("id") and leg.get("status") == "open")
 
 
+_DEAD_STATUSES = ("canceled", "cancelled", "expired", "rejected")
+
+
+def _algo_state(o: dict) -> str:
+    """Estado de una orden trigger (SL): filled|open|canceled|unknown.
+
+    Con actualOrderId la condición ya se disparó (orden de mercado real) aunque
+    el status no diga 'closed'. Un status no reconocido NUNCA se lee como
+    cancelado: 'unknown' → el vigilante no lo marca ni alerta en falso.
+    """
+    st = (o.get("status") or "").lower()
+    if st == "closed" or (o.get("info") or {}).get("actualOrderId"):
+        return "filled"
+    if st == "open":
+        return "open"
+    if st in _DEAD_STATUSES:
+        return "canceled"
+    return "unknown"
+
+
+def _limit_state(o: dict) -> str:
+    """Estado de la venta límite spot. Un llenado PARCIAL cuenta como 'filled'
+    (el spot vendido ya no está cubierto por el short completo)."""
+    st = (o.get("status") or "").lower()
+    if st == "closed" or float(o.get("filled") or 0) > 0:
+        return "filled"
+    if st == "open":
+        return "open"
+    if st in _DEAD_STATUSES:
+        return "canceled"
+    return "unknown"
+
+
 def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = None) -> dict:
     """Estado real de los seguros: {perp, spot} ∈ open|filled|canceled|missing|unknown,
     con fills (`perp_fill`, `spot_fill`) cuando hay ejecución."""
@@ -810,8 +917,7 @@ def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = No
     if _leg_active(prot.get("perp")):
         try:
             o = perp_cli.fetch_order(prot["perp"]["id"], perp_sym, {"trigger": True})
-            st = o.get("status")
-            out["perp"] = {"closed": "filled", "open": "open"}.get(st, "canceled")
+            out["perp"] = _algo_state(o)
             if out["perp"] == "filled":
                 actual = (o.get("info") or {}).get("actualOrderId")
                 out["perp_fill"] = order_fills(perp_cli, perp_sym, actual) if actual else None
@@ -834,8 +940,7 @@ def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = No
                     out["spot"] = "canceled" if o else "unknown"   # cancelled/expired
             else:
                 o = spot_cli.fetch_order(spot["id"], spot_sym)
-                st = o.get("status")
-                out["spot"] = {"closed": "filled", "open": "open"}.get(st, "canceled")
+                out["spot"] = _limit_state(o)
                 if out["spot"] == "filled":
                     out["spot_fill"] = order_fills(spot_cli, spot_sym, spot["id"])
         except Exception as e:
@@ -848,36 +953,93 @@ def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wal
     """Cancela las órdenes de seguro vivas. Devuelve fees/qty de lo que ya se
     había llenado (para sumarlo al cierre)."""
     out = {"perp_filled": 0.0, "perp_cost": 0.0, "spot_filled": 0.0, "spot_cost": 0.0, "fee_usd": 0.0}
+    alive = []
     perp = prot.get("perp")
     if _leg_active(perp):
-        try:
-            o = perp_cli.fetch_order(perp["id"], perp_sym, {"trigger": True})
-            if o.get("status") == "open":
-                perp_cli.cancel_order(perp["id"], perp_sym, {"trigger": True})
-            elif o.get("status") == "closed" and (o.get("info") or {}).get("actualOrderId"):
-                f = order_fills(perp_cli, perp_sym, o["info"]["actualOrderId"])
-                out["perp_filled"], out["perp_cost"] = f["gross"], f["cost"]
-                out["fee_usd"] += f["fee_usd"]
-        except Exception as e:
-            log.warning(f"cancel SL {perp_sym}: {e}")
+        o = None
+        for attempt in range(3):
+            try:
+                o = perp_cli.fetch_order(perp["id"], perp_sym, {"trigger": True})
+                if _algo_state(o) == "open":
+                    perp_cli.cancel_order(perp["id"], perp_sym, {"trigger": True})
+                    o = perp_cli.fetch_order(perp["id"], perp_sym, {"trigger": True})
+                if _algo_state(o) != "open":
+                    break
+            except Exception as e:
+                log.warning(f"cancel SL {perp_sym} intento {attempt + 1}: {e}")
+                o = None
+            time.sleep(1)
+        if o is None or _algo_state(o) == "open":
+            # Un SL closePosition vivo cerraría también una posición futura del símbolo.
+            alive.append(f"SL del short {perp['id']}")
+        elif _algo_state(o) == "filled" and (o.get("info") or {}).get("actualOrderId"):
+            f = order_fills(perp_cli, perp_sym, o["info"]["actualOrderId"])
+            out["perp_filled"], out["perp_cost"] = f["gross"], f["cost"]
+            out["fee_usd"] += f["fee_usd"]
     spot = prot.get("spot")
     if _leg_active(spot):
-        try:
-            if spot.get("venue") == "bsc":
+        if spot.get("venue") == "bsc":
+            try:
                 from exchanges import kyber_limit_order as klo
                 if wallet:
                     klo.cancel(wallet, [spot["id"]])
-            else:
-                o = spot_cli.fetch_order(spot["id"], spot_sym)
-                if o.get("status") == "open":
-                    spot_cli.cancel_order(spot["id"], spot_sym)
-                    o = _final_order(spot_cli, spot["id"], spot_sym) or o
-                if float(o.get("filled") or 0) > 0:
-                    f = order_fills(spot_cli, spot_sym, spot["id"])
-                    out["spot_filled"], out["spot_cost"] = f["gross"], f["cost"]
-                    out["fee_usd"] += f["fee_usd"]
-        except Exception as e:
-            log.warning(f"cancel venta límite {spot_sym}: {e}")
+            except Exception as e:
+                log.warning(f"cancel venta límite BSC {spot_sym}: {e}")
+                alive.append(f"venta límite BSC {spot['id']}")
+        else:
+            o = None
+            for attempt in range(3):
+                try:
+                    o = spot_cli.fetch_order(spot["id"], spot_sym)
+                    if (o.get("status") or "").lower() == "open":
+                        spot_cli.cancel_order(spot["id"], spot_sym)
+                        o = _final_order(spot_cli, spot["id"], spot_sym) or o
+                    if (o.get("status") or "").lower() != "open":
+                        break
+                except Exception as e:
+                    log.warning(f"cancel venta límite {spot_sym} intento {attempt + 1}: {e}")
+                    o = None
+                time.sleep(1)
+            if o is None or (o.get("status") or "").lower() == "open":
+                # Con la límite viva el spot sigue bloqueado y se vendería solo después.
+                alive.append(f"venta límite spot {spot['id']}")
+            elif float(o.get("filled") or 0) > 0:
+                f = order_fills(spot_cli, spot_sym, spot["id"], expected_filled=o.get("filled"))
+                out["spot_filled"], out["spot_cost"] = f["gross"], f["cost"]
+                out["fee_usd"] += f["fee_usd"]
+    if alive:
+        raise ExecError("No se pudieron cancelar los seguros (" + ", ".join(alive)
+                        + "); cierre abortado sin operar. Reintenta o cancélalos en Binance.",
+                        code="PROTECTION_CANCEL")
+    return out
+
+
+def short_health(creds_by_exchange: dict, position: dict) -> dict:
+    """Estado real del short: {short (base), mark, liq, liq_distance_pct}.
+
+    short=None si no se pudo leer. Lo usa el vigilante para detectar un short
+    liquidado/cerrado fuera de basyo (spot desnudo) y la cercanía a liquidación.
+    """
+    _, perp_cli, _, perp_sym = _protection_clients(creds_by_exchange, position)
+    out = {"short": None, "mark": None, "liq": None, "liq_distance_pct": None}
+    try:
+        positions = perp_cli.fetch_positions([perp_sym])
+    except Exception as e:
+        log.warning(f"short_health {perp_sym}: {e}")
+        return out
+    cs = _contract_size(perp_cli, perp_sym)
+    out["short"] = 0.0
+    for p in positions:
+        if not p.get("contracts") or p.get("side") not in (None, "short"):
+            continue
+        out["short"] = abs(float(p["contracts"])) * cs
+        mark = p.get("markPrice") or (p.get("info") or {}).get("markPrice")
+        liq = p.get("liquidationPrice")
+        out["mark"] = float(mark) if mark else None
+        out["liq"] = float(liq) if liq else None
+        if out["mark"] and out["liq"]:
+            out["liq_distance_pct"] = round((out["liq"] - out["mark"]) / out["mark"] * 100, 2)
+        break
     return out
 
 
@@ -962,11 +1124,15 @@ class CexSpotLeg:
         los fills reales de la orden.
         """
         params = _with_coid({"postOnly": True} if typ == "limit" else {}, self.ctx.coid("s"))
-        o = self.c.create_order(self.sym, typ, side, amount, price if typ == "limit" else None, params)
+        # Idempotente: si create_order lanza pero la orden entró, se sigue con ella
+        # (si no, quedaría viva sin rastrear y podría llenarse sin cobertura).
+        o = _create_idempotent(self.c, self.sym, typ, side, amount,
+                               price if typ == "limit" else None, params)
         oid = o["id"]
         self.order_ids.append(oid)
         seen = 0.0
         terminal = False
+        hedge_err = None
         next_reprice = time.time() + REPRICE_SECS
         try:
             while True:
@@ -980,9 +1146,15 @@ class CexSpotLeg:
                 status = last.get("status")
                 filled = float(last.get("filled") or 0)
                 if filled > seen:
-                    f = order_fills(self.c, self.sym, oid, self.px_cache)
-                    on_fill(oid, f, f["gross"] - (f["fee_base"] if side == "buy" else 0))
+                    f = order_fills(self.c, self.sym, oid, self.px_cache, expected_filled=filled)
                     seen = filled
+                    try:
+                        on_fill(oid, f, f["gross"] - (f["fee_base"] if side == "buy" else 0))
+                    except ExecError as e:
+                        # La cobertura falló: dejar de operar, pero contar igual los
+                        # fills tardíos (tras cancelar) para deshacer el spot correcto.
+                        hedge_err = e
+                        break
                 if status in ("closed", "canceled", "rejected", "expired"):
                     terminal = True
                     break
@@ -1000,11 +1172,23 @@ class CexSpotLeg:
                 if typ != "limit":
                     time.sleep(0.5)
         finally:
+            final = None
             if not terminal:
                 _safe_cancel(self.c, oid, self.sym)
-                _final_order(self.c, oid, self.sym)
-        f = order_fills(self.c, self.sym, oid, self.px_cache)
+                final = _final_order(self.c, oid, self.sym)
+        f = order_fills(self.c, self.sym, oid, self.px_cache,
+                        expected_filled=(final or {}).get("filled"))
+        if hedge_err is not None:
+            try:
+                on_fill(oid, f, f["gross"] - (f["fee_base"] if side == "buy" else 0))
+            except ExecError:
+                pass
+            raise hedge_err
         on_fill(oid, f, f["gross"] - (f["fee_base"] if side == "buy" else 0))
+        if not terminal and (final is None or (final.get("status") or "").lower() == "open"):
+            # No se pudo confirmar la cancelación: no colocar otra orden encima.
+            raise ExecError(f"No se pudo cancelar la orden spot {oid}; ejecución detenida "
+                            f"— revisa órdenes abiertas en {self.sym}", code="CANCEL_FAILED")
         return f
 
     def trade(self, side, target_base, on_fill, window, taker_ok):
@@ -1077,15 +1261,20 @@ class PerpHedger:
         params = _perp_open_params(self.c, self.sym) if self.opening \
             else _perp_close_params(self.c, self.sym)
         last_err = None
+        # Mismo clientOrderId en el reintento: si el primer intento entró (timeout
+        # con orden aceptada), Binance rechaza el duplicado y _create_idempotent la
+        # encuentra → nunca se duplica el short ni la recompra.
+        coid = self.ctx.coid("p")
         for attempt in range(2):
             try:
-                o = self.c.create_order(self.sym, "market", side, amt, None,
-                                        _with_coid(params, self.ctx.coid("p")))
+                o = _create_idempotent(self.c, self.sym, "market", side, amt, None,
+                                       _with_coid(params, coid))
                 self.order_ids.append(o["id"])
-                f = order_fills(self.c, self.sym, o["id"], self.px_cache)
+                f = order_fills(self.c, self.sym, o["id"], self.px_cache,
+                                expected_filled=o.get("filled") or None)
                 got = f["gross"] or amt * self.cs
                 self.hedged += got
-                self.cost += f["cost"]
+                self.cost += f["cost"] or got * (f["avg"] or mid)
                 self.fee_usd += f["fee_usd"]
                 return None
             except Exception as e:
@@ -1316,11 +1505,20 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
         # No se pudo cubrir → vender lo no cubierto para no quedar direccional.
         unhedged = max(0.0, state["spot_net"] - hedger.hedged)
         unwound = _unwind_spot(leg, unhedged)
+        partial = None
+        if hedger.hedged > 0:
+            # La posición guardada es SOLO lo cubierto (lo deshecho ya no está en manos).
+            pstate = dict(state)
+            if unwound and state["spot_net"] > hedger.hedged:
+                k = hedger.hedged / state["spot_net"]
+                pstate.update(spot_net=hedger.hedged, spot_cost=state["spot_cost"] * k,
+                              spot_gross=(state.get("spot_gross") or state["spot_net"]) * k)
+            partial = _open_result(exchange, spot_sym, perp_sym, leg, hedger, pstate,
+                                   leverage, onchain)
         return {"ok": False, "code": "HEDGE_FAILED", "unwound": unwound,
                 "msg": (f"Falló el short perp: {hedger.failed}. Spot no cubierto "
                         f"{'deshecho' if unwound else 'NO deshecho — REVISA MANUALMENTE'}."),
-                "partial": _open_result(exchange, spot_sym, perp_sym, leg, hedger, state,
-                                        leverage, onchain) if hedger.hedged > 0 else None}
+                "partial": partial}
 
     if hedger.hedged <= 0:
         msg = str(error) if error else ("No se logró basis favorable ni llenar el spot en la "
@@ -1602,6 +1800,11 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
 
     onchain = spot_leg_factory is not None
     leg = spot_leg_factory(perp_cli, perp_sym, ctx) if onchain else None
+    # El short se lee ANTES de tocar nada: si no se puede leer, no se opera (vender
+    # el spot creyendo que no hay short dejaría el short abierto y sin rastrear).
+    if _open_perp_size(perp_cli, perp_sym, "short") is None:
+        raise ExecError("No se pudo leer la posición perp en el exchange; cierre abortado "
+                        "sin operar. Reintenta en unos minutos.", code="POSITION_READ")
     # Seguros primero: la venta límite bloquea la base (saldo libre) y el SL no
     # debe dispararse a mitad del cierre. Lo que ya llenaron cuenta como salida.
     prot_fill = {}
@@ -1610,6 +1813,9 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
                                                position["protection"],
                                                getattr(leg, "wallet", None))
     actual_short = _open_perp_size(perp_cli, perp_sym, "short")
+    if actual_short is None:
+        raise ExecError("No se pudo leer la posición perp tras cancelar los seguros; cierre "
+                        "abortado sin operar (los seguros se re-colocan).", code="POSITION_READ")
     perp_to_close = min(perp_qty, actual_short) if actual_short else 0.0
     if onchain:
         spot_held = leg.held_base()
@@ -1675,8 +1881,12 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         error = ExecError(f"Error vendiendo el spot: {e}")
 
     # Cobertura final: el perp se cierra en proporción a lo vendido; si se vendió
-    # todo (o no había spot), se recompra el perp completo.
-    fully_sold = spot_to_sell <= 0 or state["sold"] >= spot_to_sell * 0.999
+    # todo (o no había spot), se recompra el perp completo. Un remanente spot bajo
+    # el mínimo vendible es polvo: cuenta como vendido (si no, la posición quedaría
+    # trabada y cada cierre posterior fallaría con "nada ejecutado").
+    remaining = max(0.0, spot_to_sell - state["sold"])
+    fully_sold = (spot_to_sell <= 0 or state["sold"] >= spot_to_sell * 0.999
+                  or (not error and not ctx.cancelled() and _is_dust(leg, remaining, ref)))
     if hedger.failed is None:
         target = perp_to_close if fully_sold else state["sold"] * ratio
         hedger.target(target, force_all=fully_sold)
@@ -1684,7 +1894,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         return {"ok": False, "code": "HEDGE_FAILED",
                 "msg": (f"Spot vendido ({state['sold']:g}) pero el perp NO se recompró "
                         f"completamente: {hedger.failed} — REVISA MANUALMENTE"),
-                "spot_sold": state["sold"], "perp_closed": hedger.hedged}
+                "spot_sold": state["sold"], "perp_closed": hedger.hedged,
+                "exit_fees_usd": round(leg.fee_usd + hedger.fee_usd + prot_fill.get("fee_usd", 0.0), 6)}
 
     res = {
         "ok": True, "dry_run": False, "drift": drift,
@@ -1708,6 +1919,22 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     if error or ctx.cancelled():
         res["partial_note"] = str(error) if error else "Cancelado por el usuario"
     return res
+
+
+def _is_dust(leg, amt: float, ref) -> bool:
+    """True si `amt` (base) ya no se puede vender: bajo el mínimo del mercado spot
+    (CEX) o < 1 USD (on-chain)."""
+    if amt <= 0:
+        return True
+    px = (ref or {}).get("spot_mid") or (ref or {}).get("perp_mid") or 0
+    if isinstance(leg, CexSpotLeg):
+        try:
+            px = px or _mid_price(leg.c, leg.sym)
+            n = _norm_amount(leg.c, leg.sym, amt)
+            return n <= 0 or not _min_ok(leg.c, leg.sym, n, px)
+        except Exception:
+            return False
+    return bool(px) and amt * px < 1.0
 
 
 def _close_pnl(position, state, hedger, prot_fill, ref) -> dict:
@@ -1763,6 +1990,8 @@ def _close_cross(creds_by_exchange, position, dry_run, ctx):
     qty = position.get("perp_qty")
     long_real = _open_perp_size(long_cli, sym, "long")
     short_real = _open_perp_size(short_cli, sym, "short")
+    if long_real is None or short_real is None:
+        return {"ok": False, "msg": "No se pudieron leer las posiciones perp; cierre abortado sin operar"}
     if qty:
         long_amt, short_amt = min(qty, long_real), min(qty, short_real)
     else:
@@ -1843,29 +2072,37 @@ def reconcile_spot_perp(creds: dict, exchange: str, symbol: str, prefix: str,
         fees += f["fee_usd"]
         perp_net += f["gross"] if o.get("side") == "sell" else -f["gross"]
 
+    # perp_net = vendido − recomprado (en un cierre las recompras lo hacen negativo).
     if kind == "open":
         spot_hold, perp_hold = max(0.0, spot_net), max(0.0, perp_net)
     else:
         spot_hold = max(0.0, float(position.get("spot_qty") or 0) + spot_net)
-        perp_hold = max(0.0, float(position.get("perp_qty") or 0) - perp_net)
+        perp_hold = max(0.0, float(position.get("perp_qty") or 0) + perp_net)
     actual_short = _open_perp_size(perp_cli, perp_sym, "short")
-    perp_hold = min(perp_hold, actual_short) if actual_short else perp_hold
+    if actual_short is None:
+        raise ExecError("No se pudo leer la posición perp para reconciliar")
+    # El short real manda: nunca registrar (ni re-cubrir contra) más de lo que existe.
+    perp_hold = min(perp_hold, actual_short)
 
     adjusted = None
     delta = spot_hold - perp_hold
     amt = _norm_amount(perp_cli, perp_sym, abs(delta))
     if amt > 0 and _min_ok(perp_cli, perp_sym, amt, _mid_price(perp_cli, perp_sym)):
-        if delta > 0:
-            o = perp_cli.create_order(perp_sym, "market", "sell", amt, None,
-                                      _with_coid(_perp_open_params(perp_cli, perp_sym), None))
-            perp_hold += amt * _contract_size(perp_cli, perp_sym)
-            adjusted = f"short +{amt}"
-        else:
-            o = perp_cli.create_order(perp_sym, "market", "buy", amt, None,
-                                      _perp_close_params(perp_cli, perp_sym))
-            perp_hold -= amt * _contract_size(perp_cli, perp_sym)
-            adjusted = f"short −{amt}"
-        fees += order_fills(perp_cli, perp_sym, o["id"])["fee_usd"]
+        try:
+            if delta > 0:
+                o = perp_cli.create_order(perp_sym, "market", "sell", amt, None,
+                                          _with_coid(_perp_open_params(perp_cli, perp_sym), None))
+                perp_hold += amt * _contract_size(perp_cli, perp_sym)
+                adjusted = f"short +{amt}"
+            else:
+                o = perp_cli.create_order(perp_sym, "market", "buy", amt, None,
+                                          _perp_close_params(perp_cli, perp_sym))
+                perp_hold -= amt * _contract_size(perp_cli, perp_sym)
+                adjusted = f"short −{amt}"
+            fees += order_fills(perp_cli, perp_sym, o["id"])["fee_usd"]
+        except Exception as e:
+            log.error(f"reconcile ajuste {perp_sym} falló: {e}")
+            adjusted = f"ajuste FALLIDO ({e}) — delta spot−short {delta:g}"
     return {"spot_qty": spot_hold, "perp_qty": max(0.0, perp_hold), "fees_usd": fees,
             "adjusted": adjusted,
             "msg": f"Reconciliado: spot {spot_hold:g}, short {perp_hold:g}"

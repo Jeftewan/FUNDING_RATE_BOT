@@ -14,7 +14,6 @@ Requiere: pip install -r requirements-dev.txt
 """
 
 import os
-import statistics
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -25,6 +24,10 @@ from sqlalchemy import create_engine, text
 # ── project root: scripts/ → repo root ──────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = ROOT / "cache"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from analysis.ml_features import window_stats  # noqa: E402  (fuente única prod/offline)
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -138,31 +141,17 @@ def base_window_features(rates: list, volumes: list, intervs: list,
     ih = max(float(intervs[i]), 1.0)
     ppd = 24.0 / ih
 
-    abs_hist = [abs(r) for r in hist if abs(r) > 1e-12]
-    if len(abs_hist) < 5:
+    # Misma función que usa prod (analysis/arbitrage.py) → paridad por construcción.
+    ws = window_stats(hist)
+    if ws is None:
         return None
-
-    mean_h = statistics.mean(abs_hist)
-    std_h = statistics.stdev(abs_hist) if len(abs_hist) > 1 else 0.0
-    cv = std_h / mean_h if mean_h > 1e-12 else 999.0
-    min_ratio = min(abs_hist) / mean_h if mean_h > 1e-12 else 0.0
-
-    # streak: positivos consecutivos desde el final
-    streak = 0
-    for r in reversed(hist):
-        if r > 0:
-            streak += 1
-        else:
-            break
-
-    pct = sum(1 for r in hist if r > 0) / len(hist) * 100
-    settlement_avg = mean_h
+    settlement_avg = ws["settlement_avg"]
 
     return {
-        "cv": cv,
-        "min_ratio": min_ratio,
-        "streak": streak,
-        "pct": pct,
+        "cv": ws["cv"],
+        "min_ratio": ws["min_ratio"],
+        "streak": ws["streak"],
+        "pct": ws["pct"],
         "settlement_avg": settlement_avg,
         "ppd": ppd,
         "fee_drag": estimate_fee_drag(settlement_avg, ppd),

@@ -126,7 +126,8 @@ class AccountSyncer:
         # estimadas previas o reales del sync anterior); se conservan las de
         # auditoría (auto_open, import, manual_adjust…). Las reales no llevan
         # "kind" para que la UI/chart las traten como pagos normales.
-        keep = [p for p in (pos.get("payments") or []) if "rate" not in p]
+        keep = [p for p in (pos.get("payments") or [])
+                if "rate" not in p or p.get("kind") == "manual_adjust"]
         cum = 0.0
         funding = []
         for inc in incomes:

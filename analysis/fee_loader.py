@@ -49,46 +49,36 @@ def _load_one(display_name: str, ccxt_instance) -> dict:
     """Best-effort: pull maker/taker from a CCXT exchange for spot + swap."""
     out = {}
 
-    # Many exchanges expose a top-level `fees['trading']` block
-    try:
-        trading = getattr(ccxt_instance, "fees", {}).get("trading", {})
-        maker = _pct(trading.get("maker"))
-        taker = _pct(trading.get("taker"))
-        if maker is not None:
-            out["fut_maker"] = maker  # CCXT swap instance → these are perp fees
-        if taker is not None:
-            out["fut_taker"] = taker
-    except Exception as e:
-        log.debug(f"fee_loader: {display_name} top-level fees read failed: {e}")
-
-    # Best-effort: walk a sample of swap markets and take the most common
-    # maker/taker pair.  Works for exchanges whose trading fees are returned
-    # per-market by CCXT (Binance, Bybit, OKX, Bitget all do this).
+    # NO se usa `fees['trading']` de la clase ccxt: son defaults genéricos (en
+    # Binance 0.10 % = SPOT), no del perp; antes se tomaban como fee del perp
+    # (real 0.05 %) y duplicaban el costo estimado las primeras 24 h tras cada
+    # deploy. Solo cuentan los fees por mercado, separados spot vs swap, y solo
+    # si los mercados ya están cargados; si no, rige Config.FEES (VIP0 real).
     try:
         markets = getattr(ccxt_instance, "markets", None)
         if markets:
-            makers, takers = [], []
-            for m in list(markets.values())[:50]:
-                mk = _pct(m.get("maker"))
-                tk = _pct(m.get("taker"))
+            buckets = {"fut": ([], []), "spot": ([], [])}
+            for m in markets.values():
+                kind = "fut" if (m.get("swap") or m.get("contract")) else ("spot" if m.get("spot") else None)
+                if kind is None or m.get("quote") != "USDT":
+                    continue
+                mk, tk = _pct(m.get("maker")), _pct(m.get("taker"))
                 if mk is not None:
-                    makers.append(mk)
+                    buckets[kind][0].append(mk)
                 if tk is not None:
-                    takers.append(tk)
-            if makers:
-                out.setdefault("fut_maker", sorted(makers)[len(makers) // 2])
-            if takers:
-                out.setdefault("fut_taker", sorted(takers)[len(takers) // 2])
+                    buckets[kind][1].append(tk)
+            for kind, (makers, takers) in buckets.items():
+                if makers:
+                    out[f"{kind}_maker"] = sorted(makers)[len(makers) // 2]
+                if takers:
+                    out[f"{kind}_taker"] = sorted(takers)[len(takers) // 2]
     except Exception as e:
         log.debug(f"fee_loader: {display_name} market-level fees read failed: {e}")
 
-    # Spot fees: all four CEXs use the same maker/taker for spot and perp
-    # at base tier.  If we didn't learn them explicitly, mirror the perp
-    # values (still better than the stale hardcoded table).
-    if "fut_taker" in out:
-        out.setdefault("spot_taker", out["fut_taker"])
-    if "fut_maker" in out:
-        out.setdefault("spot_maker", out["fut_maker"])
+    # Solo se cachea si hay las cuatro cifras (spot y perp): un dict parcial
+    # reemplazaría la tabla completa en get_exchange_fees_split.
+    if not all(k in out for k in ("spot_maker", "spot_taker", "fut_maker", "fut_taker")):
+        return {}
 
     return out
 

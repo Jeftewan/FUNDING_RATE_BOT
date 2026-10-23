@@ -26,6 +26,16 @@ _calibration = None          # lista ordenada asc de percentiles p0..p100 de las
                              # predicciones de train → mapea pred a score 0–100.
 _feature_names = None
 model_version = None         # fecha del modelo (str) o None — se loguea/persiste.
+# Cómo arma prod los features para ESTE artefacto (lo fija el entrenamiento):
+#   "estimate_v0": modelos de snapshots — ventana = últimas 30 liquidadas,
+#                  tasa actual = la vigente (estimación del próximo pago).
+#   "settled_v1":  modelos del dataset Binance — ventana = las 30 liquidaciones
+#                  ANTERIORES a la última, tasa actual = la última liquidada.
+_feature_spec = "estimate_v0"
+
+
+def feature_spec() -> str:
+    return _feature_spec
 
 
 def load_model(path: str) -> bool:
@@ -36,7 +46,7 @@ def load_model(path: str) -> bool:
     de sklearn no coincide (pickle incompatible), loguea y devuelve False — prod
     sigue con el heurístico.
     """
-    global _model, _calibration, _feature_names, model_version
+    global _model, _calibration, _feature_names, model_version, _feature_spec
     try:
         import os
         if not os.path.exists(path):
@@ -56,12 +66,18 @@ def load_model(path: str) -> bool:
             )
             return False
 
+        spec = bundle.get("feature_spec", "estimate_v0")
+        if spec not in ("estimate_v0", "settled_v1"):
+            log.error(f"ML model feature_spec desconocido ({spec}) — usando heurístico.")
+            return False
+
         _model = model
         _calibration = calib
         _feature_names = feats
+        _feature_spec = spec
         model_version = bundle.get("model_version")
         log.info(
-            f"ML model loaded: version={model_version} "
+            f"ML model loaded: version={model_version} spec={spec} "
             f"features={len(feats)} calib_pts={len(calib)}"
         )
         return True
@@ -70,6 +86,7 @@ def load_model(path: str) -> bool:
         _model = None
         _calibration = None
         _feature_names = None
+        _feature_spec = "estimate_v0"
         model_version = None
         return False
 
