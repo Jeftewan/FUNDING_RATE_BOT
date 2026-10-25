@@ -40,8 +40,9 @@ Estado del proyecto al **2026-10-25** (auditoría de rentabilidad, rama `feat/pr
 - **Rotación**: ver `rotation_gain_ok` en switch_analyzer (margen 2 % → +18 % vs no rotar).
 - **Mercado 2026**: funding BTC 11.9 % (2024) → 5.1 % (2025) → 3.0 % (2026 YTD); BTC/ETH a 10x no
   sirve (≈3–5 % anual sobre capital). 5–10 %/mes sostenido no es realista; 3–4 %/mes en meses buenos.
-- **Bug abierto**: JCT `user_history.id=46` registra `price_pnl=+438` (venta límite spot llenada, recompra
-  del short no registrada) → infla KPIs; fix en sesión aparte.
+- **JCT `user_history.id=46`**: registraba `price_pnl=+438` (faltaba la recompra manual del short); real
+  +57.5. Fix en el código (ver "Lecciones de JCT #46"); la fila se corrige con
+  `scripts/fix_external_buyback.py --hist 46 --apply` (lo corre el usuario tras el merge).
 
 ## Auditoría 2026-10-22 — foco Binance spot_perp
 
