@@ -765,17 +765,27 @@ def binance_preflight(perp_cli, perp_sym: str, leverage: int):
         raise ExecError(f"Leverage {leverage}x supera el máximo de {perp_sym} ({max_lev}x)")
 
 
-# ── Seguros spot_perp: SL del short + venta límite del spot al mismo precio ──
-# SL al 75 % del camino entrada → liquidación del short aislado. El spot se vende
-# con una límite a ese precio (CEX: LIMIT GTC; BSC: orden límite Kyber de 7 días),
-# así ambas piernas salen juntas antes de la liquidación. El vigilante
-# (execution/protection.py) completa la otra pierna si solo se llena una.
-PROTECTION_LIQ_FRACTION = 0.75
+# ── Seguros spot_perp: SL del short + venta límite del spot ──────────────────
+# SL al 80 % del camino entrada → liquidación del short aislado. El spot se vende
+# con una límite un poco POR DEBAJO (sl·(1−δ); CEX: LIMIT GTC; BSC: orden límite
+# Kyber de 7 días) para que en una subida salga primero el spot:
+#   * solo SL (caso A): spot desnudo → el vigilante lo vende a mercado.
+#   * solo spot (caso B): el short queda suelto con su SL duro + un take profit a
+#     −RUNNER_TP_PCT de la venta; si no toca en RUNNER_MAX_SECS se recompra.
+# Ver reports/protection_study_20261025.md.
+PROTECTION_LIQ_FRACTION = 0.80
+PROTECTION_SPOT_OFFSET = 0.005       # δ: el caso A cae ~75 % sin cambiar el esperado
+RUNNER_TP_PCT = 0.05
+RUNNER_MAX_SECS = 15 * 60
 PROTECTION_EXCHANGES = {"binance"}   # STOP_MARKET closePosition vía Algo API (ccxt)
 
 
 def protection_price(entry: float, liq: float, fraction: float = PROTECTION_LIQ_FRACTION) -> float:
     return entry + fraction * (liq - entry)
+
+
+def protection_spot_price(sl: float, offset: float = PROTECTION_SPOT_OFFSET) -> float:
+    return sl * (1 - offset)
 
 
 def _short_liq_price(perp_cli, perp_sym: str):
@@ -828,8 +838,10 @@ def place_protection(creds_by_exchange: dict, position: dict, ctx: ExecContext =
     if not entry or not liq or liq <= entry:
         return {"ok": False, "msg": f"No se pudo determinar entrada/liquidación (entry={entry}, liq={liq})"}
     sl = float(perp_cli.price_to_precision(perp_sym, protection_price(entry, liq)))
-    prot = {"status": "active", "sl_price": sl, "liq_price": liq, "liq_source": liq_source,
-            "entry_price": entry, "fraction": PROTECTION_LIQ_FRACTION, "placed_at": time.time(),
+    sp = protection_spot_price(sl)
+    prot = {"status": "active", "sl_price": sl, "spot_price": sp, "liq_price": liq,
+            "liq_source": liq_source, "entry_price": entry, "fraction": PROTECTION_LIQ_FRACTION,
+            "spot_offset": PROTECTION_SPOT_OFFSET, "placed_at": time.time(),
             "perp": None, "spot": None, "errors": []}
 
     try:
@@ -845,21 +857,24 @@ def place_protection(creds_by_exchange: dict, position: dict, ctx: ExecContext =
 
     venue = position.get("spot_venue") or "binance"
     try:
-        if venue == "bsc":
+        if not float(position.get("spot_qty") or 0):
+            pass                           # short suelto: no queda spot que proteger
+        elif venue == "bsc":
             from exchanges import kyber_limit_order as klo
             from exchanges import onchain_bsc as bsc
             if not wallet or not token:
                 raise ExecError("falta wallet/token BSC")
             held = bsc.from_wei(bsc.erc20_balance(token["address"], wallet["address"]), int(token["decimals"]))
             qty = min(float(position.get("spot_qty") or 0), held)
-            lo = klo.place_sell(wallet, token, qty, sl)
+            lo = klo.place_sell(wallet, token, qty, sp)
             prot["spot"] = {"venue": "bsc", "id": lo["id"], "status": "open", "qty": qty,
                             "expires_at": lo["expires_at"]}
         else:
             qty = _spot_sellable(spot_cli, spot_sym, float(position.get("spot_qty") or 0))
-            if qty <= 0 or not _min_ok(spot_cli, spot_sym, qty, sl):
+            sp = prot["spot_price"] = float(spot_cli.price_to_precision(spot_sym, sp))
+            if qty <= 0 or not _min_ok(spot_cli, spot_sym, qty, sp):
                 raise ExecError(f"cantidad spot {qty:g} bajo el mínimo")
-            o = spot_cli.create_order(spot_sym, "limit", "sell", qty, sl, _with_coid({}, ctx.coid("tp")))
+            o = spot_cli.create_order(spot_sym, "limit", "sell", qty, sp, _with_coid({}, ctx.coid("tp")))
             prot["spot"] = {"venue": "binance", "id": str(o.get("id")), "status": "open", "qty": qty}
     except Exception as e:
         log.error(f"venta límite spot {spot_sym} failed: {e}")
@@ -869,6 +884,21 @@ def place_protection(creds_by_exchange: dict, position: dict, ctx: ExecContext =
     if not prot["ok"]:
         prot["msg"] = "; ".join(prot["errors"])
     return prot
+
+
+def place_runner_tp(creds_by_exchange: dict, position: dict, spot_fill_price: float,
+                    ctx: ExecContext = None) -> dict:
+    """Take profit del short suelto (caso B): TAKE_PROFIT_MARKET closePosition a
+    −RUNNER_TP_PCT del precio de la venta spot (last price). Va por la Algo API."""
+    ctx = ctx or ExecContext()
+    _, perp_cli, _, perp_sym = _protection_clients(creds_by_exchange, position)
+    px = float(perp_cli.price_to_precision(perp_sym, spot_fill_price * (1 - RUNNER_TP_PCT)))
+    params = {"closePosition": True, "workingType": "CONTRACT_PRICE", "triggerPrice": px}
+    if _is_hedged(perp_cli, perp_sym) is True:
+        params["positionSide"] = "SHORT"
+    o = perp_cli.create_order(perp_sym, "TAKE_PROFIT_MARKET", "buy", None, None,
+                              _with_coid(params, ctx.coid("rtp")))
+    return {"id": str(o.get("id")), "status": "open", "price": px}
 
 
 def _leg_active(leg) -> bool:
@@ -912,18 +942,20 @@ def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = No
     """Estado real de los seguros: {perp, spot} ∈ open|filled|canceled|missing|unknown,
     con fills (`perp_fill`, `spot_fill`) cuando hay ejecución."""
     prot = position.get("protection") or {}
-    out = {"perp": "missing", "spot": "missing"}
+    out = {"perp": "missing", "spot": "missing", "tp": "missing"}
     spot_cli, perp_cli, spot_sym, perp_sym = _protection_clients(creds_by_exchange, position)
-    if _leg_active(prot.get("perp")):
+    for leg in ("perp", "tp"):             # SL duro y take profit del short suelto
+        if not _leg_active(prot.get(leg)):
+            continue
         try:
-            o = perp_cli.fetch_order(prot["perp"]["id"], perp_sym, {"trigger": True})
-            out["perp"] = _algo_state(o)
-            if out["perp"] == "filled":
+            o = perp_cli.fetch_order(prot[leg]["id"], perp_sym, {"trigger": True})
+            out[leg] = _algo_state(o)
+            if out[leg] == "filled":
                 actual = (o.get("info") or {}).get("actualOrderId")
-                out["perp_fill"] = order_fills(perp_cli, perp_sym, actual) if actual else None
+                out[f"{leg}_fill"] = order_fills(perp_cli, perp_sym, actual) if actual else None
         except Exception as e:
-            log.warning(f"SL status {perp_sym}: {e}")
-            out["perp"] = "unknown"
+            log.warning(f"{leg} status {perp_sym}: {e}")
+            out[leg] = "unknown"
     spot = prot.get("spot")
     if _leg_active(spot):
         try:
@@ -934,6 +966,9 @@ def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = No
                 filled = int((o or {}).get("filledMakingAmount") or 0)
                 if st == "filled" or (filled and st not in klo.ACTIVE_STATUSES):
                     out["spot"] = "filled"
+                    out["spot_full"] = st == "filled"
+                    qty, usdt = _bsc_filled(spot, o)
+                    out["spot_fill"] = {"gross": qty, "cost": usdt, "fee_usd": 0.0}
                 elif st in klo.ACTIVE_STATUSES:
                     out["spot"] = "open"
                 else:
@@ -942,6 +977,7 @@ def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = No
                 o = spot_cli.fetch_order(spot["id"], spot_sym)
                 out["spot"] = _limit_state(o)
                 if out["spot"] == "filled":
+                    out["spot_full"] = (o.get("status") or "").lower() == "closed"
                     out["spot_fill"] = order_fills(spot_cli, spot_sym, spot["id"])
         except Exception as e:
             log.warning(f"spot protection status {spot_sym}: {e}")
@@ -950,6 +986,16 @@ def protection_status(creds_by_exchange: dict, position: dict, wallet: dict = No
 
 
 _BSC_LIVE = ("open", "partially_filled")
+
+
+def _bsc_filled(spot, o) -> tuple:
+    """(base vendida, USDT recibidos) de una orden límite Kyber."""
+    o = o or {}
+    filled, making = int(o.get("filledMakingAmount") or 0), int(o.get("makingAmount") or 0)
+    if not (filled and making):
+        return 0.0, 0.0
+    taking = int(o.get("filledTakingAmount") or 0) or int(o.get("takingAmount") or 0) * filled // making
+    return float(spot.get("qty") or 0) * filled / making, taking / 1e18   # USDT BSC: 18 dec
 
 
 def _cancel_bsc_limit(wallet, spot) -> tuple:
@@ -974,21 +1020,19 @@ def _cancel_bsc_limit(wallet, spot) -> tuple:
             log.warning(f"cancel venta límite BSC {oid} intento {attempt + 1}: {e}")
         time.sleep(1)
     alive = o.get("status") in _BSC_LIVE if o is not None else not cancelled
-    o = o or {}
-    filled, making = int(o.get("filledMakingAmount") or 0), int(o.get("makingAmount") or 0)
-    if not (filled and making):
-        return alive, 0.0, 0.0
-    taking = int(o.get("filledTakingAmount") or 0) or int(o.get("takingAmount") or 0) * filled // making
-    return alive, float(spot.get("qty") or 0) * filled / making, taking / 1e18   # USDT BSC: 18 dec
+    return (alive, *_bsc_filled(spot, o))
 
 
 def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None) -> dict:
     """Cancela las órdenes de seguro vivas. Devuelve fees/qty de lo que ya se
     había llenado (para sumarlo al cierre)."""
-    out = {"perp_filled": 0.0, "perp_cost": 0.0, "spot_filled": 0.0, "spot_cost": 0.0, "fee_usd": 0.0}
+    out = {"perp_filled": 0.0, "perp_cost": 0.0, "tp_filled": 0.0, "spot_filled": 0.0,
+           "spot_cost": 0.0, "fee_usd": 0.0}
     alive = []
-    perp = prot.get("perp")
-    if _leg_active(perp):
+    for leg, label in (("perp", "SL del short"), ("tp", "take profit del short")):
+        perp = prot.get(leg)
+        if not _leg_active(perp):
+            continue
         o = None
         for attempt in range(3):
             try:
@@ -999,16 +1043,19 @@ def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wal
                 if _algo_state(o) != "open":
                     break
             except Exception as e:
-                log.warning(f"cancel SL {perp_sym} intento {attempt + 1}: {e}")
+                log.warning(f"cancel {label} {perp_sym} intento {attempt + 1}: {e}")
                 o = None
             time.sleep(1)
         if o is None or _algo_state(o) == "open":
-            # Un SL closePosition vivo cerraría también una posición futura del símbolo.
-            alive.append(f"SL del short {perp['id']}")
+            # Un closePosition vivo cerraría también una posición futura del símbolo.
+            alive.append(f"{label} {perp['id']}")
         elif _algo_state(o) == "filled" and (o.get("info") or {}).get("actualOrderId"):
             f = order_fills(perp_cli, perp_sym, o["info"]["actualOrderId"])
-            out["perp_filled"], out["perp_cost"] = f["gross"], f["cost"]
+            out["perp_filled"] += f["gross"]
+            out["perp_cost"] += f["cost"]
             out["fee_usd"] += f["fee_usd"]
+            if leg == "tp":
+                out["tp_filled"] = f["gross"]
     spot = prot.get("spot")
     if _leg_active(spot):
         if spot.get("venue") == "bsc":
@@ -1894,6 +1941,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     duration = float(twap.get("duration_s") or 0)
     interval = duration / slices if slices > 1 else 0
     window = SPOT_LIMIT_TIMEOUT if slices == 1 else max(15, min(SPOT_LIMIT_TIMEOUT, interval * 0.8))
+    if spot_to_sell and not actual_short:
+        window = 0       # spot desnudo (el SL ya cerró el short): taker ya, sin esperar maker
     error = None
     try:
         for i in range(slices):
