@@ -27,3 +27,4 @@ reports/profit_sim_*.csv
 
 # Dataset local de Binance (scripts/binance_dataset.py)
 cache/binance/
+cache/real_trades.pkl
