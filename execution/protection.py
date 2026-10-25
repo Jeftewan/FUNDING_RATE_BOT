@@ -7,7 +7,8 @@ Cada PROTECTION_INTERVAL s, por posición activa con protection_json.status=acti
     precio, pueden no coincidir). El job registra fills/fees reales.
   - Venta spot llenada COMPLETA con el SL vivo (caso B) → short suelto ("runner"):
     se registra la venta, el short sigue con su SL duro + take profit a
-    −RUNNER_TP_PCT; si en RUNNER_MAX_SECS no tocó, se recompra con un cierre.
+    −caída de la venta; si en el tiempo máximo no tocó, se recompra con un cierre
+    (texec.RUNNER_RULES por venue: CEX −5 % / 15 min, BSC −20 % / 1 h).
   - Mark a < HOT_PCT del SL → el loop pasa a HOT_INTERVAL (spot desnudo menos tiempo).
   - Orden límite BSC (Kyber, expira a 7 días) a < RENEW_BEFORE de expirar o ya
     expirada → se renueva y se avisa por Telegram.
@@ -120,11 +121,12 @@ class ProtectionWatcher:
             self._close(uid, pos, prot, token, key,
                         f"Seguro ejecutado en {sym}: {which}. Cerrando la posición")
             return
+        max_secs = int((prot.get("tp") or {}).get("max_secs") or texec.runner_rule(pos)[1])
         if prot.get("status") == "runner" and \
-                time.time() - float(prot.get("runner_at") or 0) >= texec.RUNNER_MAX_SECS:
+                time.time() - float(prot.get("runner_at") or 0) >= max_secs:
             self._close(uid, pos, prot, token, "runner_timeout",
                         f"Short suelto de {sym}: no tocó el take profit en "
-                        f"{texec.RUNNER_MAX_SECS // 60} min. Recomprando")
+                        f"{max_secs // 60} min. Recomprando")
             return
 
         if self._check_short(uid, pos, creds, token):
@@ -168,7 +170,7 @@ class ProtectionWatcher:
     def _start_runner(self, uid, pos, prot, st, creds) -> bool:
         """Caso B: la venta spot se llenó completa y el SL no. Registra la venta y deja
         el short suelto con su SL duro + take profit (reports/protection_study_20261025.md:
-        TP −5 % o 15 min rinde ≥ recomprar ya). False → se cierra como antes."""
+        y _bsc.md: la regla por venue rinde ≥ recomprar ya). False → se cierra como antes."""
         from exchanges import trade_executor as texec
         r = self.runner
         sym = pos.get("symbol", "")
@@ -195,7 +197,7 @@ class ProtectionWatcher:
         log.info(f"runner {sym} pos={pos['id']}: spot {qty:g} @ {px:g}, TP {tp['price']:g}")
         r._alert(uid, sym, f"Venta límite del spot {sym} ejecutada a {px:g}. El short queda suelto: "
                            f"take profit a {tp['price']:g}, SL {prot.get('sl_price'):g}; si no toca en "
-                           f"{texec.RUNNER_MAX_SECS // 60} min se recompra.", severity="WARNING",
+                           f"{tp['max_secs'] // 60} min se recompra.", severity="WARNING",
                  typ="SPOT_TP_RUNNER")
         return True
 

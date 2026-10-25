@@ -17,12 +17,16 @@ con spot y carry alto en cache/binance/fr_binance.csv. Una entrada por día y
 símbolo, hold máx 30 d. Resultado por evento en % del precio de entrada, medido
 contra la salida ideal (ambas piernas exactamente en el SL); el funding cobrado
 por el short suelto NO se suma (sesgo conservador para el runner).
-Limitación: el spot on-chain BSC (tokens solo-Alpha) no está en Binance.
+Con --venue bsc el spot son los tokens solo-Alpha (sin spot en Binance, BSC,
+liquidez ≥ 200k como en prod): velas 1m de la API pública de Binance Alpha
+(precio de los trades on-chain), alineadas al perp con forward-fill en minutos
+sin trades. La orden límite Kyber se asume llenada cuando ese precio la cruza.
 
 Uso:
     python scripts/protection_study.py                  # 20 símbolos, 12 meses
     python scripts/protection_study.py --symbols 30 --months 6
-Salida: reports/protection_study_YYYYMMDD.md (velas cacheadas en cache/binance/klines1m/).
+    python scripts/protection_study.py --venue bsc      # tokens solo-Alpha (spot on-chain)
+Salida: reports/protection_study_YYYYMMDD[_bsc].md (velas cacheadas en cache/binance/klines1m/).
 """
 import argparse
 import io
@@ -51,18 +55,55 @@ TP_FALLS = (0.03, 0.05, 0.10, 0.20, 0.30)              # caída desde la venta s
 TIMEOUTS = (5, 15, 30, 60, 120, 240, 720, 1440, HOLD_MIN)   # minutos
 KINDS = {"spot": "spot/monthly/klines", "perp": "futures/um/monthly/klines",
          "mark": "futures/um/monthly/markPriceKlines"}
+ALPHA_LIST_URL = "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
+ALPHA_KLINES_URL = "https://www.binance.com/bapi/defi/v1/public/alpha-trade/klines"
+ALPHA_MIN_LIQ = 200_000              # mismo piso que prod (exchanges/onchain_bsc.py)
+SPOT_SLIP = {"binance": SLIP, "bsc": 0.005}   # venta a mercado del spot desnudo (swap DEX)
+ALPHA_IDS = {}                       # símbolo → alphaId (ALPHA_191)
 
 
 # ── datos ───────────────────────────────────────────────────────────────────
-def pick_symbols(n: int, months: list) -> list:
+def _alpha_bsc() -> dict:
+    data = _get(ALPHA_LIST_URL, timeout=30).json()["data"]
+    return {t["symbol"].upper(): t["alphaId"] for t in data
+            if str(t.get("chainId")) == "56" and float(t.get("liquidity") or 0) >= ALPHA_MIN_LIQ
+            and t.get("alphaId")}
+
+
+def pick_symbols(n: int, months: list, venue: str = "binance") -> list:
     df = pd.read_csv(OUT_CSV, usecols=["symbol", "rate", "interval_hours", "funding_ts", "has_spot"])
     t0 = int(datetime.strptime(months[0], "%Y-%m").replace(tzinfo=timezone.utc).timestamp() * 1000)
-    df = df[(df.funding_ts >= t0) & (df.has_spot == 1)]
+    df = df[df.funding_ts >= t0]
+    if venue == "bsc":
+        ALPHA_IDS.update(_alpha_bsc())
+        df = df[(df.has_spot == 0) & df.symbol.str.upper().isin(ALPHA_IDS)]
+    else:
+        df = df[df.has_spot == 1]
     df["daily"] = df.rate * 24 / df.interval_hours
     g = df.groupby("symbol").agg(daily=("daily", "mean"), n=("rate", "size"))
     g = g[(g.n >= 300) & ~g.index.str.match(r"^1+0+")]   # 1000PEPE: el spot no es el mismo
     g = g.sort_values("daily", ascending=False)
     return list(g.index[:n])
+
+
+def _kinds(venue: str) -> list:
+    return ["alpha", "perp", "mark"] if venue == "bsc" else list(KINDS)
+
+
+def _alpha_month(sym: str, month: str) -> np.ndarray:
+    """Velas 1m on-chain (API pública de Binance Alpha) de un mes, paginadas."""
+    p = pd.Period(month, "M")
+    t, stop = int(p.start_time.timestamp() * 1000), int((p + 1).start_time.timestamp() * 1000)
+    rows = []
+    while t < stop:
+        r = _get(ALPHA_KLINES_URL, {"symbol": f"{ALPHA_IDS[sym.upper()]}USDT", "interval": "1m",
+                                    "limit": 1500, "startTime": t, "endTime": stop - 1}, timeout=30)
+        data = (r.json().get("data") or []) if r is not None else []
+        if not data:
+            break
+        rows += [k[:5] for k in data]
+        t = int(data[-1][0]) + 60_000
+    return np.array(rows, dtype=float) if rows else np.empty((0, 5))
 
 
 def _month_bars(sym: str, kind: str, month: str):
@@ -71,6 +112,10 @@ def _month_bars(sym: str, kind: str, month: str):
         z = np.load(path)
         return z["a"] if z["a"].size else None
     path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "alpha":
+        a = _alpha_month(sym, month)
+        np.savez_compressed(path, a=a)
+        return a if a.size else None
     pair = f"{sym}USDT"                  # el dataset guarda la base (BTC), vision el par
     r = _get(f"{VISION}/data/{KINDS[kind]}/{pair}/1m/{pair}-1m-{month}.zip", timeout=120)
     a = np.empty((0, 5))
@@ -84,15 +129,21 @@ def _month_bars(sym: str, kind: str, month: str):
     return a if a.size else None
 
 
-def load_symbol(sym: str, months: list):
+def load_symbol(sym: str, months: list, venue: str = "binance"):
     """DataFrame por minuto (ts) con spot_high, perp_open/high/low/close, mark_high."""
     parts = {}
-    for kind in KINDS:
+    for kind in _kinds(venue):
         arrs = [a for a in (_month_bars(sym, kind, m) for m in months) if a is not None]
         if not arrs:
             return None
         a = np.vstack(arrs)
         parts[kind] = pd.DataFrame(a, columns=["ts", "o", "h", "l", "c"]).drop_duplicates("ts").set_index("ts")
+    if venue == "bsc":
+        # On-chain hay minutos sin trades: el precio es el último conocido.
+        sp = parts.pop("alpha").reindex(parts["perp"].index)
+        sp["c"] = sp.c.ffill()
+        sp["h"] = sp.h.fillna(sp.c)
+        parts["spot"] = sp
     df = pd.DataFrame({"spot_h": parts["spot"].h, "spot_c": parts["spot"].c,
                        "perp_o": parts["perp"].o, "perp_h": parts["perp"].h,
                        "perp_l": parts["perp"].l, "perp_c": parts["perp"].c,
@@ -142,7 +193,7 @@ def tp_time_exits(d: dict, t: int, end: int, sl: float, sp: float, e: float) -> 
     return out
 
 
-def simulate(sym: str, df: pd.DataFrame) -> list:
+def simulate(sym: str, df: pd.DataFrame, spot_slip: float = SLIP) -> list:
     d = {k: df[k].to_numpy() for k in df.columns}
     n = len(df)
     out = []
@@ -180,7 +231,7 @@ def simulate(sym: str, df: pd.DataFrame) -> list:
                     for tag, lag in (("now60", 1), ("now10", 0)):
                         k = min(tp + lag, end - 1)
                         hit = _first(d["spot_h"][tp + 1:k + 1] > sp) if k > tp else -1
-                        sell = sp if hit >= 0 else d["spot_c"][k] * (1 - SLIP)
+                        sell = sp if hit >= 0 else d["spot_c"][k] * (1 - spot_slip)
                         row[tag] = (sell - buy) / e * 100
                 else:
                     row["case"] = "AB"
@@ -190,9 +241,11 @@ def simulate(sym: str, df: pd.DataFrame) -> list:
 
 
 # ── reporte ─────────────────────────────────────────────────────────────────
-def report(res: pd.DataFrame, syms: list, months: list) -> str:
+def report(res: pd.DataFrame, syms: list, months: list, venue: str = "binance") -> str:
     run_cols = [f"run{int(c * 100)}" for c in CALLBACKS]
-    L = [f"# Estudio de seguros spot_perp — {datetime.now():%Y-%m-%d}", "",
+    spot_src = ("spot on-chain BSC (velas de Binance Alpha), tokens solo-Alpha; venta del spot "
+                f"desnudo con {SPOT_SLIP['bsc']:.1%} de impacto") if venue == "bsc" else "spot Binance"
+    L = [f"# Estudio de seguros spot_perp — {datetime.now():%Y-%m-%d} — {spot_src}", "",
          f"Símbolos ({len(syms)}): {', '.join(syms)}  ", f"Meses: {months[0]} → {months[-1]}; "
          f"una entrada por día, hold ≤ 30 d; SL al {FRACTION:.0%} del camino a liquidación "
          f"(mmr {MMR:.0%}), slippage {SLIP:.1%}.  ",
@@ -266,26 +319,29 @@ def main():
     ap.add_argument("--months", type=int, default=12)
     ap.add_argument("--end", default=None, help="último mes YYYY-MM (default: el anterior al actual)")
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--venue", choices=("binance", "bsc"), default="binance")
     args = ap.parse_args()
     end = pd.Period(args.end, "M") if args.end else pd.Period(datetime.now(timezone.utc).strftime("%Y-%m"), "M") - 1
     months = [str(end - k) for k in range(args.months - 1, -1, -1)]
-    syms = pick_symbols(args.symbols, months)
+    syms = pick_symbols(args.symbols, months, args.venue)
     print(f"símbolos: {syms}", flush=True)
     with ThreadPoolExecutor(args.workers) as ex:
-        list(ex.map(lambda t: _month_bars(*t), [(s, k, m) for s in syms for k in KINDS for m in months]))
+        list(ex.map(lambda t: _month_bars(*t),
+                    [(s, k, m) for s in syms for k in _kinds(args.venue) for m in months]))
     rows = []
     for s in syms:
-        df = load_symbol(s, months)
+        df = load_symbol(s, months, args.venue)
         if df is None:
             print(f"  {s}: sin datos suficientes", flush=True)
             continue
-        rows += simulate(s, df)
+        rows += simulate(s, df, SPOT_SLIP[args.venue])
         print(f"  {s}: {len(df)} minutos", flush=True)
     res = pd.DataFrame(rows)
     if res.empty:
         sys.exit("sin datos: nada que simular")
-    out = ROOT / "reports" / f"protection_study_{datetime.now():%Y%m%d}.md"
-    out.write_text(report(res, syms, months), encoding="utf-8")
+    suffix = "_bsc" if args.venue == "bsc" else ""
+    out = ROOT / "reports" / f"protection_study_{datetime.now():%Y%m%d}{suffix}.md"
+    out.write_text(report(res, syms, months, args.venue), encoding="utf-8")
     print(f"-> {out}")
 
 

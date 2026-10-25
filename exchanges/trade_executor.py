@@ -771,12 +771,13 @@ def binance_preflight(perp_cli, perp_sym: str, leverage: int):
 # Kyber de 7 días) para que en una subida salga primero el spot:
 #   * solo SL (caso A): spot desnudo → el vigilante lo vende a mercado.
 #   * solo spot (caso B): el short queda suelto con su SL duro + un take profit a
-#     −RUNNER_TP_PCT de la venta; si no toca en RUNNER_MAX_SECS se recompra.
+#     −caída de la venta; si no toca en el tiempo máximo se recompra (RUNNER_RULES).
 # Ver reports/protection_study_20261025.md.
 PROTECTION_LIQ_FRACTION = 0.80
 PROTECTION_SPOT_OFFSET = 0.005       # δ: el caso A cae ~75 % sin cambiar el esperado
-RUNNER_TP_PCT = 0.05
-RUNNER_MAX_SECS = 15 * 60
+# (caída del TP, tiempo máx) por venue del spot. On-chain el spot hace mechas más
+# largas y esperar una caída mayor rinde más; en CEX no (estudios del 2026-10-25).
+RUNNER_RULES = {"binance": (0.05, 15 * 60), "bsc": (0.20, 60 * 60)}
 PROTECTION_EXCHANGES = {"binance"}   # STOP_MARKET closePosition vía Algo API (ccxt)
 
 
@@ -886,19 +887,24 @@ def place_protection(creds_by_exchange: dict, position: dict, ctx: ExecContext =
     return prot
 
 
+def runner_rule(position: dict) -> tuple:
+    return RUNNER_RULES.get(position.get("spot_venue") or "binance", RUNNER_RULES["binance"])
+
+
 def place_runner_tp(creds_by_exchange: dict, position: dict, spot_fill_price: float,
                     ctx: ExecContext = None) -> dict:
     """Take profit del short suelto (caso B): TAKE_PROFIT_MARKET closePosition a
-    −RUNNER_TP_PCT del precio de la venta spot (last price). Va por la Algo API."""
+    −caída del precio de la venta spot (last price, RUNNER_RULES). Va por la Algo API."""
     ctx = ctx or ExecContext()
     _, perp_cli, _, perp_sym = _protection_clients(creds_by_exchange, position)
-    px = float(perp_cli.price_to_precision(perp_sym, spot_fill_price * (1 - RUNNER_TP_PCT)))
+    fall, max_secs = runner_rule(position)
+    px = float(perp_cli.price_to_precision(perp_sym, spot_fill_price * (1 - fall)))
     params = {"closePosition": True, "workingType": "CONTRACT_PRICE", "triggerPrice": px}
     if _is_hedged(perp_cli, perp_sym) is True:
         params["positionSide"] = "SHORT"
     o = perp_cli.create_order(perp_sym, "TAKE_PROFIT_MARKET", "buy", None, None,
                               _with_coid(params, ctx.coid("rtp")))
-    return {"id": str(o.get("id")), "status": "open", "price": px}
+    return {"id": str(o.get("id")), "status": "open", "price": px, "max_secs": max_secs}
 
 
 def _leg_active(leg) -> bool:

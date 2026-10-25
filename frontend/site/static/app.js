@@ -1360,7 +1360,7 @@ function protectionBadge(pr) {
   if (!pr) return '';
   if (pr.status === 'runner') {
     const fill = pr.spot && pr.spot.fill_price ? `Spot vendido a ${pr.spot.fill_price}` : 'Spot vendido';
-    const tip = `${fill} | Take profit short: ${pr.tp ? pr.tp.price : '—'} | SL ${pr.sl_price} | se recompra a los 15 min si no toca`;
+    const tip = `${fill} | Take profit short: ${pr.tp ? pr.tp.price : '—'} | SL ${pr.sl_price} | se recompra a los ${pr.tp && pr.tp.max_secs ? Math.round(pr.tp.max_secs / 60) : 15} min si no toca`;
     return `<span class="ind-badge badge-unprotected" title="${tip.replace(/"/g, '&quot;')}">SHORT SUELTO</span>`;
   }
   if (pr.status !== 'active') {

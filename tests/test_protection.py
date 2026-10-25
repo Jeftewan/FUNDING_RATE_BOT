@@ -356,7 +356,8 @@ def test_watcher_full_spot_fill_leaves_short_running_with_tp(env, monkeypatch):
     assert pnl is not None
     tp = ex.algo[ex.algo_of("TAKE_PROFIT_MARKET")]
     assert tp["params"]["closePosition"] is True
-    assert tp["params"]["triggerPrice"] == pytest.approx(prot0["spot_price"] * (1 - te.RUNNER_TP_PCT), abs=0.01)
+    assert tp["params"]["triggerPrice"] == pytest.approx(prot0["spot_price"] * (1 - te.RUNNER_RULES["binance"][0]), abs=0.01)
+    assert tp["type"] == "TAKE_PROFIT_MARKET" and prot["tp"]["max_secs"] == te.RUNNER_RULES["binance"][1]
 
     w.tick()
     assert not submitted                              # nada nuevo: sigue suelto
@@ -384,9 +385,10 @@ def test_runner_close_job_cancels_sl_and_closes(env, monkeypatch):
 
 def test_runner_times_out_and_buys_back(env, monkeypatch):
     app, runner, ex, uid, pos_id, w, submitted, alerts = _opened_watcher(env, monkeypatch)
+    monkeypatch.setattr(te, "RUNNER_RULES", {"binance": (0.05, 0)})
     ex.fill_spot_limit()
     w.tick()
-    monkeypatch.setattr(te, "RUNNER_MAX_SECS", 0)
+    assert _prot(app, pos_id)[0]["status"] == "runner"
     w.tick()
     assert submitted and _prot(app, pos_id)[0]["triggered_by"] == "runner_timeout"
 
@@ -418,3 +420,9 @@ def test_watcher_goes_hot_near_sl(env, monkeypatch):
     ex.mark = sl * 0.99
     w.tick()
     assert w._hot is True and not submitted
+
+
+def test_runner_rule_depends_on_spot_venue():
+    assert te.runner_rule({"spot_venue": "bsc"}) == te.RUNNER_RULES["bsc"]
+    assert te.runner_rule({"spot_venue": ""}) == te.RUNNER_RULES["binance"]
+    assert te.RUNNER_RULES["bsc"][0] > te.RUNNER_RULES["binance"][0]
