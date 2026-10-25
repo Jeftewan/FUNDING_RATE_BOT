@@ -714,6 +714,10 @@ body {
 }
 .opp-ai.open .ai-body { display: block; }
 .ai-watch { background: var(--orange-bg); color: var(--orange); border: 1px solid #f59e0b44; }
+.ai-lev { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 11px; }
+.ai-lev th, .ai-lev td { padding: 2px 4px; text-align: right; border-bottom: 1px solid var(--border); }
+.ai-lev th:first-child, .ai-lev td:first-child { text-align: left; }
+.ai-risks { margin: 4px 0 4px 16px; padding: 0; font-size: 12px; }
 
 /* ═══ POSITION AI ═════════════════════════════════ */
 .pos-ai {

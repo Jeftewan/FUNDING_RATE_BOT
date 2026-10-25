@@ -555,6 +555,56 @@ async function loadOpps() {
   }
 }
 
+// ── Análisis IA bajo demanda por oportunidad ─────────────────
+// Veredicto determinista del modelo (backend) + explicación de Gemini.
+let _oppAiData = {};
+const AI_ICON = '<svg class="ai-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/></svg>';
+
+function oppAiHtml(oppId, i) {
+  const a = _oppAiData[oppId];
+  if (!a) {
+    return `<button class="btn-ai-toggle" onclick="analyzeOppAI('${oppId}',${i})">${AI_ICON}<span class="ai-label">Analizar con IA</span></button>`;
+  }
+  const cls = a.signal === 'ENTRAR' ? 'ai-buy' : a.signal === 'NO ENTRAR' ? 'ai-avoid' : 'ai-hold';
+  const lev = (a.facts && a.facts.lev || []).map(l =>
+    `<tr><td>${l.x}x</td><td>${l.roc == null ? '—' : l.roc.toFixed(1) + '%'}</td><td>${l.usd_d == null ? '—' : '$' + l.usd_d.toFixed(2)}</td><td>${l.liq}%</td></tr>`).join('');
+  const risks = (a.risks || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
+  return `
+    <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">
+      ${AI_ICON}<span class="ai-label">Analisis IA</span>
+      <span class="ai-badge ${cls}">${a.signal}</span>
+      <svg class="ai-arrow" width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
+    </button>
+    <div class="ai-body">
+      <div class="ai-analysis">${escapeHtml(a.analysis || a.reason || '')}</div>
+      ${lev ? `<table class="ai-lev"><tr><th>Apal.</th><th>APR s/capital</th><th>USD/día ($${a.facts.capital})</th><th>Liq. a +</th></tr>${lev}</table>` : ''}
+      ${a.leverage ? `<div class="ai-action-plan"><span class="ai-action-label">Apalancamiento:</span> ${escapeHtml(a.leverage)}</div>` : ''}
+      ${risks ? `<ul class="ai-risks">${risks}</ul>` : ''}
+      ${a.watch ? `<div class="ai-action-plan"><span class="ai-action-label">Vigilar:</span> ${escapeHtml(a.watch)}</div>` : ''}
+    </div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function analyzeOppAI(oppId, i) {
+  const box = document.getElementById('ai-' + i);
+  if (box) box.innerHTML = `<button class="btn-ai-toggle" disabled>${AI_ICON}<span class="ai-label">Analizando...</span></button>`;
+  const cap = parseFloat(document.getElementById('cap-' + i)?.value) || 1000;
+  try {
+    const res = await fetch(`/api/opportunities/${encodeURIComponent(oppId)}/ai`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ capital: cap }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.msg || 'sin resultado');
+    _oppAiData[oppId] = data.analysis;
+  } catch (e) {
+    showToast('Error en el análisis IA: ' + e.message, 'error');
+  }
+  if (box) { box.innerHTML = oppAiHtml(oppId, i); if (_oppAiData[oppId]) box.classList.add('open'); }
+}
+
 function renderOpps(data) {
   const rawOpps = data.opportunities || [];
   const opps = sortAndFilter(rawOpps);
@@ -635,17 +685,7 @@ function renderOpps(data) {
         ${execButton(o, i)}
       </div>
       <div class="opp-est" id="est-${i}"></div>
-      ${o.ai_analysis ? `
-      <div class="opp-ai" id="ai-${i}">
-        <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">
-          <svg class="ai-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/><circle cx="9" cy="9" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="9" r="1" fill="currentColor" stroke="none"/></svg>
-          <span class="ai-label">Analisis IA</span>
-          <span class="ai-badge ${o.ai_analysis.signal === 'COMPRAR' ? 'ai-buy' : o.ai_analysis.signal === 'EVITAR' ? 'ai-avoid' : 'ai-hold'}">${o.ai_analysis.signal}</span>
-          <span class="ai-conf">${o.ai_analysis.confidence}/10</span>
-          <svg class="ai-arrow" width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
-        </button>
-        <div class="ai-body">${o.ai_analysis.analysis}</div>
-      </div>` : ''}
+      <div class="opp-ai${_oppAiData[o._id] ? ' open' : ''}" id="ai-${i}">${oppAiHtml(o._id, i)}</div>
     </div>`;
   }).join('');
 
@@ -1323,16 +1363,19 @@ let _posAiData = {};
 let _posAiLoading = false;
 let _lastPosData = null;
 
-async function analyzePositionsAI() {
+async function analyzePositionsAI(posId) {
   if (_posAiLoading) return;
   _posAiLoading = true;
   const btn = document.getElementById('pos-ai-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Analizando posiciones...'; }
+  if (btn) { btn.disabled = true; btn.textContent = posId ? 'Analizando posición...' : 'Analizando posiciones...'; }
   try {
-    const res = await fetch('/api/positions/ai', { method: 'POST' });
+    const res = await fetch('/api/positions/ai', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(posId ? { position_id: posId } : {}),
+    });
     const data = await res.json();
     if (data.ok && data.analyses) {
-      _posAiData = data.analyses;
+      _posAiData = posId ? { ..._posAiData, ...data.analyses } : data.analyses;
       // Update switch analysis in cached position data (on-demand results)
       if (data.switch_results && _lastPosData && _lastPosData.positions) {
         for (const p of _lastPosData.positions) {
@@ -1641,7 +1684,8 @@ function renderPositions(data) {
           <div class="ai-analysis">${_posAiData[posId].analysis}</div>
           ${_posAiData[posId].action_plan ? `<div class="ai-action-plan"><span class="ai-action-label">Plan de accion:</span> ${_posAiData[posId].action_plan}</div>` : ''}
         </div>
-      </div>` : ''}
+      </div>` : `
+      <div class="pos-ai"><button class="btn-ai-toggle" onclick="analyzePositionsAI('${posId}')">${AI_ICON}<span class="ai-label">Analizar con IA</span></button></div>`}
     </div>`;
   }).join('');
 }

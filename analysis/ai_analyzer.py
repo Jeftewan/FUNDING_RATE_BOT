@@ -1,4 +1,4 @@
-"""AI-powered opportunity analysis via Gemini 3.1 Flash-Lite."""
+"""Análisis IA bajo demanda (Gemini 3.1 Flash-Lite): oportunidades y posiciones."""
 
 import json
 import logging
@@ -8,82 +8,7 @@ import re
 log = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-3.1-flash-lite"
-MAX_OPPS = 5
 TIMEOUT = 25
-
-SYSTEM_PROMPT = (
-    "Eres analista experto en arbitraje de funding rates. Tu trabajo es evaluar "
-    "oportunidades y dar una explicacion clara que ayude al usuario a decidir.\n\n"
-    "CONTEXTO DEL RANKING (modelo predictivo ML):\n"
-    "Un modelo de machine learning predice el NET APR (retorno anual neto de fees, en %) "
-    "de cada oportunidad y las oportunidades te llegan YA RANKEADAS de mayor a menor por "
-    "ese Net APR predicho. El numero clave que evaluas es 'napr' (Net APR predicho), NO un "
-    "score 0-100.\n"
-    "El modelo ya internaliza consistencia, estabilidad, yield, fee drag, z-score, momentum "
-    "y percentil como variables de entrada. Es decir, el napr predicho YA descuenta esos "
-    "riesgos. Tu rol es dar contexto humano y accionable, NO re-penalizar lo que el modelo "
-    "ya considero. No bajes una señal solo porque ves un riesgo menor que el modelo ya peso.\n"
-    "IMPORTANTE — campo 'mdl': napr es la prediccion NETA del modelo SOLO si mdl=1. Si mdl=0 "
-    "el modelo no predijo esta oportunidad y napr es un APR BRUTO estimado (no descuenta fees ni "
-    "riesgo, y el lote se ordeno por heuristico, no por napr): trata ese napr con mas cautela, no "
-    "asumas que el riesgo ya esta descontado y apoyate mas en con, fd, z y mom.\n\n"
-    "Responde SOLO JSON valido:\n"
-    '{"analyses":[{"id":"_id","signal":"COMPRAR|MANTENER|EVITAR",'
-    '"confidence":1-10,"analysis":"texto explicativo 40-60 palabras"}]}\n\n'
-    "CAMPOS que recibiras (SIEMPRE presentes, sin excepciones):\n"
-    "- sym: simbolo del par (ej BTC, ETH)\n"
-    "- mode: 'sp'=spot-perp, 'cross'=cross-exchange\n"
-    "- napr: Net APR predicho por el modelo ML en % anual neto de fees — METRICA PRINCIPAL "
-    "(solo fiable como neto si mdl=1)\n"
-    "- mdl: 1=napr viene del modelo ML (neto, descuenta riesgo); 0=modelo no predijo, napr es APR bruto\n"
-    "- apr: retorno anual bruto estimado en %\n"
-    "- beh: horas para recuperar fees (break-even)\n"
-    "- d1k: ingreso diario USD por cada $1000 invertidos\n"
-    "- n3d: ingreso neto USD en 3 dias por cada $1000 invertidos\n"
-    "- vol: volumen 24h en millones USD\n"
-    "- fr: funding rate actual en % (solo mode sp)\n"
-    "- diff: diferencial de funding rate en % (solo mode cross)\n"
-    "- grade: grado segun Net APR predicho (A=muy alto, B=alto, C=moderado, D=bajo)\n"
-    "- ehd: dias estimados que la tasa se mantendra favorable\n"
-    "- con: consistencia en % — porcentaje de periodos historicos que fueron favorables (0-100)\n"
-    "- fd: fee drag — ratio fees/ganancia bruta (0.0-1.0, menor=mejor, 0.2=20% se va en fees)\n"
-    "- mom: momentum (contexto de riesgo) — 'flat'=estable, 'accelerating'=acelerando, "
-    "'decelerating'=desacelerando, 'negative'=negativo\n"
-    "- z: z-score (contexto de riesgo) — desviaciones estandar de la tasa actual vs su media "
-    "historica (0=normal, >1.5=sobreextendido, >2.0=critico)\n\n"
-    "REGLAS de decision (sobre el napr ya rankeado por el modelo):\n"
-    "COMPRAR: napr alto (entre los mejores del lote) + con>=60 + sin riesgo claro e inminente\n"
-    "EVITAR: SOLO ante riesgo fuerte y concreto: z>=2.0 | (mom=accelerating AND z>1.0) | "
-    "con<40 | beh>20h | napr<=0\n"
-    "MANTENER: todo lo demas — señales mixtas, merecen vigilancia pero no descarte\n\n"
-    "NOTA CRITICA: como el lote llega rankeado por el modelo, las primeras oportunidades ya "
-    "fueron validadas como las de mayor retorno neto esperado. En estos casos la señal por "
-    "defecto es COMPRAR; solo emite EVITAR si hay una razon FUERTE y CONCRETA (z>=2.0, "
-    "momentum acelerando con z alto, consistencia muy baja, break-even excesivo).\n\n"
-    "FORTALEZAS que refuerzan COMPRAR:\n"
-    "- napr alto con con>=70: retorno neto esperado solido y consistente\n"
-    "- z<1.0 + mom flat: tasa en rango normal, sin sobreextension\n"
-    "- ehd>=5: persistencia esperada confirmada\n"
-    "- fd<0.2: fees bajos, alta eficiencia\n\n"
-    "RIESGOS (solo estos justifican EVITAR):\n"
-    "- z>=2.0: tasa sobreextendida, reversion probable\n"
-    "- mom=accelerating + z>1.0: pico de spike, reversion inminente\n"
-    "- con<40: tasa demasiado impredecible\n"
-    "- beh>20h: fees excesivos para el retorno\n"
-    "- napr<=0: el modelo no espera retorno neto positivo\n\n"
-    "En 'analysis' DEBES incluir estos 3 elementos en 40-60 palabras:\n"
-    "1. SITUACION: que esta pasando con esta oportunidad\n"
-    "2. RAZON: por que recomiendas esa signal (datos concretos)\n"
-    "3. ACCION: que debe hacer el usuario y que vigilar\n\n"
-    "Ejemplo COMPRAR (napr=48): 'Net APR predicho 48% con consistencia 89% grade A y z-score 0.6. "
-    "El modelo la rankea entre las mejores; momentum estable y fees recuperables en 5h. Entrar con "
-    "confianza, vigilar si z sube de 1.0.'\n"
-    "Ejemplo MANTENER (napr=15): 'Net APR predicho 15% con consistencia 63% grade C. Retorno aceptable "
-    "pero z-score 1.2 indica sobreextension moderada. Esperar a que z baje de 1.0 o entrar con tamaño reducido.'\n"
-    "Ejemplo EVITAR (z alto): 'Z-score 2.3, tasa sobreextendida y reversion probable; el modelo aun la rankea "
-    "pero el riesgo es concreto. No entrar hasta que z baje de 1.5.'"
-)
-
 
 def _get_gemini_key(config) -> str:
     """Pick a random Gemini API key from the configured keys."""
@@ -100,80 +25,11 @@ def _get_gemini_key(config) -> str:
     return random.choice(keys)
 
 
-def _slim_opp(opp: dict) -> dict:
-    """Extract relevant fields for AI analysis.
-
-    Every key is ALWAYS present so the AI never has to guess about missing
-    data.  The key names exactly match what SYSTEM_PROMPT documents.
-    """
-    ind = opp.get("indicators", {}) or {}
-    is_cross = opp.get("mode") == "cross_exchange"
-    hist = opp.get("history", {}) or {}
-
-    # Net APR predicho por el modelo ML — métrica principal. Fallback al APR
-    # bruto estimado cuando el modelo no predijo (model_prediction None). El flag
-    # mdl le dice al LLM si napr es la predicción neta del modelo (1) o un APR
-    # bruto sustituto (0), para que no lo trate como neto-descontado-de-riesgo.
-    model_pred = opp.get("model_prediction")
-    is_model = model_pred is not None
-    napr = model_pred if is_model else opp.get("apr", 0)
-
-    slim = {
-        "id": opp.get("_id", ""),
-        "sym": opp.get("symbol", ""),
-        "mode": "cross" if is_cross else "sp",
-        "napr": round(napr, 1),
-        "mdl": 1 if is_model else 0,
-        "apr": round(opp.get("apr", 0)),
-        "beh": round(opp.get("break_even_hours", 0), 1),
-        "d1k": round(opp.get("daily_income_per_1000", 0), 2),
-        "n3d": round(opp.get("net_3d_revenue_per_1000", 0), 2),
-        "vol": round((opp.get("volume_24h", 0) or 0) / 1e6, 1),
-        "grade": opp.get("stability_grade", "D"),
-        "ehd": opp.get("estimated_hold_days", 0),
-        # Always include consistency and fee drag (0 is a valid value)
-        "con": round(hist.get("pct", hist.get("favorable_pct", 0)) or 0),
-        "fd": round(hist.get("fee_drag", 0) or 0, 2),
-    }
-
-    if is_cross:
-        slim["diff"] = round((opp.get("rate_differential", 0) or 0) * 100, 4)
-    else:
-        slim["fr"] = round((opp.get("funding_rate", 0) or 0) * 100, 4)
-
-    # Indicadores de riesgo (contexto para la narrativa; el modelo ya los ingiere)
-    slim["mom"] = ind.get("momentum_signal", "flat") or "flat"
-    slim["z"] = round(ind.get("z_score", 0) or 0, 1)
-
-    return slim
-
-
-def _build_messages(opps: list) -> tuple:
-    """Build (system_prompt, user_content) for the Gemini API."""
-    slim_data = [_slim_opp(o) for o in opps]
-    user_content = (
-        f"Analiza estas {len(slim_data)} oportunidades de arbitraje de funding rates "
-        f"(ordenadas por Net APR predicho de mayor a menor). Para cada una, evalua si vale la pena "
-        f"entrar, considerando riesgo vs retorno, sostenibilidad de la tasa, y eficiencia de fees. "
-        f"Da una explicacion clara y accionable:\n"
-        + json.dumps(slim_data, separators=(",", ":"), ensure_ascii=False)
-    )
-    return SYSTEM_PROMPT, user_content
-
-
 def _parse_ai_response(text: str, valid_signals: tuple, default_signal: str) -> dict:
     """Parse the LLM JSON response into {id: {signal, confidence, analysis}} map."""
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if m:
-            try:
-                data = json.loads(m.group(1))
-            except json.JSONDecodeError:
-                return {}
-        else:
-            return {}
+    data = _parse_json(text)
+    if not isinstance(data, dict):
+        return {}
 
     analyses = data.get("analyses", [])
     if not isinstance(analyses, list):
@@ -200,71 +56,132 @@ def _parse_ai_response(text: str, valid_signals: tuple, default_signal: str) -> 
     return result
 
 
-def analyze_top_opportunities(opportunities: list, config, top_n: int = MAX_OPPS) -> list:
-    """Analyze top N opportunities with Gemini AI. Returns opportunities with ai_analysis field.
+# Veredicto determinista desde el modelo (el LLM solo explica). Umbrales sobre el
+# Net APR predicho por nocional (`model_prediction`): reports/exit_policy_20261022.md
+# y reports/attribution_20261025.md muestran que el gate útil es pred > 0; pisos de
+# tasa más altos dejan slots vacíos. Las reglas fijas del prompt anterior (z ≥ 2 →
+# EVITAR) chocaban con el modelo: los picos Alpha rentables tienen z alto.
+ENTER_NAPR = 5.0          # ≥ → ENTRAR (debajo es ruido del modelo)
+LEVERAGES = (1, 2, 3)     # tope de leverage del negocio (decisión 2026-10-25)
+LIQ_MMR = 0.01
 
-    Gracefully degrades: if no API key, Gemini fails, or parsing fails,
-    returns opportunities unchanged without ai_analysis field.
+OPP_SYSTEM_PROMPT = (
+    "Eres analista cuantitativo de arbitraje de funding rates (long spot + short perp, delta neutral). "
+    "Recibes UNA oportunidad con su veredicto YA DECIDIDO por el modelo predictivo (campo 'verdict') "
+    "y los numeros calculados. Tu trabajo es EXPLICAR ese veredicto en lenguaje claro y señalar riesgos "
+    "concretos; NO cambies el veredicto ni inventes datos.\n\n"
+    "Campos: sym, venue (cex=spot en Binance; alpha=spot solo on-chain en Binance Alpha/BSC: mas carry "
+    "pero swap mas caro y venta menos liquida), napr (Net APR predicho por el modelo, % anual neto de fees "
+    "sobre el nocional, METRICA PRINCIPAL), fr (funding actual %/pago), ih (horas entre pagos), "
+    "lev (tabla por apalancamiento: roc = rendimiento anual sobre el capital total, usd_d = USD/dia "
+    "esperados para el capital indicado, liq = % de subida que liquida el short), fees_usd, beh (horas "
+    "para recuperar fees), con (% de pagos favorables), streak (pagos favorables seguidos), z (z-score "
+    "de la tasa actual; alto es normal en picos y el modelo ya lo pondero), mom (momentum), lr (ultimas "
+    "tasas %), mins (minutos al proximo pago).\n\n"
+    "Responde SOLO JSON: {\"analysis\":\"50-80 palabras: que paga, por que el modelo da ese veredicto, "
+    "con numeros\",\"risks\":[\"1-3 riesgos concretos y medibles\"],\"watch\":\"que vigilar y cuando salir "
+    "(regla del negocio: cerrar tras dos pagos seguidos <= 0)\",\"leverage\":\"recomendacion entre 1x y 3x "
+    "segun liq y volatilidad, una frase\"}"
+)
+
+
+def _lev_table(opp: dict, capital: float) -> list:
+    """Rendimiento sobre capital por leverage: con margen C/(L+1) el nocional es C·L/(L+1)."""
+    napr = opp.get("model_prediction")
+    out = []
+    for lev in LEVERAGES:
+        frac = lev / (lev + 1)
+        roc = napr * frac if napr is not None else None
+        out.append({"x": lev, "roc": round(roc, 1) if roc is not None else None,
+                    "usd_d": round(capital * frac * napr / 100 / 365, 2) if napr is not None else None,
+                    "liq": round(max(0.0, 1 / lev - LIQ_MMR) * 100, 1)})
+    return out
+
+
+def opportunity_verdict(opp: dict) -> dict:
+    """ENTRAR / ESPERAR / NO ENTRAR desde el Net APR predicho; SIN MODELO si no predijo."""
+    napr = opp.get("model_prediction")
+    if napr is None:
+        return {"signal": "SIN MODELO",
+                "reason": "El modelo no predijo este par (modo cross/DeFi o historial corto): solo heurístico."}
+    if napr <= 0:
+        return {"signal": "NO ENTRAR", "reason": f"El modelo espera retorno neto ≤ 0 ({napr:.1f} % anual)."}
+    if napr < ENTER_NAPR:
+        return {"signal": "ESPERAR", "reason": f"Retorno neto esperado bajo ({napr:.1f} % anual < {ENTER_NAPR:.0f} %)."}
+    return {"signal": "ENTRAR", "reason": f"Retorno neto esperado {napr:.1f} % anual sobre el nocional."}
+
+
+def _opp_facts(opp: dict, capital: float) -> dict:
+    ind = opp.get("indicators", {}) or {}
+    hist = opp.get("history", {}) or {}
+    rates = hist.get("_rates") or []
+    return {
+        "sym": opp.get("symbol", ""),
+        "venue": "alpha" if opp.get("spot_venue") == "bsc" else "cex",
+        "napr": round(opp["model_prediction"], 1) if opp.get("model_prediction") is not None else None,
+        "fr": round((opp.get("funding_rate", 0) or 0) * 100, 4),
+        "ih": opp.get("interval_hours", 8),
+        "lev": _lev_table(opp, capital),
+        "capital": round(capital),
+        "fees_usd": round(opp.get("fees_total", 0) or 0, 2),
+        "beh": round(opp.get("break_even_hours", 0) or 0, 1),
+        "con": round(hist.get("pct", hist.get("favorable_pct", 0)) or 0),
+        "streak": hist.get("streak", 0),
+        "z": round(ind.get("z_score", 0) or 0, 1),
+        "mom": ind.get("momentum_signal", "flat") or "flat",
+        "lr": [round(r * 100, 4) for r in rates[-10:]],
+        "mins": round(opp.get("mins_to_next", -1) or -1),
+    }
+
+
+def analyze_opportunity(opp: dict, config, capital: float = 1000.0) -> dict:
+    """Análisis bajo demanda de UNA oportunidad.
+
+    El veredicto es determinista (`opportunity_verdict`); Gemini solo redacta la
+    explicación. Sin API key o si Gemini falla, devuelve el veredicto y los
+    números sin texto del LLM (nunca lanza).
     """
+    verdict = opportunity_verdict(opp)
+    facts = _opp_facts(opp, capital)
+    out = {"signal": verdict["signal"], "reason": verdict["reason"], "facts": facts,
+           "analysis": verdict["reason"], "risks": [], "watch": "", "leverage": "", "llm": False}
     api_key = _get_gemini_key(config)
     if not api_key:
-        return opportunities
-
-    # Top N por Net APR predicho por el modelo ML (model_prediction). Fallback a
-    # `score` cuando el modelo no predijo. Se excluyen las que el modelo predice
-    # con retorno neto <= 0 (no vale la pena analizarlas).
-    def _napr_key(o):
-        mp = o.get("model_prediction")
-        return mp if mp is not None else o.get("score", 0)
-
-    ranked = sorted(opportunities, key=_napr_key, reverse=True)
-    ranked = [
-        o for o in ranked
-        if not (o.get("model_prediction") is not None and o.get("model_prediction") <= 0)
-    ]
-    top_opps = ranked[:top_n]
-    if not top_opps:
-        return opportunities
-
+        return out
     try:
         from google import genai
         from google.genai import types
 
-        client = genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(timeout=TIMEOUT * 1000),
-        )
-        system_prompt, user_content = _build_messages(top_opps)
-
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=TIMEOUT * 1000))
+        payload = {"verdict": verdict["signal"], "reason": verdict["reason"], **facts}
         resp = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=user_content,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.3,
-                response_mime_type="application/json",
-            ),
+            contents="Explica esta oportunidad:\n" + json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+            config=types.GenerateContentConfig(system_instruction=OPP_SYSTEM_PROMPT, temperature=0.2,
+                                               response_mime_type="application/json"),
         )
-
-        raw = resp.text or ""
-        analysis_map = _parse_ai_response(
-            raw, ("COMPRAR", "MANTENER", "EVITAR"), "MANTENER"
-        )
-
-        if analysis_map:
-            for opp in opportunities:
-                ai = analysis_map.get(opp.get("_id", ""))
-                if ai:
-                    opp["ai_analysis"] = ai
-
-            log.info(f"AI analysis: {len(analysis_map)}/{len(top_opps)} opportunities analyzed")
-        else:
-            log.warning("AI analysis: empty response from Gemini")
-
+        data = _parse_json(resp.text or "")
+        if data:
+            out.update(analysis=str(data.get("analysis") or out["analysis"])[:700],
+                       risks=[str(r)[:200] for r in (data.get("risks") or [])][:3],
+                       watch=str(data.get("watch") or "")[:300],
+                       leverage=str(data.get("leverage") or "")[:200], llm=True)
     except Exception as e:
-        log.warning(f"AI analysis failed: {e}")
+        log.warning(f"Opportunity AI failed for {opp.get('_id')}: {e}")
+    return out
 
-    return opportunities
+
+def _parse_json(text: str):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                return None
+    return None
 
 
 # ── Position Analysis ─────────────────────────────────────────
@@ -272,7 +189,9 @@ def analyze_top_opportunities(opportunities: list, config, top_n: int = MAX_OPPS
 POSITION_SYSTEM_PROMPT = (
     "Eres analista experto en arbitraje de funding rates. Tu rol es dar al usuario "
     "una RUTA DE DECISION CLARA sobre cada posicion: mantener, vigilar o cerrar, "
-    "y si hay una alternativa mejor, explicar el trade-off concreto.\n\n"
+    "y si hay una alternativa mejor, explicar el trade-off concreto.\n"
+    "El campo 'verdict' de cada posicion YA esta decidido por las reglas del negocio: usalo como "
+    "'signal', explicalo con numeros y da el plan de accion; no lo contradigas.\n\n"
     "CONTEXTO DEL RANKING (modelo predictivo ML):\n"
     "- Un modelo ML predice el Net APR (retorno anual neto de fees) de cada candidato; "
     "es la métrica de calidad de las alternativas (sw.alt_napr), ya descuenta consistencia, "
@@ -424,20 +343,45 @@ def _slim_position(pos: dict) -> dict:
     return slim
 
 
-def analyze_positions(positions: list, config) -> dict:
-    """Analyze active positions with Gemini AI. Returns {pos_id: {signal, confidence, analysis}}.
+def position_verdict(slim: dict) -> dict:
+    """Veredicto determinista con la regla de salida del negocio (reports/exit_policy_20261022.md:
+    salir tras dos pagos seguidos ≤ 0 y mantener hasta ~30 d)."""
+    lr = slim.get("lr") or []
+    if len(lr) >= 2 and lr[-1] <= 0 and lr[-2] <= 0:
+        return {"signal": "CERRAR", "reason": "Dos pagos seguidos sin cobrar."}
+    sw = slim.get("sw") or {}
+    if (sw.get("rec") == "SWITCH" and sw.get("val", 0) > 0 and sw.get("beh", 999) < 24
+            and sw.get("alt_napr", 0) > slim.get("apr", 0)):
+        return {"signal": "CERRAR", "reason": f"Rotar a {sw.get('alt')}: mejora neta tras el costo del cambio."}
+    if lr and lr[-1] <= 0:
+        return {"signal": "VIGILAR", "reason": "Último pago ≤ 0: cerrar si el próximo también lo es."}
+    if slim.get("h", 0) > 30 * 24:
+        return {"signal": "VIGILAR", "reason": "Más de 30 días abierta: revisar si sigue rindiendo sobre su promedio."}
+    return {"signal": "MANTENER", "reason": "Sigue cobrando funding."}
 
-    Gracefully degrades: returns empty dict on any failure.
+
+def analyze_positions(positions: list, config) -> dict:
+    """Análisis de posiciones. Returns {pos_id: {signal, confidence, analysis, action_plan?}}.
+
+    El veredicto es determinista (`position_verdict`); Gemini solo lo explica.
+    Sin API key o si Gemini falla, devuelve los veredictos con su razón.
     """
-    api_key = _get_gemini_key(config)
-    if not api_key or not positions:
+    if not positions:
         return {}
+    slim_data = [_slim_position(p) for p in positions]
+    verdicts = {s["id"]: position_verdict(s) for s in slim_data}
+    for s in slim_data:
+        s["verdict"] = verdicts[s["id"]]["signal"]
+    base = {pid: {"signal": v["signal"], "confidence": 10, "analysis": v["reason"]}
+            for pid, v in verdicts.items()}
+    api_key = _get_gemini_key(config)
+    if not api_key:
+        return base
 
     try:
         from google import genai
         from google.genai import types
 
-        slim_data = [_slim_position(p) for p in positions]
         user_content = (
             f"Evalua estas {len(slim_data)} posiciones abiertas de arbitraje de funding rates. "
             f"Para cada una analiza: rendimiento vs expectativa, tendencia del FR, "
@@ -464,11 +408,14 @@ def analyze_positions(positions: list, config) -> dict:
         result = _parse_ai_response(
             raw, ("MANTENER", "CERRAR", "VIGILAR"), "VIGILAR"
         )
+        for pid, entry in result.items():        # el LLM explica, no decide
+            if pid in verdicts:
+                entry["signal"] = verdicts[pid]["signal"]
         log.info(f"Position AI: {len(result)}/{len(positions)} analyzed")
-        return result
+        return {**base, **result}
 
     except Exception as e:
         log.warning(f"Position AI failed: {e}")
-        return {}
+        return base
 
 

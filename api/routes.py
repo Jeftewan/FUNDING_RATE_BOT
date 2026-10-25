@@ -489,6 +489,36 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 "alerts": s.get("alerts", []),
             })
 
+    # ── Opportunity AI Analysis (bajo demanda) ──────────────────
+    _opp_ai_cache = {}   # (opp_id, next_funding_ts, capital) → (ts, result)
+
+    @app.route("/api/opportunities/<opp_id>/ai", methods=["POST"])
+    @auth_required
+    def api_opportunity_ai(opp_id):
+        """Veredicto determinista del modelo + explicación de Gemini para UNA
+        oportunidad. Body opcional {capital}. Caché 30 min por settlement."""
+        from analysis.ai_analyzer import analyze_opportunity
+
+        data = flask_req.get_json(silent=True) or {}
+        try:
+            capital = max(10.0, float(data.get("capital") or 1000))
+        except (TypeError, ValueError):
+            capital = 1000.0
+        with state_manager.lock:
+            opp = next((dict(o) for o in state_manager.state.get("opportunities", [])
+                        if o.get("_id") == opp_id), None)
+        if not opp:
+            return jsonify({"ok": False, "msg": "Oportunidad no encontrada (re-escanea)"}), 404
+        key = (opp_id, opp.get("next_funding_ts", 0), round(capital))
+        hit = _opp_ai_cache.get(key)
+        if hit and time.time() - hit[0] < 1800:
+            return jsonify({"ok": True, "analysis": hit[1], "cached": True})
+        result = analyze_opportunity(opp, config, capital=capital)
+        if len(_opp_ai_cache) > 200:
+            _opp_ai_cache.clear()
+        _opp_ai_cache[key] = (time.time(), result)
+        return jsonify({"ok": True, "analysis": result, "cached": False})
+
     # ── Position AI Analysis ────────────────────────────────────
     @app.route("/api/positions/ai", methods=["POST"])
     @auth_required
@@ -510,6 +540,9 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             else:
                 positions_list = []
 
+            only = str((flask_req.get_json(silent=True) or {}).get("position_id") or "")
+            if only:
+                positions_list = [p for p in positions_list if str(p.get("id", "")) == only]
             if not positions_list:
                 return jsonify({"ok": True, "analyses": {}, "switch_results": {}})
 
