@@ -2,7 +2,8 @@
 """Backfill de market_feature_snapshots desde la API pública de Binance — LOCAL.
 
 Baja los ~30 d que Binance expone por API (/futures/data solo guarda el último
-mes) para los perps USDT con spot USDT en Binance, con la misma resolución
+mes) para los perps USDT con spot USDT en Binance **y los tokens solo-Alpha
+(BSC)**, con la misma resolución
 horaria y las mismas funciones que el colector de prod
 (exchanges/market_features.py: basis_pct, pct_change, vol_7d).
 
@@ -14,6 +15,9 @@ cada <30 d acumula historia más allá de la ventana de la API.
 Diferencias con prod (documentadas para el entrenamiento):
   * spot_mid / perp_mid = cierre de la vela 1h que termina en ts_hour (prod: mid
     del book a ~:04) → basis_pct aproximado.
+  * tokens solo-Alpha: spot_mid y basis_pct = alpha_basis() sobre las 5 velas 1m
+    on-chain y del perp que terminan en ts_hour — IDÉNTICO a prod.
+    alpha_liquidity_usd vacío (la lista Alpha solo da la liquidez actual).
   * mark_price / index_price = cierre de las velas 1h de mark/index.
   * taker_buy_sell_ratio = periodo [ts_hour−1h, ts_hour) (igual que prod, que lee
     la última hora cerrada); OI y top long/short = punto en ts_hour.
@@ -36,8 +40,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from exchanges.market_features import (  # noqa: E402
-    DATA_MIN_INTERVAL, EXCHANGE, FEATURE_COLUMNS, basis_pct, pct_change, vol_7d, _f,
+    ALPHA_KLINES_URL, BASIS_BARS, DATA_MIN_INTERVAL, EXCHANGE, FEATURE_COLUMNS, alpha_basis,
+    basis_pct, pct_change, vol_7d, _f,
 )
+from exchanges.onchain_bsc import ALPHA_LIST_URL  # noqa: E402
 from exchanges.net import requests_proxies  # noqa: E402
 
 OUT_CSV = ROOT / "cache" / "binance" / "market_features.csv"
@@ -80,6 +86,39 @@ def universe() -> list:
                   and s.get("status") == "TRADING" and s["symbol"] in spot_ids)
 
 
+def alpha_universe(exclude: set) -> dict:
+    """{base: alphaId} de tokens Alpha BSC con perp USDT en TRADING y sin spot CEX."""
+    fut = _get(f"{FAPI}/fapi/v1/exchangeInfo")["symbols"]
+    perps = {s["baseAsset"] for s in fut if s.get("contractType") == "PERPETUAL"
+             and s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"}
+    out = {}
+    for t in (_get(ALPHA_LIST_URL).get("data") or []):
+        sym = (t.get("symbol") or "").upper()
+        if str(t.get("chainId")) == "56" and t.get("alphaId") and sym in perps and sym not in exclude:
+            out.setdefault(sym, t["alphaId"])
+    return out
+
+
+def _bars_1m(url, params, start_ms, end_ms, unwrap=False):
+    """{open_time: vela} 1m paginadas por 1500 (fapi y API Alpha)."""
+    out, t = {}, start_ms
+    while t < end_ms:
+        rows = _get(url, {**params, "interval": "1m", "limit": 1500, "startTime": t, "endTime": end_ms - 1})
+        rows = (rows.get("data") or []) if unwrap else rows
+        if not rows:
+            break
+        for k in rows:
+            out[int(k[0])] = k
+        t = int(rows[-1][0]) + 60_000
+        if len(rows) < 1500:
+            break
+    return out
+
+
+def _window(bars: dict, end_ms: int) -> list:
+    return [bars[k] for k in range(end_ms - BASIS_BARS * 60_000, end_ms, 60_000) if k in bars]
+
+
 def _data_series(path, pid, start_ms, end_ms):
     """/futures/data/* a 1h → {timestamp: entrada}.
 
@@ -117,13 +156,18 @@ def _closes(url, pid, start_ms, end_ms, interval="1h", key="symbol"):
     return out
 
 
-def symbol_rows(sym: str, start_ms: int, end_ms: int) -> list:
+def symbol_rows(sym: str, start_ms: int, end_ms: int, alpha_id: str = None) -> list:
     pid = f"{sym}USDT"
     oi = _data_series("/futures/data/openInterestHist", pid, start_ms - H_MS, end_ms)
     taker = _data_series("/futures/data/takerlongshortRatio", pid, start_ms - H_MS, end_ms)
     top = _data_series("/futures/data/topLongShortPositionRatio", pid, start_ms, end_ms)
     perp = _closes(f"{FAPI}/fapi/v1/klines", pid, start_ms - H_MS, end_ms)
-    spot = _closes(f"{SAPI}/api/v3/klines", pid, start_ms - H_MS, end_ms)
+    spot = {} if alpha_id else _closes(f"{SAPI}/api/v3/klines", pid, start_ms - H_MS, end_ms)
+    a1m = p1m = {}
+    if alpha_id:
+        w0 = start_ms - BASIS_BARS * 60_000
+        a1m = _bars_1m(ALPHA_KLINES_URL, {"symbol": f"{alpha_id}USDT"}, w0, end_ms, unwrap=True)
+        p1m = _bars_1m(f"{FAPI}/fapi/v1/klines", {"symbol": pid}, w0, end_ms)
     mark = _closes(f"{FAPI}/fapi/v1/markPriceKlines", pid, start_ms - H_MS, end_ms)
     index = _closes(f"{FAPI}/fapi/v1/indexPriceKlines", pid, start_ms - H_MS, end_ms, key="pair")
     daily = _closes(f"{FAPI}/fapi/v1/klines", pid, start_ms - 10 * DAY_MS, end_ms, "1d")
@@ -137,9 +181,14 @@ def symbol_rows(sym: str, start_ms: int, end_ms: int) -> list:
         row.update({c: None for c in FEATURE_COLUMNS})
         row["mark_price"] = _f(mark.get(prev))
         row["index_price"] = _f(index.get(prev))
-        row["spot_mid"] = _f(spot.get(prev))
         row["perp_mid"] = _f(perp.get(prev))
-        row["basis_pct"] = basis_pct(row["spot_mid"], row["perp_mid"])
+        if alpha_id:
+            row["spot_source"] = "alpha"
+            row["spot_mid"], row["basis_pct"] = alpha_basis(_window(a1m, ts), _window(p1m, ts), ts)
+        else:
+            row["spot_source"] = "cex"
+            row["spot_mid"] = _f(spot.get(prev))
+            row["basis_pct"] = basis_pct(row["spot_mid"], row["perp_mid"])
         row["open_interest"] = _f(o.get("sumOpenInterest"))
         row["open_interest_usd"] = _f(o.get("sumOpenInterestValue"))
         row["oi_change_1h_pct"] = pct_change(o.get("sumOpenInterest"), o_prev.get("sumOpenInterest"))
@@ -147,7 +196,7 @@ def symbol_rows(sym: str, start_ms: int, end_ms: int) -> list:
         row["top_long_short_pos_ratio"] = _f((top.get(ts) or {}).get("longShortRatio"))
         day_start = ts // DAY_MS * DAY_MS
         row["volatility_7d"] = vol_7d([daily[d] for d in days if d < day_start])
-        if any(row[c] is not None for c in FEATURE_COLUMNS):
+        if any(row[c] is not None for c in FEATURE_COLUMNS if c != "spot_source"):
             rows.append(row)
     return rows
 
@@ -162,20 +211,23 @@ def load_existing() -> dict:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--days", type=int, default=30, help="ventana hacia atrás (máx. ~30 por API)")
-    ap.add_argument("--symbols", default="", help="CSV de bases (default: todos los perps con spot)")
+    ap.add_argument("--symbols", default="", help="CSV de bases (default: perps con spot CEX + solo-Alpha)")
     args = ap.parse_args()
 
     end_ms = int(time.time() * 1000) // H_MS * H_MS          # hora en curso excluida
     start_ms = end_ms - args.days * DAY_MS + H_MS
-    syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] or universe()
-    print(f"{len(syms)} símbolos, {args.days} d -> {OUT_CSV}", flush=True)
+    cex = universe()
+    alpha = alpha_universe(set(cex))
+    syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()] or cex + sorted(alpha)
+    print(f"{len(syms)} símbolos ({sum(s in alpha for s in syms)} Alpha), {args.days} d -> {OUT_CSV}",
+          flush=True)
 
     merged = load_existing()
     n_before, n_new, fails = len(merged), 0, []
     t0 = time.time()
     for i, sym in enumerate(syms, 1):
         try:
-            rows = symbol_rows(sym, start_ms, end_ms)
+            rows = symbol_rows(sym, start_ms, end_ms, alpha.get(sym))
         except Exception as e:
             fails.append(sym)
             print(f"  {sym}: ERROR {e}", flush=True)

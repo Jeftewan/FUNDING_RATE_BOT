@@ -143,6 +143,8 @@ def _run_migrations(db):
         "  CONSTRAINT uq_mfs_symbol_exchange_hour UNIQUE (symbol, exchange, ts_hour)"
         ")",
         "CREATE INDEX IF NOT EXISTS idx_mfs_ts_hour ON market_feature_snapshots (ts_hour)",
+        "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS spot_source VARCHAR(8)",
+        "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS alpha_liquidity_usd FLOAT",
     ]
     for sql in migrations:
         try:

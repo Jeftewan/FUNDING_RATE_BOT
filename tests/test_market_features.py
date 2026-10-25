@@ -60,7 +60,7 @@ class FakeBinance:
 
 def _collector(ex):
     mgr = types.SimpleNamespace(get_exchange=lambda name: ex if name == "binance" else None)
-    return mf.MarketFeatureCollector(mgr, sleep=lambda s: None)
+    return mf.MarketFeatureCollector(mgr, sleep=lambda s: None, alpha_loader=lambda: {})
 
 
 @pytest.fixture
@@ -178,3 +178,65 @@ def test_worker_una_vez_por_hora(app, monkeypatch):
     w._maybe_store_market_features(opps)
     w._maybe_store_market_features(opps)
     assert len(started) == 1 and started[0][0] == ["AAA"]
+
+
+def _bar(open_ms, close, base, quote):
+    return [open_ms, close, close, close, close, base, open_ms + 59_999, quote]
+
+
+def test_vwap_window_and_fallback():
+    end = HOUR * 1000
+    bars = [_bar(end - 6 * 60_000, 9.0, 1, 9),            # fuera de la ventana
+            *[_bar(end - k * 60_000, 2.0, 10, 21) for k in range(5, 0, -1)],
+            _bar(end, 9.0, 1, 9)]                          # vela en curso, fuera
+    win = mf.bars_before(bars, end)
+    assert len(win) == 5
+    assert mf.vwap(win) == pytest.approx(2.1)
+    # sin volumen → media de cierres (minutos sin trades on-chain)
+    assert mf.vwap([_bar(end - 60_000, 3.0, 0, 0), _bar(end - 120_000, 5.0, 0, 0)]) == 4.0
+    assert mf.vwap([]) is None
+
+
+class FakeAlphaBinance(FakeBinance):
+    """CCC solo tiene spot on-chain (sin book CEX)."""
+
+    def fapiPublicGetKlines(self, p):
+        if p.get("interval") == "1m":
+            end = p["endTime"] + 1
+            return self._call("klines1m", [_bar(end - k * 60_000, 1.02, 100, 102) for k in range(5, 0, -1)], p)
+        return super().fapiPublicGetKlines(p)
+
+
+def test_alpha_leg_basis_from_onchain_vwap():
+    ex = FakeAlphaBinance()
+    seen = {}
+
+    def alpha_klines(alpha_id, q):
+        seen.update(q, alpha_id=alpha_id)
+        end = q["endTime"] + 1
+        return [_bar(end - k * 60_000, 1.0, 50, 50) for k in range(5, 0, -1)]
+
+    col = mf.MarketFeatureCollector(
+        types.SimpleNamespace(get_exchange=lambda n: ex), sleep=lambda s: None,
+        alpha_loader=lambda: {"CCC": {"alpha_id": "ALPHA_9", "liquidity": 450000.0}},
+        alpha_klines=alpha_klines)
+    rows = {r["symbol"]: r for r in col.collect(["AAA", "CCC"], now=NOW)}
+    assert rows["AAA"]["spot_source"] == "cex" and rows["AAA"]["alpha_liquidity_usd"] is None
+    c = rows["CCC"]
+    assert c["spot_source"] == "alpha" and c["alpha_liquidity_usd"] == 450000.0
+    assert c["spot_mid"] == pytest.approx(1.0)
+    assert c["basis_pct"] == pytest.approx(2.0)                  # perp VWAP 1.02 vs spot 1.00
+    assert seen["alpha_id"] == "ALPHA_9" and seen["endTime"] == HOUR * 1000 - 1
+
+
+def test_alpha_leg_failure_keeps_row():
+    ex = FakeAlphaBinance()
+
+    def boom(alpha_id, q):
+        raise RuntimeError("alpha 503")
+
+    col = mf.MarketFeatureCollector(
+        types.SimpleNamespace(get_exchange=lambda n: ex), sleep=lambda s: None,
+        alpha_loader=lambda: {"CCC": {"alpha_id": "ALPHA_9", "liquidity": 1.0}}, alpha_klines=boom)
+    c = {r["symbol"]: r for r in col.collect(["CCC"], now=NOW)}["CCC"]
+    assert c["spot_source"] == "alpha" and c["basis_pct"] is None and c["open_interest"] == 110.0

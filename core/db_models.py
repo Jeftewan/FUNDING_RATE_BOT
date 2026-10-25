@@ -305,6 +305,8 @@ class MarketFeatureSnapshot(db.Model):
     funding_cap = db.Column(db.Float)
     funding_floor = db.Column(db.Float)
     volatility_7d = db.Column(db.Float)          # std de 7 log-retornos diarios del perp
+    spot_source = db.Column(db.String(8))        # "cex" (book Binance) | "alpha" (VWAP 5 velas 1m on-chain)
+    alpha_liquidity_usd = db.Column(db.Float)    # liquidez del pool según la lista Alpha (solo online)
     captured_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
                             nullable=False)
 
