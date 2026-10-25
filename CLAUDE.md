@@ -162,6 +162,7 @@ frontend/               # Servicio Railway "web" (rootDirectory=/frontend)
 | `scan_cache` | Último resultado del scan (opportunities_json, defi_json) |
 | `funding_rate_snapshots` | 90 días de tasas históricas, dedup por (symbol, exchange, funding_ts) |
 | `score_snapshots` | Evolución del score por oportunidad (ventana rolling 30 entradas) |
+| `market_feature_snapshots` | Señales horarias por par Binance spot_perp (clave única symbol, exchange, `ts_hour` = inicio de la hora UTC en epoch s): tasa estimada del próximo pago, mark/index, basis spot–perp (mids del book), OI y Δ1h, taker buy/sell, top long/short (posición), intervalo y cap/floor, volatilidad 7 d. Retención 120 d. Ver "Señales de mercado horarias" |
 
 Las migraciones se aplican automáticamente al arrancar vía `_run_migrations()`. Para agregar columnas a tablas existentes, añadir `ALTER TABLE ADD COLUMN IF NOT EXISTS` al array `migrations` en `core/database.py`.
 
@@ -180,6 +181,30 @@ El scanner **no usa un intervalo configurable**. Funciona por eventos de pago de
 4. Para **cross_exchange**, cada pierna (long y short) se evalúa independientemente para PRE y POST según su propio `next_funding_ts` e intervalo.
 
    - **Scan horario** (`PERIODIC_SCAN_SECS`, a :04 UTC tras los settlements): corre aunque no haya posiciones (desde 2026-10-22). Antes, sin posiciones el bot quedaba mudo y no escribía snapshots.
+
+### Señales de mercado horarias (Fase 2, `exchanges/market_features.py`)
+
+Binance guarda solo ~30 d de OI y ratios por API → se recolectan ya para entrenar el modelo de la Fase 3.
+- **Cuándo**: al final de `_run_scan_inner`, la **primera vez que escanea en cada hora UTC** (el scan horario
+  garantiza ≥1 scan por hora; si el primero es un scan por evento, ese cuenta). Hilo en background; si no
+  guarda nada o falla, se reintenta en el siguiente scan. Solo candidatos Binance de `spot_perp_opps`.
+- **Costo**: 4 llamadas de todos-los-símbolos (`/fapi/v1/premiumIndex`, `/fapi/v1/fundingInfo`, bookTicker spot
+  y perp) + 3 por símbolo en `/futures/data` (`openInterestHist`, `takerlongshortRatio`,
+  `topLongShortPositionRatio`; 1000 req/5 min por IP → paceadas a `DATA_MIN_INTERVAL` = 0.32 s, ~4 min con
+  250 pares) + klines 1d del perp una vez por símbolo y día (vol 7 d). Mismo cliente ccxt/proxy que
+  `exchanges/manager.py`. 5 errores seguidos en `/futures/data` → se omite OI/ratios del resto.
+- **Tolerancia**: una fuente caída deja NULL en sus columnas; el upsert (`upsert_rows`, Postgres/SQLite) usa
+  `COALESCE` → un NULL no pisa un valor ya guardado en la misma hora. Purga diaria > 120 d (`purge_old`).
+- **Definiciones** (compartidas con el backfill): `basis_pct = (perp_mid − spot_mid)/spot_mid × 100`;
+  `oi_change_1h_pct` del par de puntos 1h; `taker_buy_sell_ratio` = última hora cerrada; `volatility_7d` =
+  desvío de 7 log-retornos de los últimos 8 cierres diarios completos; `funding_interval_hours` = 8 si el
+  símbolo no aparece en `fundingInfo`.
+- **Backfill offline**: `python scripts/market_features_backfill.py [--days 30] [--symbols BTC,ETH]` → 
+  `cache/binance/market_features.csv` (fusiona con el CSV previo: correrlo cada <30 d acumula historia).
+  Basis desde cierres de velas 1h (no mids); sin tasa estimada/intervalo/cap (no hay historia por API).
+- **Historia larga**: data.binance.vision publica `futures/um/daily/metrics/<SYM>` (OI, top trader
+  long/short, taker vol ratio cada 5 min) **desde 2020** → para la Fase 3 no hace falta esperar a acumular.
+- Tests: `tests/test_market_features.py`.
 
 El historial de funding por candidato se cachea hasta el próximo settlement del par (máx. 1 h, `exchanges/manager.py:fetch_funding_history`) → el scan horario casi no gasta llamadas. Los intervalos de funding de Binance se refrescan cada 15 min (`FUNDING_INTERVALS_TTL`).
 
