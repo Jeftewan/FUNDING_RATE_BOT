@@ -81,19 +81,22 @@ def universe() -> list:
 
 
 def _data_series(path, pid, start_ms, end_ms):
-    """/futures/data/* a 1h, paginado por 500 → {timestamp: entrada}."""
-    out, t = {}, start_ms
-    while t < end_ms:
+    """/futures/data/* a 1h → {timestamp: entrada}.
+
+    Pagina HACIA ATRÁS con solo endTime: con startTime+endTime Binance devuelve
+    las ÚLTIMAS 500 filas, y un startTime ≥ 30 d atrás da 400 (-1130)."""
+    out, e = {}, end_ms
+    while e >= start_ms:
         rows = _get(f"{FAPI}{path}", {"symbol": pid, "period": "1h", "limit": 500,
-                                       "startTime": t, "endTime": end_ms}, pace=DATA_MIN_INTERVAL)
+                                       "endTime": e}, pace=DATA_MIN_INTERVAL)
         if not rows:
             break
         for r in rows:
             out[int(r["timestamp"])] = r
-        last = max(int(r["timestamp"]) for r in rows)
-        if last + H_MS <= t:
+        first = min(int(r["timestamp"]) for r in rows)
+        if first - H_MS >= e:
             break
-        t = last + H_MS
+        e = first - H_MS
     return out
 
 
