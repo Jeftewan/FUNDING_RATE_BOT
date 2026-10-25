@@ -38,6 +38,13 @@ Estado del proyecto al **2026-10-25** (auditoría de rentabilidad, rama `feat/pr
 - **Leverage** (`scripts/leverage_study.py`, seguros simulados con velas 1m): Alpha 1x 33 %, **2x
   36–44 %**, 3x 24–28 % (SL en 57 % de entradas); CEX mejor a 3x pero 3–5 %. → `RECOMMENDED_LEV`.
 - **Rotación**: ver `rotation_gain_ok` en switch_analyzer (margen 2 % → +18 % vs no rotar).
+- **Cross perp** (`scripts/cross_dataset.py` + `scripts/cross_backtest.py`, `reports/cross_vs_spotperp_20261025.md`,
+  Binance/Bybit/OKX/Bitget): **no reactivar**. Ninguna config cumple DD ≤ 5 % fuera de muestra; el PnL
+  depende de 3 símbolos con funding extremo (sin ellos WF −0.7 % a 1x). Mismo motor: spot_perp CEX ∪ Alpha
+  30.7 % anual OOS, `p_prod>0` a 2x. Su riesgo por pierna usa velas 1d (in-sample L3 ≥ L2); con velas 1m
+  (`leverage_study.py`) 3x pierde en Alpha → se mantiene `RECOMMENDED_LEV` Alpha 2x.
+- **Señales nuevas** (`market_feature_snapshots`, ver sección de tablas): recolección horaria desde este PR.
+  El basis se calcula con spot CEX → vacío para tokens Alpha (pendiente: mid on-chain).
 - **Mercado 2026**: funding BTC 11.9 % (2024) → 5.1 % (2025) → 3.0 % (2026 YTD); BTC/ETH a 10x no
   sirve (≈3–5 % anual sobre capital). 5–10 %/mes sostenido no es realista; 3–4 %/mes en meses buenos.
 - **JCT `user_history.id=46`**: registraba `price_pnl=+438` (faltaba la recompra manual del short); real
