@@ -126,6 +126,25 @@ def _run_migrations(db):
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS earnings_source VARCHAR(20) DEFAULT 'estimated'",
         "UPDATE user_positions SET source = 'auto' WHERE auto_executed = TRUE AND (source IS NULL OR source = 'manual')",
         "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS auto_transfer BOOLEAN DEFAULT FALSE",
+        # Señales de mercado horarias (Fase 2): create_all ya crea la tabla; esto la
+        # deja idempotente si se aplica a mano o el modelo no se importó.
+        "CREATE TABLE IF NOT EXISTS market_feature_snapshots ("
+        "  id SERIAL PRIMARY KEY,"
+        "  symbol VARCHAR(20) NOT NULL,"
+        "  exchange VARCHAR(50) NOT NULL,"
+        "  ts_hour BIGINT NOT NULL,"
+        "  funding_rate_est FLOAT, mark_price FLOAT, index_price FLOAT,"
+        "  next_funding_ts BIGINT, spot_mid FLOAT, perp_mid FLOAT, basis_pct FLOAT,"
+        "  open_interest FLOAT, open_interest_usd FLOAT, oi_change_1h_pct FLOAT,"
+        "  taker_buy_sell_ratio FLOAT, top_long_short_pos_ratio FLOAT,"
+        "  funding_interval_hours INTEGER, funding_cap FLOAT, funding_floor FLOAT,"
+        "  volatility_7d FLOAT,"
+        "  captured_at TIMESTAMP NOT NULL DEFAULT NOW(),"
+        "  CONSTRAINT uq_mfs_symbol_exchange_hour UNIQUE (symbol, exchange, ts_hour)"
+        ")",
+        "CREATE INDEX IF NOT EXISTS idx_mfs_ts_hour ON market_feature_snapshots (ts_hour)",
+        "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS spot_source VARCHAR(8)",
+        "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS alpha_liquidity_usd FLOAT",
     ]
     for sql in migrations:
         try:

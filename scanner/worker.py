@@ -13,7 +13,6 @@ import time
 import logging
 import threading
 from datetime import datetime
-from analysis.ai_analyzer import analyze_top_opportunities
 from analysis.indicators import detect_exceptional
 from analysis import ml_scorer
 
@@ -37,7 +36,6 @@ SETTLEMENT_RETRY_SECS = 15 * 60
 # de excepcionales siempre frescos (antes sin posiciones el bot quedaba mudo).
 PERIODIC_SCAN_SECS = 3600
 PERIODIC_SCAN_OFFSET_SECS = 4 * 60      # :04 de cada hora → tras los settlements de :00
-AI_REUSE_SECS = 6 * 3600                # reusar el análisis Gemini si el top-5 no cambió
 # Liquidación: fracción de la distancia a liquidación del short que, al
 # consumirse, dispara la alarma LIQUIDATION_PROXIMITY. Con margen aislado la
 # liquidación del short está ~1/leverage por encima de la entrada; 0.70 avisa
@@ -76,7 +74,9 @@ class ScannerWorker:
         self._last_switch_analysis = 0  # Timestamp of last switch analysis
         self._switch_results = {}  # {position_id: switch_analysis_result}
         self._prev_exceptional_keys = set()  # Exceptional keys from previous scan
-        self._ai_key, self._ai_ts, self._ai_by_id = (), 0.0, {}  # caché del análisis Gemini
+        self._mf_collector = None   # MarketFeatureCollector (lazy)
+        self._mf_hour = None        # hora UTC ya recolectada / en curso
+        self._mf_purge_day = None
 
     def start(self):
         if self._started:
@@ -750,26 +750,7 @@ class ScannerWorker:
         # Sort by score DESC
         opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
 
-        # 6b. AI analysis of top opportunities — solo si cambió el top-5 (por
-        # Net APR predicho) o pasaron AI_REUSE_SECS; si no, se reutiliza el
-        # análisis previo (cada llamada consume cuota del free tier de Gemini).
-        def _napr(o):
-            mp = o.get("model_prediction")
-            return mp if mp is not None else o.get("score", 0)
-        top_key = tuple(o.get("_id") for o in sorted(opportunities, key=_napr, reverse=True)[:5])
-        if top_key and top_key == self._ai_key and time.time() - self._ai_ts < AI_REUSE_SECS:
-            for o in opportunities:
-                if o.get("_id") in self._ai_by_id:
-                    o["ai_analysis"] = self._ai_by_id[o["_id"]]
-        else:
-            try:
-                opportunities = analyze_top_opportunities(opportunities, self.config)
-                self._ai_by_id = {o["_id"]: o["ai_analysis"] for o in opportunities
-                                  if o.get("ai_analysis")}
-                if self._ai_by_id:
-                    self._ai_key, self._ai_ts = top_key, time.time()
-            except Exception as e:
-                log.warning(f"AI analysis skipped: {e}")
+        # 6b. El análisis IA es bajo demanda (POST /api/opportunities/<id>/ai).
 
         # 6c. Detect exceptional opportunities (global Net APR percentile)
         # One global query for the p95 threshold over the predicted net APR
@@ -890,6 +871,10 @@ class ScannerWorker:
                 args=(all_opps, scan_count),
                 daemon=True,
             ).start()
+
+        # 10. Señales de mercado horarias (OI, ratios, basis…) de los candidatos
+        # Binance spot_perp: una vez por hora UTC, la primera vez que escanea.
+        self._maybe_store_market_features(spot_perp_opps)
 
     def _position_outlook(self, all_rates: dict, spot_perp_opps: list) -> dict:
         """{"SYM_Exchange": {pred, score, ts}} para las posiciones spot_perp activas."""
@@ -1028,6 +1013,44 @@ class ScannerWorker:
 
         except Exception as e:
             log.exception(f"Rate snapshot storage failed (non-critical): {e}")
+
+    # ── Market Feature Snapshots (señales horarias para el modelo) ──
+
+    def _maybe_store_market_features(self, spot_perp_opps: list):
+        symbols = sorted({o.symbol for o in spot_perp_opps if o.exchange == "Binance"})
+        hour = int(time.time() // PERIODIC_SCAN_SECS)
+        if not symbols or not self._flask_app or self._mf_hour == hour:
+            return
+        self._mf_hour = hour  # marca antes de lanzar: evita dos hilos en la misma hora
+        threading.Thread(target=self._store_market_features, args=(symbols, hour),
+                         daemon=True).start()
+
+    def _store_market_features(self, symbols: list, hour: int = None):
+        """Recolecta y upsertea market_feature_snapshots. Nunca lanza."""
+        try:
+            from exchanges import market_features as mf
+            if self._mf_collector is None:
+                self._mf_collector = mf.MarketFeatureCollector(self.exchange_manager)
+            t0 = time.time()
+            rows = self._mf_collector.collect(symbols)
+            with self._flask_app.app_context():
+                from core.database import db
+                n = mf.upsert_rows(db, rows)
+                day = int(time.time() // 86400)
+                if self._mf_purge_day != day:
+                    self._mf_purge_day = day
+                    deleted = mf.purge_old(db)
+                    if deleted:
+                        log.info(f"Cleaned {deleted} old market feature snapshots")
+            with_oi = sum(1 for r in rows if r.get("open_interest") is not None)
+            log.info(f"Market features: {n}/{len(symbols)} pares ({with_oi} con OI) "
+                     f"en {time.time() - t0:.0f}s")
+            if not rows and hour is not None and self._mf_hour == hour:
+                self._mf_hour = None  # nada guardado → reintenta en el próximo scan
+        except Exception as e:
+            log.warning(f"Market feature storage failed (non-critical): {e}")
+            if hour is not None and self._mf_hour == hour:
+                self._mf_hour = None
 
     # ── Score Snapshot Storage (rolling window) ────────────────
 

@@ -366,6 +366,10 @@ class JobRunner:
                                       uid, {**p, "spot_venue": pos.get("spot_venue"),
                                             "token": p.get("token") or {}}))
         sym = pos.get("symbol", "")
+        if res.get("price_pnl_unknown"):
+            self._alert(uid, sym, f"{sym}: el short se cerró fuera de basyo y su recompra no se pudo "
+                                  f"leer ({res['price_pnl_unknown']}). El PnL de precio queda sin "
+                                  f"calcular; revísalo y corrígelo a mano.", severity="WARNING")
         if not res.get("ok"):
             self._update(jid, status="failed", result_json=_jsonable(res), error=res.get("msg"))
             self._alert(uid, sym, f"Fallo al cerrar {sym} (auto): {res.get('msg', '')}")
@@ -417,8 +421,10 @@ class JobRunner:
                 row.spot_qty = max(0.0, (row.spot_qty or 0) - float(res.get("spot_sold") or 0)
                                    - float(pf.get("spot_filled") or 0))
             if row.perp_qty is not None:
+                # El short cerrado fuera de basyo ya no existe aunque su recompra no se encuentre.
                 row.perp_qty = max(0.0, (row.perp_qty or 0) - float(res.get("perp_closed") or 0)
-                                   - float(pf.get("perp_filled") or 0))
+                                   - float(pf.get("perp_filled") or 0)
+                                   - float((res.get("perp_external") or {}).get("missing") or 0))
             if res.get("protection_filled") is not None and row.protection_json:
                 # El cierre ya canceló (o vio llenados) los seguros: que un reintento no
                 # intente cancelarlos otra vez. _restore_protection los repone si aplica.
@@ -437,6 +443,7 @@ class JobRunner:
             pj.append({"ts": time.time(), "kind": "auto_close_partial",
                        "order_ids": res.get("order_ids", []), "legs": res.get("legs", []),
                        "price_pnl": res.get("price_pnl"), "exec": res.get("exec"),
+                       "price_pnl_unknown": res.get("price_pnl_unknown"),
                        "note": res.get("partial_note") or res.get("msg", "")})
             row.payments_json = pj
             db.session.commit()
@@ -575,10 +582,16 @@ def real_net_breakdown(row, res) -> dict:
     detalle de ejecución para user_history. Neto real = funding + price_pnl − fees.
 
     price_pnl None (falta precio de entrada) → el neto queda funding − fees como antes.
+    Si alguna ejecución no pudo leer la recompra de un short cerrado fuera de basyo
+    (`price_pnl_unknown`), el total es None: sumar solo la otra pierna lo inflaría.
     """
     partial = getattr(row, "realized_price_pnl", None)
     this = res.get("price_pnl")
     price_pnl = None if this is None and partial is None else round((partial or 0) + (this or 0), 6)
+    if res.get("price_pnl_unknown") or any(
+            isinstance(p, dict) and p.get("price_pnl_unknown")
+            for p in (getattr(row, "payments_json", None) or [])):
+        price_pnl = None
     exit_slip = (res.get("exit_slippage") or {}).get("total")
     entry_slip = getattr(row, "entry_slippage_usd", None)
     slip = None if exit_slip is None and entry_slip is None else round((entry_slip or 0) + (exit_slip or 0), 6)
@@ -589,9 +602,11 @@ def real_net_breakdown(row, res) -> dict:
 
 
 def _protection_qty(res) -> float:
-    """Cantidad que llenaron los seguros (SL / venta límite) durante el cierre."""
+    """Cantidad cerrada sin órdenes de este cierre: lo que llenaron los seguros (SL /
+    venta límite) y el short cerrado fuera de basyo."""
     pf = res.get("protection_filled") or {}
-    return float(pf.get("perp_filled") or 0) + float(pf.get("spot_filled") or 0)
+    return (float(pf.get("perp_filled") or 0) + float(pf.get("spot_filled") or 0)
+            + float((res.get("perp_external") or {}).get("missing") or 0))
 
 
 def _jsonable(obj):

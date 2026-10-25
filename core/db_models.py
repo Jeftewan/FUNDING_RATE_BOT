@@ -277,6 +277,45 @@ class FundingRateSnapshot(db.Model):
     )
 
 
+class MarketFeatureSnapshot(db.Model):
+    """Señales de mercado horarias por par Binance spot_perp (features del modelo).
+
+    Binance guarda solo ~30 d de OI y ratios: se recolectan cada hora para los
+    candidatos del scan (exchanges/market_features.py). Retención: 120 días.
+    """
+    __tablename__ = "market_feature_snapshots"
+
+    id = db.Column(db.Integer, primary_key=True)
+    symbol = db.Column(db.String(20), nullable=False)
+    exchange = db.Column(db.String(50), nullable=False)
+    ts_hour = db.Column(db.BigInteger, nullable=False)  # inicio de la hora UTC (epoch s)
+    funding_rate_est = db.Column(db.Float)       # premiumIndex.lastFundingRate (próximo pago)
+    mark_price = db.Column(db.Float)
+    index_price = db.Column(db.Float)
+    next_funding_ts = db.Column(db.BigInteger)   # ms
+    spot_mid = db.Column(db.Float)
+    perp_mid = db.Column(db.Float)
+    basis_pct = db.Column(db.Float)              # (perp_mid − spot_mid)/spot_mid × 100
+    open_interest = db.Column(db.Float)          # contratos (base)
+    open_interest_usd = db.Column(db.Float)
+    oi_change_1h_pct = db.Column(db.Float)
+    taker_buy_sell_ratio = db.Column(db.Float)   # última hora cerrada
+    top_long_short_pos_ratio = db.Column(db.Float)
+    funding_interval_hours = db.Column(db.Integer)
+    funding_cap = db.Column(db.Float)
+    funding_floor = db.Column(db.Float)
+    volatility_7d = db.Column(db.Float)          # std de 7 log-retornos diarios del perp
+    spot_source = db.Column(db.String(8))        # "cex" (book Binance) | "alpha" (VWAP 5 velas 1m on-chain)
+    alpha_liquidity_usd = db.Column(db.Float)    # liquidez del pool según la lista Alpha (solo online)
+    captured_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
+                            nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("symbol", "exchange", "ts_hour", name="uq_mfs_symbol_exchange_hour"),
+        db.Index("idx_mfs_ts_hour", "ts_hour"),
+    )
+
+
 class ScoreSnapshot(db.Model):
     """Rolling score history per opportunity.
 

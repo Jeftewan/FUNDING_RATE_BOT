@@ -15,7 +15,7 @@ class Config:
     DEFI_ENABLED = os.environ.get("DEFI_ENABLED", "0").lower() in ("1", "true", "yes")
     MIN_3DAY_REVENUE_PCT = float(os.environ.get("MIN_3DAY_REVENUE_PCT", "0.03"))
     MIN_FUNDING_DIFFERENTIAL = float(os.environ.get("MIN_FUNDING_DIFFERENTIAL", "0.0002"))
-    MAX_LEVERAGE = int(os.environ.get("MAX_LEVERAGE", "1"))
+    MAX_LEVERAGE = int(os.environ.get("MAX_LEVERAGE", "3"))   # tope de la auto-ejecución (decisión 2026-10-25)
 
     # Exchange API keys (optional — public data only if empty)
     BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")

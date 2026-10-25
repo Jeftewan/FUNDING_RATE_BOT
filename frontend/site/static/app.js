@@ -555,6 +555,56 @@ async function loadOpps() {
   }
 }
 
+// ── Análisis IA bajo demanda por oportunidad ─────────────────
+// Veredicto determinista del modelo (backend) + explicación de Gemini.
+let _oppAiData = {};
+const AI_ICON = '<svg class="ai-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/></svg>';
+
+function oppAiHtml(oppId, i) {
+  const a = _oppAiData[oppId];
+  if (!a) {
+    return `<button class="btn-ai-toggle" onclick="analyzeOppAI('${oppId}',${i})">${AI_ICON}<span class="ai-label">Analizar con IA</span></button>`;
+  }
+  const cls = a.signal === 'ENTRAR' ? 'ai-buy' : a.signal === 'NO ENTRAR' ? 'ai-avoid' : 'ai-hold';
+  const lev = (a.facts && a.facts.lev || []).map(l =>
+    `<tr${l.x === a.facts.lev_rec ? ' class="ai-lev-rec" title="Recomendado (backtest con seguros)"' : ''}><td>${l.x}x</td><td>${l.roc == null ? '—' : l.roc.toFixed(1) + '%'}</td><td>${l.usd_d == null ? '—' : '$' + l.usd_d.toFixed(2)}</td><td>${l.liq}%</td></tr>`).join('');
+  const risks = (a.risks || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
+  return `
+    <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">
+      ${AI_ICON}<span class="ai-label">Analisis IA</span>
+      <span class="ai-badge ${cls}">${a.signal}</span>
+      <svg class="ai-arrow" width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
+    </button>
+    <div class="ai-body">
+      <div class="ai-analysis">${escapeHtml(a.analysis || a.reason || '')}</div>
+      ${lev ? `<table class="ai-lev"><tr><th>Apal.</th><th>APR s/capital</th><th>USD/día ($${a.facts.capital})</th><th>Liq. a +</th></tr>${lev}</table>` : ''}
+      ${a.leverage ? `<div class="ai-action-plan"><span class="ai-action-label">Apalancamiento:</span> ${escapeHtml(a.leverage)}</div>` : ''}
+      ${risks ? `<ul class="ai-risks">${risks}</ul>` : ''}
+      ${a.watch ? `<div class="ai-action-plan"><span class="ai-action-label">Vigilar:</span> ${escapeHtml(a.watch)}</div>` : ''}
+    </div>`;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function analyzeOppAI(oppId, i) {
+  const box = document.getElementById('ai-' + i);
+  if (box) box.innerHTML = `<button class="btn-ai-toggle" disabled>${AI_ICON}<span class="ai-label">Analizando...</span></button>`;
+  const cap = parseFloat(document.getElementById('cap-' + i)?.value) || 1000;
+  try {
+    const res = await fetch(`/api/opportunities/${encodeURIComponent(oppId)}/ai`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ capital: cap }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.msg || 'sin resultado');
+    _oppAiData[oppId] = data.analysis;
+  } catch (e) {
+    showToast('Error en el análisis IA: ' + e.message, 'error');
+  }
+  if (box) { box.innerHTML = oppAiHtml(oppId, i); if (_oppAiData[oppId]) box.classList.add('open'); }
+}
+
 function renderOpps(data) {
   const rawOpps = data.opportunities || [];
   const opps = sortAndFilter(rawOpps);
@@ -583,10 +633,12 @@ function renderOpps(data) {
     // Net APR predicho por el modelo ML — número principal y discriminante.
     // Fallback al APR estimado si el modelo no predijo (model_prediction null).
     const netApr = o.model_prediction != null ? o.model_prediction : o.apr;
-    // Ganancia neta esperada en 14 d por cada $1.000 de CAPITAL a 1x. El APR del
-    // modelo es sobre el nocional perp; a 1x $1.000 = $500 spot + $500 de margen
-    // (nocional $500) → la mitad. Con apalancamiento L el nocional es L/(L+1).
-    const gain14 = o.model_prediction != null ? (o.model_prediction / 100) * 500 * 14 / 365 : null;
+    // Ganancia neta esperada en 14 d por cada $1.000 de CAPITAL al leverage
+    // recomendado. El APR del modelo es sobre el nocional perp; con leverage L el
+    // nocional es C·L/(L+1). Recomendado por backtest con seguros
+    // (reports/leverage_study_20261025_*.md): Alpha 2x, spot CEX 3x.
+    const levRec = o.spot_venue === 'bsc' ? 2 : 3;
+    const gain14 = o.model_prediction != null ? (o.model_prediction / 100) * 1000 * levRec / (levRec + 1) * 14 / 365 : null;
 
     const isExc = o.is_exceptional;
     const excReasons = (o.exceptional_reasons || []).join(' · ');
@@ -608,7 +660,7 @@ function renderOpps(data) {
       </div>
 
       <div class="opp-stats">
-        <div class="opp-stat" title="Ganancia neta esperada en 14 días por $1.000 de capital a 1x (modelo, descuenta fees)"><span class="label">Neto 14d 1K</span><span class="value ${gain14 == null ? '' : (gain14 >= 0 ? 'green' : 'red')}">${gain14 == null ? '—' : '$' + gain14.toFixed(2)}</span></div>
+        <div class="opp-stat" title="Ganancia neta esperada en 14 días por $1.000 de capital a ${levRec}x (modelo, descuenta fees)"><span class="label">Neto 14d 1K ${levRec}x</span><span class="value ${gain14 == null ? '' : (gain14 >= 0 ? 'green' : 'red')}">${gain14 == null ? '—' : '$' + gain14.toFixed(2)}</span></div>
         <div class="opp-stat"><span class="label">FR</span><span class="value green">${frPct}%</span></div>
         <div class="opp-stat"><span class="label">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
         <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
@@ -629,23 +681,13 @@ function renderOpps(data) {
 
       <div class="opp-actions">
         <label class="inp-label">Capital<input type="number" id="cap-${i}" placeholder="USD" class="inp-sm" style="width:70px"></label>
-        <label class="inp-label">Apal.<input type="number" id="lev-${i}" placeholder="1x" value="1" min="1" max="50" class="inp-sm" style="width:40px"></label>
+        <label class="inp-label">Apal.<input type="number" id="lev-${i}" placeholder="1x" value="${levRec}" min="1" max="3" class="inp-sm" style="width:40px" title="Recomendado ${levRec}x (backtest con seguros); máximo 3x"></label>
         <button class="btn btn-calc" onclick="calcEst('${o._id}',${i})">Calc</button>
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${i})">Entrar</button>
         ${execButton(o, i)}
       </div>
       <div class="opp-est" id="est-${i}"></div>
-      ${o.ai_analysis ? `
-      <div class="opp-ai" id="ai-${i}">
-        <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">
-          <svg class="ai-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1a4 4 0 01-8 0V6a4 4 0 014-4z"/><path d="M8 14s-4 2-4 6h16c0-4-4-6-4-6"/><circle cx="9" cy="9" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="9" r="1" fill="currentColor" stroke="none"/></svg>
-          <span class="ai-label">Analisis IA</span>
-          <span class="ai-badge ${o.ai_analysis.signal === 'COMPRAR' ? 'ai-buy' : o.ai_analysis.signal === 'EVITAR' ? 'ai-avoid' : 'ai-hold'}">${o.ai_analysis.signal}</span>
-          <span class="ai-conf">${o.ai_analysis.confidence}/10</span>
-          <svg class="ai-arrow" width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" fill="none" stroke-width="1.5"/></svg>
-        </button>
-        <div class="ai-body">${o.ai_analysis.analysis}</div>
-      </div>` : ''}
+      <div class="opp-ai${_oppAiData[o._id] ? ' open' : ''}" id="ai-${i}">${oppAiHtml(o._id, i)}</div>
     </div>`;
   }).join('');
 
@@ -667,7 +709,7 @@ function renderOpps(data) {
       const capEl = document.getElementById('cap-' + i);
       if (capEl) capEl.value = cached.capVal;
       const levEl = document.getElementById('lev-' + i);
-      if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
+      if (levEl && cached.levVal) levEl.value = cached.levVal;
     }
   });
 }
@@ -1323,16 +1365,19 @@ let _posAiData = {};
 let _posAiLoading = false;
 let _lastPosData = null;
 
-async function analyzePositionsAI() {
+async function analyzePositionsAI(posId) {
   if (_posAiLoading) return;
   _posAiLoading = true;
   const btn = document.getElementById('pos-ai-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Analizando posiciones...'; }
+  if (btn) { btn.disabled = true; btn.textContent = posId ? 'Analizando posición...' : 'Analizando posiciones...'; }
   try {
-    const res = await fetch('/api/positions/ai', { method: 'POST' });
+    const res = await fetch('/api/positions/ai', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(posId ? { position_id: posId } : {}),
+    });
     const data = await res.json();
     if (data.ok && data.analyses) {
-      _posAiData = data.analyses;
+      _posAiData = posId ? { ..._posAiData, ...data.analyses } : data.analyses;
       // Update switch analysis in cached position data (on-demand results)
       if (data.switch_results && _lastPosData && _lastPosData.positions) {
         for (const p of _lastPosData.positions) {
@@ -1641,7 +1686,8 @@ function renderPositions(data) {
           <div class="ai-analysis">${_posAiData[posId].analysis}</div>
           ${_posAiData[posId].action_plan ? `<div class="ai-action-plan"><span class="ai-action-label">Plan de accion:</span> ${_posAiData[posId].action_plan}</div>` : ''}
         </div>
-      </div>` : ''}
+      </div>` : `
+      <div class="pos-ai"><button class="btn-ai-toggle" onclick="analyzePositionsAI('${posId}')">${AI_ICON}<span class="ai-label">Analizar con IA</span></button></div>`}
     </div>`;
   }).join('');
 }

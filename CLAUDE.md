@@ -1,6 +1,6 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-10-22** (auditoría Binance spot_perp, rama `feat/binance-spot-perp-audit`).
+Estado del proyecto al **2026-10-25** (auditoría de rentabilidad, rama `feat/profit-research`).
 
 ---
 
@@ -24,6 +24,43 @@ Estado del proyecto al **2026-10-22** (auditoría Binance spot_perp, rama `feat/
 **El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing es un bundle Vite estático servido por Caddy — el contenido visible vive en `frontend/site/static/landing/assets/index-*.js`, no en `frontend/site/index.html`. **Flask ya no sirve HTML** (`static_folder=None`): es API pura.
 
 ---
+
+## Auditoría 2026-10-25 — de dónde sale la ganancia
+
+- **El edge está en tokens Alpha** (spot solo on-chain en Binance Alpha/BSC): los 17 trades Binance
+  reales lo son. El simulador viejo (`ml_binance.py`, `exit_policy_study.py`) filtraba `has_spot` (spot
+  CEX) → daba 3.7 % anual. Con CEX ∪ Alpha (`scripts/attribution_study.py`) da 29.9 % (12 m) y 26.4 %
+  en el periodo real vs ROC realizado 32 % (Binance) / 52 % (Bitget). Lista Alpha pública con
+  `listingTime` (`cache/binance/alpha_tokens.json`); sesgo de supervivencia (tokens borrados no salen).
+- **Modelo** (`scripts/ml_v2.py`, `reports/ml_v2_20261025.md`): en ese universo el vigente rinde 33.2 %
+  WF / 14.9 % hold-out; 7 variantes (ventanas, régimen, q25, P(ganancia), E×P) no lo superan de forma
+  consistente → no se exportó. Rankear por probabilidad empeora. Mensual a 1x: 1.7–6.7 %, típico ~3 %.
+- **Leverage** (`scripts/leverage_study.py`, seguros simulados con velas 1m): Alpha 1x 33 %, **2x
+  36–44 %**, 3x 24–28 % (SL en 57 % de entradas); CEX mejor a 3x pero 3–5 %. → `RECOMMENDED_LEV`.
+- **Rotación**: ver `rotation_gain_ok` en switch_analyzer (margen 2 % → +18 % vs no rotar).
+- **Cross perp** (`scripts/cross_dataset.py` + `scripts/cross_backtest.py`, `reports/cross_vs_spotperp_20261025.md`,
+  Binance/Bybit/OKX/Bitget): **no reactivar**. Ninguna config cumple DD ≤ 5 % fuera de muestra; el PnL
+  depende de 3 símbolos con funding extremo (sin ellos WF −0.7 % a 1x). Mismo motor: spot_perp CEX ∪ Alpha
+  30.7 % anual OOS, `p_prod>0` a 2x. Su riesgo por pierna usa velas 1d (in-sample L3 ≥ L2); con velas 1m
+  (`leverage_study.py`) 3x pierde en Alpha → se mantiene `RECOMMENDED_LEV` Alpha 2x.
+- **Señales nuevas** (`market_feature_snapshots`, ver sección de tablas): recolección horaria desde este PR.
+  Tokens solo-Alpha: `spot_source='alpha'`, spot = VWAP de las 5 velas 1m on-chain (API pública de
+  Binance Alpha) que terminan en `ts_hour` contra el VWAP del perp en las mismas velas
+  (`market_features.alpha_basis`, idéntica en el backfill); `alpha_liquidity_usd` solo online. El precio
+  de la lista Alpha no se usa: se desvía hasta ~3 % de los trades on-chain. Tokens Alpha *offline* no
+  se recolectan (tampoco se operan).
+- **¿Modelo nuevo con las señales?** (`scripts/new_signals_probe.py`, `reports/new_signals_probe_20261025.md`,
+  30 d de backfill, 453 símbolos con 98 Alpha): el **basis** trae información que el modelo no tiene (IC
+  sobre su residuo 0.17, t 11), también `log_oi_usd` (0.13) y top long/short (−0.11); ΔOI y taker no.
+  Pero un HistGB entrenado con ~1 semana rinde peor que el vigente (IC 0.30 vs 0.43) y mezclar el
+  ranking con el basis sube el IC global +0.006 pero **baja el top-5 que se opera** (funding 7 d 0.60 % →
+  0.25 % fuera de muestra) → **no se cambia el modelo**. Re-probar con ≥ 3 meses de señales (~ene-2027)
+  añadiéndolas a `ml_v2.py`; para usarlas en prod la inferencia tendrá que leer `market_feature_snapshots`.
+- **Mercado 2026**: funding BTC 11.9 % (2024) → 5.1 % (2025) → 3.0 % (2026 YTD); BTC/ETH a 10x no
+  sirve (≈3–5 % anual sobre capital). 5–10 %/mes sostenido no es realista; 3–4 %/mes en meses buenos.
+- **JCT `user_history.id=46`**: registraba `price_pnl=+438` (faltaba la recompra manual del short); real
+  +57.5. Fix en el código (ver "Lecciones de JCT #46"); la fila se corrige con
+  `scripts/fix_external_buyback.py --hist 46 --apply` (lo corre el usuario tras el merge).
 
 ## Auditoría 2026-10-22 — foco Binance spot_perp
 
@@ -143,6 +180,7 @@ frontend/               # Servicio Railway "web" (rootDirectory=/frontend)
 | `scan_cache` | Último resultado del scan (opportunities_json, defi_json) |
 | `funding_rate_snapshots` | 90 días de tasas históricas, dedup por (symbol, exchange, funding_ts) |
 | `score_snapshots` | Evolución del score por oportunidad (ventana rolling 30 entradas) |
+| `market_feature_snapshots` | Señales horarias por par Binance spot_perp (clave única symbol, exchange, `ts_hour` = inicio de la hora UTC en epoch s): tasa estimada del próximo pago, mark/index, basis spot–perp (mids del book; tokens Alpha: VWAP 1m on-chain), `spot_source`, `alpha_liquidity_usd`, OI y Δ1h, taker buy/sell, top long/short (posición), intervalo y cap/floor, volatilidad 7 d. Retención 120 d. Ver "Señales de mercado horarias" |
 
 Las migraciones se aplican automáticamente al arrancar vía `_run_migrations()`. Para agregar columnas a tablas existentes, añadir `ALTER TABLE ADD COLUMN IF NOT EXISTS` al array `migrations` en `core/database.py`.
 
@@ -161,6 +199,30 @@ El scanner **no usa un intervalo configurable**. Funciona por eventos de pago de
 4. Para **cross_exchange**, cada pierna (long y short) se evalúa independientemente para PRE y POST según su propio `next_funding_ts` e intervalo.
 
    - **Scan horario** (`PERIODIC_SCAN_SECS`, a :04 UTC tras los settlements): corre aunque no haya posiciones (desde 2026-10-22). Antes, sin posiciones el bot quedaba mudo y no escribía snapshots.
+
+### Señales de mercado horarias (Fase 2, `exchanges/market_features.py`)
+
+Binance guarda solo ~30 d de OI y ratios por API → se recolectan ya para entrenar el modelo de la Fase 3.
+- **Cuándo**: al final de `_run_scan_inner`, la **primera vez que escanea en cada hora UTC** (el scan horario
+  garantiza ≥1 scan por hora; si el primero es un scan por evento, ese cuenta). Hilo en background; si no
+  guarda nada o falla, se reintenta en el siguiente scan. Solo candidatos Binance de `spot_perp_opps`.
+- **Costo**: 4 llamadas de todos-los-símbolos (`/fapi/v1/premiumIndex`, `/fapi/v1/fundingInfo`, bookTicker spot
+  y perp) + 3 por símbolo en `/futures/data` (`openInterestHist`, `takerlongshortRatio`,
+  `topLongShortPositionRatio`; 1000 req/5 min por IP → paceadas a `DATA_MIN_INTERVAL` = 0.32 s, ~4 min con
+  250 pares) + klines 1d del perp una vez por símbolo y día (vol 7 d). Mismo cliente ccxt/proxy que
+  `exchanges/manager.py`. 5 errores seguidos en `/futures/data` → se omite OI/ratios del resto.
+- **Tolerancia**: una fuente caída deja NULL en sus columnas; el upsert (`upsert_rows`, Postgres/SQLite) usa
+  `COALESCE` → un NULL no pisa un valor ya guardado en la misma hora. Purga diaria > 120 d (`purge_old`).
+- **Definiciones** (compartidas con el backfill): `basis_pct = (perp_mid − spot_mid)/spot_mid × 100`;
+  `oi_change_1h_pct` del par de puntos 1h; `taker_buy_sell_ratio` = última hora cerrada; `volatility_7d` =
+  desvío de 7 log-retornos de los últimos 8 cierres diarios completos; `funding_interval_hours` = 8 si el
+  símbolo no aparece en `fundingInfo`.
+- **Backfill offline**: `python scripts/market_features_backfill.py [--days 30] [--symbols BTC,ETH]` → 
+  `cache/binance/market_features.csv` (fusiona con el CSV previo: correrlo cada <30 d acumula historia).
+  Basis desde cierres de velas 1h (no mids); sin tasa estimada/intervalo/cap (no hay historia por API).
+- **Historia larga**: data.binance.vision publica `futures/um/daily/metrics/<SYM>` (OI, top trader
+  long/short, taker vol ratio cada 5 min) **desde 2020** → para la Fase 3 no hace falta esperar a acumular.
+- Tests: `tests/test_market_features.py`.
 
 El historial de funding por candidato se cachea hasta el próximo settlement del par (máx. 1 h, `exchanges/manager.py:fetch_funding_history`) → el scan horario casi no gasta llamadas. Los intervalos de funding de Binance se refrescan cada 15 min (`FUNDING_INTERVALS_TTL`).
 
@@ -295,7 +357,7 @@ validación de predicciones previas de `ml_train.py`.
 
 ### Loop operativo de re-entreno (~cada 15 días, lo corre el usuario)
 
-0. (Desde 2026-10-22) `python scripts/binance_dataset.py` (incremental) + `python -u scripts/ml_binance.py` → comparar contra el modelo vigente con `scripts/exit_policy_study.py`; exportar (`--export`) solo si pasa el gate.
+0. (Desde 2026-10-25) `python scripts/binance_dataset.py` (incremental) + `python -u scripts/ml_v2.py --refresh` (universo **CEX ∪ Alpha**, label H30, fee por venue) → gate = cartera WF **y** hold-out vs modelo vigente. `ml_binance.py`/`exit_policy_study.py` solo miran spot CEX: no usarlos como gate (ver "Auditoría 2026-10-25").
 
 1. `pip install -r requirements-dev.txt` (local).
 1b. `python scripts/ml_health.py --refresh-cache` → salud del modelo VIVO fuera de
@@ -445,6 +507,10 @@ Al abrir por API (`jobs._run_open` → `trade_executor.place_protection`), solo 
   - (b) `BscSpotLeg._impact_vs_mid` compara el precio efectivo contra el mid on-chain (cotizaciones chicas); Kyber `swap_tx` ya no aborta por su oráculo.
   - (c) Con el short ya cerrado (spot desnudo), el límite de impacto de la venta sube a `MAX_PRICE_IMPACT_EXIT` = 5 %.
   - (d) Si el cierre falla, `_apply_partial_close` igual registra lo que llenaron los seguros (cantidades, `realized_price_pnl`, fees) y marca esas piernas `filled`/`canceled` en `protection_json`.
+- **Lecciones de JCT #46 (2026-10-24)**: el usuario canceló el SL de basyo en la web, se llenó la venta límite BSC (+438 USD de pierna spot) y el reintento del cierre falló vendiendo 1e-11 de remanente ("Return amount is not enough") → el short quedó abierto y sin SL; el usuario lo recompró a mano (−380.9) y el cierre siguiente ("Short real 0") registró solo la pierna spot (`price_pnl` +438 vs real +57.5). Cambios:
+  - (a) Un short que falta sin explicarlo los seguros (`perp_qty − short real − SL llenado` > 1 %) se busca en los fills reales (`external_perp_buyback`: userTrades del perp desde la apertura, compras más recientes, ventanas de 7 d) y entra al `price_pnl` y a las fees (`perp_external`). Si no se encuentra → `price_pnl_unknown`, alerta WARNING y el `price_pnl` total del historial queda `None` (nunca de una sola pierna; el flag persiste en `payments_json`).
+  - (b) Un remanente spot de polvo se descarta ANTES de vender: el perp se recompra igual.
+  - Corrección de filas viejas: `python scripts/fix_external_buyback.py --hist 46 [--apply]` (dry-run por defecto).
 - **Vigilante** (`execution/protection.py`, cada 60 s, lo arranca `JobRunner.start`): si se llenó el SL o la venta → lanza un job de cierre normal (`trigger:"protection"`) que cierra la otra pierna; orden BSC a <12 h de expirar → la renueva + Telegram `PROTECTION_RENEWED`; seguro cancelado fuera de basyo → `PROTECTION_CANCELED`. Con el mark a < 2 % del SL (`HOT_PCT`) el loop baja a 10 s.
 - **Llenados asimétricos (2026-10-25, `scripts/protection_study.py`)** — velas 1m, 12 meses: CEX = 20 alts con spot Binance (`reports/protection_study_20261025.md`); BSC = 20 tokens solo-Alpha con el precio on-chain de la API pública de Binance Alpha (`/bapi/defi/v1/public/alpha-trade/klines`, `--venue bsc`, `reports/protection_study_20261025_bsc.md`):
   - **Caso A** (dispara el SL, el spot no se vende → spot desnudo): es la cola peligrosa y **on-chain es frecuente** (2x: 1117 eventos en 6022 entradas vs 25 en CEX; el precio on-chain va detrás del perp). δ = 0.5 % la reduce (BSC 1117 → 408, CEX 25 → 7) y es el mejor esperado en ambos. En BSC el esperado neto por evento de seguro es negativo (≈ −0.25 % de la entrada a 2–3x) vs positivo en CEX. El cierre vende el spot **taker directo** (sin ventana maker) cuando el short ya no existe.
@@ -536,19 +602,21 @@ El usuario puede sobreescribir fees con valores reales una vez que la posición 
 
 ## IA / Análisis LLM
 
-`analysis/ai_analyzer.py` envía las **top 5 oportunidades por Net APR predicho** (`model_prediction`,
-fallback a `score` si el modelo no predijo; excluye `model_prediction <= 0`) a **Gemini 3.1 Flash-Lite**
-(`gemini-3.1-flash-lite`, vía `google-genai`).
+**Bajo demanda** (desde 2026-10-25; antes corría en cada scan sobre el top-5). Botón "Analizar con IA"
+por oportunidad y por posición. **El veredicto es determinista; Gemini 3.1 Flash-Lite solo lo explica**
+(`gemini-3.1-flash-lite`, `google-genai`). Motivo: las reglas fijas del prompt viejo (`z>=2 → EVITAR`)
+contradecían al modelo — los picos Alpha rentables tienen z alto — y casi siempre salía EVITAR.
 
-- **Señal:** `COMPRAR` / `MANTENER` / `EVITAR` + confidence 1–10 + razonamiento en 40–60 palabras
-- **Prompt:** alineado al modelo ML — `napr` (Net APR predicho) es la métrica principal; flag `mdl`
-  indica si `napr` viene del modelo (1, neto) o es un APR bruto sustituto (0, modelo no predijo). Incluye
-  `mode`, `sym`, momentum, z-score, percentil, consistencia, fee drag, grade.
-- **JSON mode:** `response_mime_type="application/json"`; parseo en `_parse_ai_response`.
-- **Rate limiting:** 3 API keys rotadas (`GEMINI_API_KEY_1/2/3`). El free tier de Gemini es ajustado
-  (~10 RPM, ~250K TPM, RPD según AI Studio); **sin fallback a otro proveedor** — ante 429/timeout el
-  análisis IA degrada a vacío (no rompe el scan ni el endpoint `/api/positions/ai`).
-- El prompt está calibrado para no penalizar dos veces lo que el modelo/scoring ya penaliza (z-score, momentum).
+- **Oportunidad** (`POST /api/opportunities/<id>/ai`, body `{capital}`, caché 30 min por settlement):
+  `opportunity_verdict` → `ENTRAR` (Net APR predicho ≥ `ENTER_NAPR`=5), `ESPERAR` (0–5), `NO ENTRAR`
+  (≤0), `SIN MODELO`. Devuelve `facts` con tabla por leverage 1/2/3x (`roc` sobre capital = napr·L/(L+1),
+  `usd_d`, `liq`) y `lev_rec` (Alpha 2x, CEX 3x, `RECOMMENDED_LEV`); Gemini agrega `analysis`, `risks`,
+  `watch`, `leverage`.
+- **Posición** (`POST /api/positions/ai`, body opcional `{position_id}`): `position_verdict` → `CERRAR`
+  (dos pagos seguidos ≤0 o `switch_analyzer` = SWITCH), `VIGILAR` (último pago ≤0 o >30 d), `MANTENER`.
+  El LLM no puede cambiar la señal (se sobrescribe tras parsear).
+- Sin API key o ante 429/timeout se devuelve el veredicto con su razón (nunca vacío). 3 keys rotadas
+  (`GEMINI_API_KEY_1/2/3`).
 
 ---
 
@@ -573,6 +641,7 @@ COINGLASS_API_KEY     # Datos adicionales de mercado
 ENABLED_EXCHANGES     # Default: binance (foco Binance desde 2026-10-22; otros CEX por env)
 ARBITRAGE_MODES       # Default: spot_perp (cross_exchange por env; su auto-ejecución está bloqueada)
 DEFI_ENABLED          # =1 → reactiva el scan DeFi (default apagado)
+MAX_LEVERAGE          # tope de leverage de /api/execute_open (default 3; decisión 2026-10-25)
 AUTO_UNWIND_ON_LIQ    # =1 → si el short desaparece (liquidado) el vigilante vende el spot (default: solo alerta CRITICAL)
 TRADE_SANDBOX         # =1 → auto-ejecución en test (Binance: demo trading; resto: set_sandbox_mode)
 ONCHAIN_ENABLED       # =1 → habilita la pierna spot on-chain BSC (tokens solo-Alpha)
@@ -613,6 +682,10 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 - **`current_market_rate` para cross-exchange**: se recomputa desde las dos piernas (`short_fr − long_fr`) en lugar de buscar por un único campo `"fr"`.
 - **`avg_rate` zero-safe**: la comparación usa `if avg_rate is not None and avg_rate != 0` en lugar de `or` para preservar valores legítimamente iguales a cero.
 - **Switch analysis es on-demand**: se llama desde `/api/positions/ai`, no desde el loop del monitor.
+- **Gate de rotación con modelo** (`rotation_gain_ok`, desde 2026-10-25): SWITCH solo si
+  (napr_alt − napr_actual_ajustado)·14 d > fee de entrada de la alternativa + 2 % del nocional
+  (`ROTATION_MARGIN`). Backtest `reports/rotation_policy_20261025.md`: margen 0 → 28.0 % anual (pierde
+  por fees), sin rotar 29.3 %, margen 2 % → 34.6 %. Con modelo no aplica el atajo por `health_score < 30`.
 
 ---
 
@@ -682,7 +755,7 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 - Healthcheck y root dir viven en la **configuración del servicio** (no en `railway.json`: Railway deprecó Config as Code el 2026-12-01).
 - **Sin watch paths**: con ellos Railway marcó el merge del PR #98 como `SKIPPED` ("No changes to watched files") en ambos servicios. Todo push a `main` redeploya los dos (Caddy tarda segundos).
 - Bot: `PORT=8080` (lo referencia `web`) y `MALLOC_ARENA_MAX=2` (glibc + threads fragmenta; RAM base era ~0.78 GB).
-- **Salida a exchanges (proxy)**: desde el deploy del 2026-10-18 01:05 UTC (PR #102, coincidencia: el código no influye) la IP de salida de Railway (asia-southeast1) recibe **451** de Binance ("restricted location") y **403 CloudFront** de Bybit. **Causa raíz:** cada deploy toma IP del pool propio de Railway `152.55.188.x` (AS400940), que ipinfo/MaxMind geolocalizan en **San Francisco, US**, sin importar la región; el último deploy OK fue el de PR #101. Ningún servicio/región de Railway lo evita (todos salen por AS400940); IPv6 no aplica (Binance/Bybit sin AAAA). Static Outbound IPs (plan Pro) solo sirven si sus IPs geolocalizan fuera de US — verificarlo antes de redeployar. Detección: `exchanges/net.py` (`is_geoblock_error`, `geoblocked()`), `log.error` si el país de salida está en `BLOCKED_COUNTRIES`, `/health → egress {country, proxy, geoblocked}` y alerta `EXCHANGE_GEOBLOCKED` desde el sync. Solución: proxy SOCKS5 propio (`gost`) en un VPS de país permitido (`scripts/proxy_vps_setup.sh`) + `EXCHANGE_PROXY_URL`. `exchanges/net.py` lo aplica **solo** a ccxt (`manager.py`, `trade_executor._build_client` → también `binance_account`), Web3 API/0x y la token list Alpha; Postgres/Telegram/Gemini/DeFi/RPC BSC salen directo (no usar `HTTPS_PROXY` global). Al arrancar se loguea `Egress exchanges: <país> <ip> via ...`. Diagnóstico: `python scripts/egress_check.py` (con/sin proxy). La IP del VPS es la de la whitelist de las API keys.
+- **Salida a exchanges (proxy)**: desde el deploy del 2026-10-18 01:05 UTC (PR #102, coincidencia: el código no influye) la IP de salida de Railway (asia-southeast1) recibe **451** de Binance ("restricted location") y **403 CloudFront** de Bybit. **Causa raíz:** desde ese deploy la región Singapur sale por el bloque propio de Railway `152.55.188.0/22` (AS400940), que ipinfo/ip-api geolocalizan en **San Francisco, US** (mal geolocalizado); el último deploy OK fue el de PR #101. Geolocalización de los prefijos de AS400940 (muestreo 2026-10-18): `208.77.246.0/23` → SG, `152.55.184.0/22` y `208.77.244.0/23` → **NL**, `152.55.176.0/22`/`152.55.180.0/22`/resto → US. **Estado actual: el bot corre en EU West (Amsterdam)** (`railway scale eu-west=1 southeast-asia=0`): sale por `152.55.184.x` (NL) y Binance/Bybit responden 200 (scan 3017 pares). Postgres y `web` están en us-west2, así que la latencia a DB no empeora. ⚠ La Binance **Web3 API** (on-chain BSC, `ONCHAIN_ENABLED=1` en prod) bloquea NL → en Amsterdam el spot on-chain no funciona hasta volver a SG o usar `DEX_AGGREGATOR=0x`. Ticket abierto a Railway para corregir el geofeed de `152.55.188.0/22`: https://station.railway.com/questions/southeast-asia-egress-ips-152-55-188-0-5c5acecd (el bloque NL tuvo el mismo error hace ~5 meses y lo corrigieron). Cuando ipinfo muestre SG para `152.55.188.x`, se puede volver a `southeast-asia=1` y verificar el log `Egress exchanges`. IPv6 no aplica (Binance/Bybit sin AAAA). Static Outbound IPs (plan Pro) solo sirven si sus IPs geolocalizan fuera de US — verificarlo antes de redeployar. Detección: `exchanges/net.py` (`is_geoblock_error`, `geoblocked()`), `log.error` si el país de salida está en `BLOCKED_COUNTRIES`, `/health → egress {country, proxy, geoblocked}` y alerta `EXCHANGE_GEOBLOCKED` desde el sync. Solución: proxy SOCKS5 propio (`gost`) en un VPS de país permitido (`scripts/proxy_vps_setup.sh`) + `EXCHANGE_PROXY_URL`. `exchanges/net.py` lo aplica **solo** a ccxt (`manager.py`, `trade_executor._build_client` → también `binance_account`), Web3 API/0x y la token list Alpha; Postgres/Telegram/Gemini/DeFi/RPC BSC salen directo (no usar `HTTPS_PROXY` global). Al arrancar se loguea `Egress exchanges: <país> <ip> via ...`. Diagnóstico: `python scripts/egress_check.py` (con/sin proxy). La IP del VPS es la de la whitelist de las API keys.
 - RAM ccxt: las instancias de solo lectura de `exchanges/manager.py` cargan solo spot + linear/swap y descartan `market['info']` (`_ensure_markets`); el spot check reusa esos mercados. `trade_executor` usa clientes propios, no afectados.
 - CLI: `railway ... -p 7dc7767e-983c-45a6-afc0-be5210dee632 -e production -s <servicio>` (el repo no está linkeado).
 
@@ -697,7 +770,7 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 
 ### Mejoras identificadas
 
-- **Binance en vivo — pendientes**: (1) Web3 API bloquea regiones US/NL/GB → mover el servicio del bot a Railway asia-southeast o usar 0x (validar con un swap mínimo); (2) actualizar Términos/Privacidad (custodia de la wallet dedicada) en el source React de la landing; (3) reconciliación automática de jobs on-chain interrumpidos; (4) Portfolio Margin (`papi`) no soportado; (5) IP fija de salida → resuelta con el VPS proxy (`EXCHANGE_PROXY_URL`); (6) `cross_exchange` sigue con límites simples (sin TWAP).
+- **Binance en vivo — pendientes**: (1) Web3 API bloquea regiones US/NL/GB → hoy el bot está en Amsterdam (NL) por el geobloqueo de Singapur: on-chain requiere volver a SG cuando Railway corrija `152.55.188.0/22` o usar 0x (validar con un swap mínimo); (2) actualizar Términos/Privacidad (custodia de la wallet dedicada) en el source React de la landing; (3) reconciliación automática de jobs on-chain interrumpidos; (4) Portfolio Margin (`papi`) no soportado; (5) IP fija de salida → resuelta con el VPS proxy (`EXCHANGE_PROXY_URL`); (6) `cross_exchange` sigue con límites simples (sin TWAP).
 
 - **DeFi history fiabilidad**: `fetch_funding_history` en `defi_manager.py` depende de que los snapshots existan en DB. En deploys nuevos o símbolos nuevos, thin-history (<5 muestras) da scoring neutro — correcto pero subóptimo para toma de decisiones. Nota: GMX, Aster, Lighter y Extended reportan `volume_24h=0`; el gate de volumen del scan trata ese `0` (desconocido) como **pasa**, así que estos pares ya no quedan excluidos (el filtro de volumen real es de display, client-side).
 - **Scoring DeFi bajo (pendiente)**: los modos `cross_exchange`/`defi` puntúan bajo de forma estructural — consistency (46) + stability (21) = 67% del score se calculan sobre el *diferencial* (`period_diffs`), que cambia de signo mucho más que una tasa única → streak/consistencia bajos, CV alto. A esto se suma thin-history y `volume_24h=0`. **Pendiente** (otro plan): `defi_opportunity_score()` separado con umbrales heurísticos, tras verificar cuántos snapshots/muestras hay acumulados.
