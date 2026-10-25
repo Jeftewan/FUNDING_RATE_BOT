@@ -567,7 +567,7 @@ function oppAiHtml(oppId, i) {
   }
   const cls = a.signal === 'ENTRAR' ? 'ai-buy' : a.signal === 'NO ENTRAR' ? 'ai-avoid' : 'ai-hold';
   const lev = (a.facts && a.facts.lev || []).map(l =>
-    `<tr><td>${l.x}x</td><td>${l.roc == null ? '—' : l.roc.toFixed(1) + '%'}</td><td>${l.usd_d == null ? '—' : '$' + l.usd_d.toFixed(2)}</td><td>${l.liq}%</td></tr>`).join('');
+    `<tr${l.x === a.facts.lev_rec ? ' class="ai-lev-rec" title="Recomendado (backtest con seguros)"' : ''}><td>${l.x}x</td><td>${l.roc == null ? '—' : l.roc.toFixed(1) + '%'}</td><td>${l.usd_d == null ? '—' : '$' + l.usd_d.toFixed(2)}</td><td>${l.liq}%</td></tr>`).join('');
   const risks = (a.risks || []).map(r => `<li>${escapeHtml(r)}</li>`).join('');
   return `
     <button class="btn-ai-toggle" onclick="this.parentElement.classList.toggle('open')">

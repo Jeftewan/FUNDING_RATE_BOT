@@ -64,6 +64,9 @@ def _parse_ai_response(text: str, valid_signals: tuple, default_signal: str) -> 
 ENTER_NAPR = 5.0          # ≥ → ENTRAR (debajo es ruido del modelo)
 LEVERAGES = (1, 2, 3)     # tope de leverage del negocio (decisión 2026-10-25)
 LIQ_MMR = 0.01
+# Leverage óptimo con los seguros en la cartera (reports/leverage_study_20261025_{bsc,cex}.md):
+# en Alpha el SL se dispara en 57 % de las entradas a 3x y rinde menos que 1x; 2x es el mejor.
+RECOMMENDED_LEV = {"alpha": 2, "cex": 3}
 
 OPP_SYSTEM_PROMPT = (
     "Eres analista cuantitativo de arbitraje de funding rates (long spot + short perp, delta neutral). "
@@ -80,8 +83,8 @@ OPP_SYSTEM_PROMPT = (
     "tasas %), mins (minutos al proximo pago).\n\n"
     "Responde SOLO JSON: {\"analysis\":\"50-80 palabras: que paga, por que el modelo da ese veredicto, "
     "con numeros\",\"risks\":[\"1-3 riesgos concretos y medibles\"],\"watch\":\"que vigilar y cuando salir "
-    "(regla del negocio: cerrar tras dos pagos seguidos <= 0)\",\"leverage\":\"recomendacion entre 1x y 3x "
-    "segun liq y volatilidad, una frase\"}"
+    "(regla del negocio: cerrar tras dos pagos seguidos <= 0)\",\"leverage\":\"una frase que justifique "
+    "'lev_rec' (leverage recomendado por backtest con seguros: alpha 2x, cex 3x) con la tabla lev\"}"
 )
 
 
@@ -115,9 +118,11 @@ def _opp_facts(opp: dict, capital: float) -> dict:
     ind = opp.get("indicators", {}) or {}
     hist = opp.get("history", {}) or {}
     rates = hist.get("_rates") or []
+    venue = "alpha" if opp.get("spot_venue") == "bsc" else "cex"
     return {
         "sym": opp.get("symbol", ""),
-        "venue": "alpha" if opp.get("spot_venue") == "bsc" else "cex",
+        "venue": venue,
+        "lev_rec": RECOMMENDED_LEV[venue],
         "napr": round(opp["model_prediction"], 1) if opp.get("model_prediction") is not None else None,
         "fr": round((opp.get("funding_rate", 0) or 0) * 100, 4),
         "ih": opp.get("interval_hours", 8),
