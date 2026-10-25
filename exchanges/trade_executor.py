@@ -373,7 +373,6 @@ def _order_fills_trades(client, ccxt_symbol: str, order_id: str, px_cache: dict 
         log.warning(f"fetch_my_trades {ccxt_symbol} order={order_id} failed: {e}")
         trades = None
     market = client.market(ccxt_symbol)
-    base = market.get("base", "")
     cs = market.get("contractSize") or 1
     if trades is None:
         # Fallback: orden sin trades legibles → filled/average del order.
@@ -386,9 +385,15 @@ def _order_fills_trades(client, ccxt_symbol: str, order_id: str, px_cache: dict 
             pass
         out["_from_order"] = True
         return out
+    return _sum_trades(client, market, [t for t in trades if str(t.get("order")) == str(order_id)],
+                       px_cache, out)
+
+
+def _sum_trades(client, market, trades, px_cache, out) -> dict:
+    """Acumula en `out` cantidad base, costo y fees (USD / base) de una lista de trades."""
+    base = market.get("base", "")
+    cs = market.get("contractSize") or 1
     for t in trades:
-        if str(t.get("order")) != str(order_id):
-            continue
         amt = float(t.get("amount") or 0) * (cs if market.get("contract") else 1)
         price = float(t.get("price") or 0)
         out["gross"] += amt
@@ -404,6 +409,52 @@ def _order_fills_trades(client, ccxt_symbol: str, order_id: str, px_cache: dict 
                 out["fee_usd"] += fcost * _usd_price(client, fccy, px_cache)
     if out["gross"] > 0:
         out["avg"] = out["cost"] / out["gross"]
+    return out
+
+
+_TRADES_WINDOW_MS = 7 * 86_400_000 - 1     # Binance userTrades: startTime→endTime ≤ 7 días
+EXTERNAL_CLOSE_TOL = 0.01                  # fracción del short registrado que puede faltar sin buscar recompra
+
+
+def external_perp_buyback(client, ccxt_symbol: str, qty: float, since_ms=None) -> dict:
+    """Recompra REAL de un short cerrado FUERA de basyo (manual en la web,
+    liquidación): las compras más recientes del perp desde la apertura hasta cubrir
+    `qty` (base). {gross, cost, avg, fee_usd, trades} o None si no se pueden leer.
+
+    JCT #46 (2026-10-24): el usuario recompró el short a mano y el cierre solo
+    contó la venta del spot → price_pnl +438 sobre 631 USD de nocional.
+    """
+    market = client.market(ccxt_symbol)
+    cs = (market.get("contractSize") or 1) if market.get("contract") else 1
+    end = int(time.time() * 1000)
+    since_ms = int(since_ms) - 60_000 if since_ms else end - _TRADES_WINDOW_MS
+    picked, need = [], qty
+    try:
+        while end > since_ms and need > 1e-12:
+            start = max(since_ms, end - _TRADES_WINDOW_MS)
+            trades = client.fetch_my_trades(ccxt_symbol, since=start, limit=1000,
+                                            params={"endTime": end})
+            buys = sorted((t for t in trades or [] if (t.get("side") or "").lower() == "buy"),
+                          key=lambda t: t.get("timestamp") or 0)
+            for t in reversed(buys):                      # la más reciente primero
+                amt = float(t.get("amount") or 0) * cs
+                if amt <= 0:
+                    continue
+                frac = min(1.0, need / amt)
+                fee = t.get("fee") or {}
+                picked.append({**t, "amount": float(t["amount"]) * frac,
+                               "cost": float(t.get("cost") or amt * float(t.get("price") or 0)) * frac,
+                               "fee": {**fee, "cost": abs(float(fee.get("cost") or 0)) * frac}})
+                need -= amt * frac
+                if need <= 1e-12:
+                    break
+            end = start - 1
+    except Exception as e:
+        log.warning(f"external_perp_buyback {ccxt_symbol}: {e}")
+        return None
+    out = _sum_trades(client, market, picked, {},
+                      {"gross": 0.0, "cost": 0.0, "avg": 0.0, "fee_usd": 0.0, "fee_base": 0.0})
+    out["trades"] = [str(t.get("id") or t.get("order")) for t in picked]
     return out
 
 
@@ -1930,6 +1981,23 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
 
     ref = _ref_mids(spot_cli, spot_sym, perp_cli, perp_sym, leg if onchain else None,
                     position.get("entry_price") or 0)
+    # Short cerrado fuera de basyo (web, liquidación): su recompra real entra al PnL;
+    # si no se encuentra, el PnL de precio queda indeterminado (nunca de una sola pierna).
+    ext = None
+    missing = perp_qty - actual_short - float(prot_fill.get("perp_filled") or 0)
+    if perp_qty and missing > perp_qty * EXTERNAL_CLOSE_TOL:
+        f = external_perp_buyback(perp_cli, perp_sym, missing, position.get("entry_time"))
+        if f and f["gross"] >= missing * 0.99:
+            ext = {"missing": missing, **f}
+        else:
+            ext = {"missing": missing, "found": (f or {}).get("gross"),
+                   "unknown": (f"No se encontró la recompra del short cerrado fuera de basyo "
+                               f"({(f or {}).get('gross') or 0:g} de {missing:g})")}
+    ext_fee = float((ext or {}).get("fee_usd") or 0)
+    if spot_to_sell and _is_dust(leg, spot_to_sell, ref):
+        # JCT #46: tras llenarse la venta límite quedaban 1e-11 en la wallet; el swap
+        # revertía ("Return amount is not enough") y el short quedaba sin recomprar.
+        spot_to_sell = 0.0
     hedger = PerpHedger(perp_cli, perp_sym, ctx, opening=False, max_base=perp_to_close)
     ratio = (perp_to_close / spot_to_sell) if spot_to_sell else 0
     state = {"per_order": {}, "sold": 0.0, "proceeds": 0.0}
@@ -1983,13 +2051,17 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         return {"ok": False, "code": "HEDGE_FAILED",
                 "msg": (f"Spot vendido ({state['sold']:g}) pero el perp NO se recompró "
                         f"completamente: {hedger.failed} — REVISA MANUALMENTE"),
-                "spot_sold": state["sold"], "perp_closed": hedger.hedged,
-                "exit_fees_usd": round(leg.fee_usd + hedger.fee_usd + prot_fill.get("fee_usd", 0.0), 6)}
+                "spot_sold": state["sold"], "perp_closed": hedger.hedged, "perp_external": ext,
+                "price_pnl_unknown": (ext or {}).get("unknown"),
+                "exit_fees_usd": round(leg.fee_usd + hedger.fee_usd + prot_fill.get("fee_usd", 0.0)
+                                       + ext_fee, 6)}
 
     res = {
         "ok": True, "dry_run": False, "drift": drift,
-        "exit_fees_usd": round(leg.fee_usd + hedger.fee_usd + prot_fill.get("fee_usd", 0.0), 6),
+        "exit_fees_usd": round(leg.fee_usd + hedger.fee_usd + prot_fill.get("fee_usd", 0.0)
+                               + ext_fee, 6),
         "protection_filled": prot_fill or None,
+        "perp_external": ext, "price_pnl_unknown": (ext or {}).get("unknown"),
         "spot_sold": state["sold"], "perp_closed": hedger.hedged,
         "spot_exit_price": state["proceeds"] / state["sold"] if state["sold"] else None,
         "perp_exit_price": hedger.avg or None,
@@ -2004,7 +2076,7 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
              "order_ids": hedger.order_ids, "fee_usd": round(hedger.fee_usd, 6)},
         ],
     }
-    res.update(_close_pnl(position, state, hedger, prot_fill, ref))
+    res.update(_close_pnl(position, state, hedger, prot_fill, ref, ext))
     if error or ctx.cancelled():
         res["partial_note"] = str(error) if error else "Cancelado por el usuario"
     return res
@@ -2026,21 +2098,23 @@ def _is_dust(leg, amt: float, ref) -> bool:
     return bool(px) and amt * px < 1.0
 
 
-def _close_pnl(position, state, hedger, prot_fill, ref) -> dict:
+def _close_pnl(position, state, hedger, prot_fill, ref, ext=None) -> dict:
     """PnL de precio REAL de lo cerrado en esta ejecución (incluye lo que llenaron
-    los seguros): (salida − entrada)·qty en el spot + (entrada − salida)·qty en el
-    perp. Ya contiene basis, slippage y comisión del DEX; las fees explícitas van
-    aparte en exit_fees_usd. price_pnl=None si falta el precio de entrada."""
+    los seguros y la recompra del short cerrado fuera de basyo): (salida − entrada)·qty
+    en el spot + (entrada − salida)·qty en el perp. Ya contiene basis, slippage y
+    comisión del DEX; las fees explícitas van aparte en exit_fees_usd. price_pnl=None
+    si falta el precio de entrada o la recompra externa no se pudo leer."""
     spot_entry = position.get("spot_entry_price") or _legacy_spot_entry(position)
     perp_entry = float(position.get("entry_price") or 0) or None
+    ext_ok = ext if ext and not ext.get("unknown") else {}
     spot_out = state["sold"] + float(prot_fill.get("spot_filled") or 0)
     spot_proc = state["proceeds"] + float(prot_fill.get("spot_cost") or 0)
-    perp_out = hedger.hedged + float(prot_fill.get("perp_filled") or 0)
-    perp_cost = hedger.cost + float(prot_fill.get("perp_cost") or 0)
+    perp_out = hedger.hedged + float(prot_fill.get("perp_filled") or 0) + float(ext_ok.get("gross") or 0)
+    perp_cost = hedger.cost + float(prot_fill.get("perp_cost") or 0) + float(ext_ok.get("cost") or 0)
     spot_exit = spot_proc / spot_out if spot_out else None
     perp_exit = perp_cost / perp_out if perp_out else None
     pnl = None
-    if spot_entry and perp_entry and (spot_out or perp_out):
+    if spot_entry and perp_entry and (spot_out or perp_out) and not (ext or {}).get("unknown"):
         pnl = round((spot_proc - spot_entry * spot_out) + (perp_entry * perp_out - perp_cost), 6)
     slip = _slip_summary("sell", state["proceeds"] / state["sold"] if state["sold"] else None,
                          state["sold"], hedger.avg, hedger.hedged, ref)
@@ -2053,7 +2127,7 @@ def _close_pnl(position, state, hedger, prot_fill, ref) -> dict:
             "spot_qty_out": spot_out, "perp_qty_out": perp_out,
             "exit_basis_pct": round((perp_exit - spot_exit) / spot_exit * 100, 4)
             if spot_exit and perp_exit else None,
-            "exit_ref_mids": ref, "exit_slippage": slip,
+            "exit_ref_mids": ref, "exit_slippage": slip, "perp_external": ext,
         },
     }
 
