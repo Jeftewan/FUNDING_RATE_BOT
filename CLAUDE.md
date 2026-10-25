@@ -1,6 +1,6 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-10-22** (auditoría Binance spot_perp, rama `feat/binance-spot-perp-audit`).
+Estado del proyecto al **2026-10-25** (auditoría de rentabilidad, rama `feat/profit-research`).
 
 ---
 
@@ -24,6 +24,24 @@ Estado del proyecto al **2026-10-22** (auditoría Binance spot_perp, rama `feat/
 **El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing es un bundle Vite estático servido por Caddy — el contenido visible vive en `frontend/site/static/landing/assets/index-*.js`, no en `frontend/site/index.html`. **Flask ya no sirve HTML** (`static_folder=None`): es API pura.
 
 ---
+
+## Auditoría 2026-10-25 — de dónde sale la ganancia
+
+- **El edge está en tokens Alpha** (spot solo on-chain en Binance Alpha/BSC): los 17 trades Binance
+  reales lo son. El simulador viejo (`ml_binance.py`, `exit_policy_study.py`) filtraba `has_spot` (spot
+  CEX) → daba 3.7 % anual. Con CEX ∪ Alpha (`scripts/attribution_study.py`) da 29.9 % (12 m) y 26.4 %
+  en el periodo real vs ROC realizado 32 % (Binance) / 52 % (Bitget). Lista Alpha pública con
+  `listingTime` (`cache/binance/alpha_tokens.json`); sesgo de supervivencia (tokens borrados no salen).
+- **Modelo** (`scripts/ml_v2.py`, `reports/ml_v2_20261025.md`): en ese universo el vigente rinde 33.2 %
+  WF / 14.9 % hold-out; 7 variantes (ventanas, régimen, q25, P(ganancia), E×P) no lo superan de forma
+  consistente → no se exportó. Rankear por probabilidad empeora. Mensual a 1x: 1.7–6.7 %, típico ~3 %.
+- **Leverage** (`scripts/leverage_study.py`, seguros simulados con velas 1m): Alpha 1x 33 %, **2x
+  36–44 %**, 3x 24–28 % (SL en 57 % de entradas); CEX mejor a 3x pero 3–5 %. → `RECOMMENDED_LEV`.
+- **Rotación**: ver `rotation_gain_ok` en switch_analyzer (margen 2 % → +18 % vs no rotar).
+- **Mercado 2026**: funding BTC 11.9 % (2024) → 5.1 % (2025) → 3.0 % (2026 YTD); BTC/ETH a 10x no
+  sirve (≈3–5 % anual sobre capital). 5–10 %/mes sostenido no es realista; 3–4 %/mes en meses buenos.
+- **Bug abierto**: JCT `user_history.id=46` registra `price_pnl=+438` (venta límite spot llenada, recompra
+  del short no registrada) → infla KPIs; fix en sesión aparte.
 
 ## Auditoría 2026-10-22 — foco Binance spot_perp
 
@@ -295,7 +313,7 @@ validación de predicciones previas de `ml_train.py`.
 
 ### Loop operativo de re-entreno (~cada 15 días, lo corre el usuario)
 
-0. (Desde 2026-10-22) `python scripts/binance_dataset.py` (incremental) + `python -u scripts/ml_binance.py` → comparar contra el modelo vigente con `scripts/exit_policy_study.py`; exportar (`--export`) solo si pasa el gate.
+0. (Desde 2026-10-25) `python scripts/binance_dataset.py` (incremental) + `python -u scripts/ml_v2.py --refresh` (universo **CEX ∪ Alpha**, label H30, fee por venue) → gate = cartera WF **y** hold-out vs modelo vigente. `ml_binance.py`/`exit_policy_study.py` solo miran spot CEX: no usarlos como gate (ver "Auditoría 2026-10-25").
 
 1. `pip install -r requirements-dev.txt` (local).
 1b. `python scripts/ml_health.py --refresh-cache` → salud del modelo VIVO fuera de
@@ -536,19 +554,21 @@ El usuario puede sobreescribir fees con valores reales una vez que la posición 
 
 ## IA / Análisis LLM
 
-`analysis/ai_analyzer.py` envía las **top 5 oportunidades por Net APR predicho** (`model_prediction`,
-fallback a `score` si el modelo no predijo; excluye `model_prediction <= 0`) a **Gemini 3.1 Flash-Lite**
-(`gemini-3.1-flash-lite`, vía `google-genai`).
+**Bajo demanda** (desde 2026-10-25; antes corría en cada scan sobre el top-5). Botón "Analizar con IA"
+por oportunidad y por posición. **El veredicto es determinista; Gemini 3.1 Flash-Lite solo lo explica**
+(`gemini-3.1-flash-lite`, `google-genai`). Motivo: las reglas fijas del prompt viejo (`z>=2 → EVITAR`)
+contradecían al modelo — los picos Alpha rentables tienen z alto — y casi siempre salía EVITAR.
 
-- **Señal:** `COMPRAR` / `MANTENER` / `EVITAR` + confidence 1–10 + razonamiento en 40–60 palabras
-- **Prompt:** alineado al modelo ML — `napr` (Net APR predicho) es la métrica principal; flag `mdl`
-  indica si `napr` viene del modelo (1, neto) o es un APR bruto sustituto (0, modelo no predijo). Incluye
-  `mode`, `sym`, momentum, z-score, percentil, consistencia, fee drag, grade.
-- **JSON mode:** `response_mime_type="application/json"`; parseo en `_parse_ai_response`.
-- **Rate limiting:** 3 API keys rotadas (`GEMINI_API_KEY_1/2/3`). El free tier de Gemini es ajustado
-  (~10 RPM, ~250K TPM, RPD según AI Studio); **sin fallback a otro proveedor** — ante 429/timeout el
-  análisis IA degrada a vacío (no rompe el scan ni el endpoint `/api/positions/ai`).
-- El prompt está calibrado para no penalizar dos veces lo que el modelo/scoring ya penaliza (z-score, momentum).
+- **Oportunidad** (`POST /api/opportunities/<id>/ai`, body `{capital}`, caché 30 min por settlement):
+  `opportunity_verdict` → `ENTRAR` (Net APR predicho ≥ `ENTER_NAPR`=5), `ESPERAR` (0–5), `NO ENTRAR`
+  (≤0), `SIN MODELO`. Devuelve `facts` con tabla por leverage 1/2/3x (`roc` sobre capital = napr·L/(L+1),
+  `usd_d`, `liq`) y `lev_rec` (Alpha 2x, CEX 3x, `RECOMMENDED_LEV`); Gemini agrega `analysis`, `risks`,
+  `watch`, `leverage`.
+- **Posición** (`POST /api/positions/ai`, body opcional `{position_id}`): `position_verdict` → `CERRAR`
+  (dos pagos seguidos ≤0 o `switch_analyzer` = SWITCH), `VIGILAR` (último pago ≤0 o >30 d), `MANTENER`.
+  El LLM no puede cambiar la señal (se sobrescribe tras parsear).
+- Sin API key o ante 429/timeout se devuelve el veredicto con su razón (nunca vacío). 3 keys rotadas
+  (`GEMINI_API_KEY_1/2/3`).
 
 ---
 
@@ -573,6 +593,7 @@ COINGLASS_API_KEY     # Datos adicionales de mercado
 ENABLED_EXCHANGES     # Default: binance (foco Binance desde 2026-10-22; otros CEX por env)
 ARBITRAGE_MODES       # Default: spot_perp (cross_exchange por env; su auto-ejecución está bloqueada)
 DEFI_ENABLED          # =1 → reactiva el scan DeFi (default apagado)
+MAX_LEVERAGE          # tope de leverage de /api/execute_open (default 3; decisión 2026-10-25)
 AUTO_UNWIND_ON_LIQ    # =1 → si el short desaparece (liquidado) el vigilante vende el spot (default: solo alerta CRITICAL)
 TRADE_SANDBOX         # =1 → auto-ejecución en test (Binance: demo trading; resto: set_sandbox_mode)
 ONCHAIN_ENABLED       # =1 → habilita la pierna spot on-chain BSC (tokens solo-Alpha)
@@ -613,6 +634,10 @@ El proceso corre indefinidamente — varias estructuras in-memory fueron acotada
 - **`current_market_rate` para cross-exchange**: se recomputa desde las dos piernas (`short_fr − long_fr`) en lugar de buscar por un único campo `"fr"`.
 - **`avg_rate` zero-safe**: la comparación usa `if avg_rate is not None and avg_rate != 0` en lugar de `or` para preservar valores legítimamente iguales a cero.
 - **Switch analysis es on-demand**: se llama desde `/api/positions/ai`, no desde el loop del monitor.
+- **Gate de rotación con modelo** (`rotation_gain_ok`, desde 2026-10-25): SWITCH solo si
+  (napr_alt − napr_actual_ajustado)·14 d > fee de entrada de la alternativa + 2 % del nocional
+  (`ROTATION_MARGIN`). Backtest `reports/rotation_policy_20261025.md`: margen 0 → 28.0 % anual (pierde
+  por fees), sin rotar 29.3 %, margen 2 % → 34.6 %. Con modelo no aplica el atajo por `health_score < 30`.
 
 ---
 
