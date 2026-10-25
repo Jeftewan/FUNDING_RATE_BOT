@@ -152,7 +152,7 @@ def symbol_rows(sym: str, start_ms: int, end_ms: int) -> list:
 def load_existing() -> dict:
     if not OUT_CSV.exists():
         return {}
-    with OUT_CSV.open(newline="") as f:
+    with OUT_CSV.open(newline="", encoding="utf-8") as f:
         return {(r["symbol"], r["exchange"], int(r["ts_hour"])): r for r in csv.DictReader(f)}
 
 
@@ -185,7 +185,7 @@ def main():
 
     OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     tmp = OUT_CSV.with_suffix(".tmp")
-    with tmp.open("w", newline="") as f:
+    with tmp.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
         w.writeheader()
         for k in sorted(merged):
