@@ -41,3 +41,12 @@ def test_parse_ai_response_fenced_json():
     txt = '```json\n{"analyses":[{"id":"1","signal":"cerrar","confidence":7,"analysis":"x"}]}\n```'
     r = ai._parse_ai_response(txt, ("MANTENER", "CERRAR", "VIGILAR"), "VIGILAR")
     assert r["1"]["signal"] == "CERRAR"
+
+
+def test_rotation_gain_rule():
+    from analysis.switch_analyzer import rotation_gain_ok
+    # +10 pts de APR (regla vieja) ya no alcanza para rotar
+    assert not rotation_gain_ok(30.0, 40.0, "cex", "cex")
+    # la mejora debe pagar fee + 2 % del nocional en 14 d (≈ +60 pts)
+    assert rotation_gain_ok(30.0, 110.0, "cex", "cex")
+    assert not rotation_gain_ok(30.0, 85.0, "bsc", "bsc")

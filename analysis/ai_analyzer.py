@@ -355,9 +355,8 @@ def position_verdict(slim: dict) -> dict:
     if len(lr) >= 2 and lr[-1] <= 0 and lr[-2] <= 0:
         return {"signal": "CERRAR", "reason": "Dos pagos seguidos sin cobrar."}
     sw = slim.get("sw") or {}
-    if (sw.get("rec") == "SWITCH" and sw.get("val", 0) > 0 and sw.get("beh", 999) < 24
-            and sw.get("alt_napr", 0) > slim.get("apr", 0)):
-        return {"signal": "CERRAR", "reason": f"Rotar a {sw.get('alt')}: mejora neta tras el costo del cambio."}
+    if sw.get("rec") == "SWITCH":           # regla de rotación calibrada (switch_analyzer.rotation_gain_ok)
+        return {"signal": "CERRAR", "reason": f"Rotar a {sw.get('alt')}: la mejora paga fee + 2 % del nocional en 14 d."}
     if lr and lr[-1] <= 0:
         return {"signal": "VIGILAR", "reason": "Último pago ≤ 0: cerrar si el próximo también lo es."}
     if slim.get("h", 0) > 30 * 24:

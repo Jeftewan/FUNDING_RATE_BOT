@@ -39,7 +39,23 @@ log = logging.getLogger("bot")
 # se exige que la alternativa supere al actual por ≥10 pts de net APR para no
 # rotar posiciones persiguiendo ruido.
 SWITCH_MIN_NET_APR = 8.0
-SWITCH_NET_APR_MARGIN = 10.0
+SWITCH_NET_APR_MARGIN = 10.0     # solo informativo; el gate con modelo es rotation_gain_ok
+# Rotación calibrada por backtest (reports/rotation_policy_20261025.md, 12 m CEX ∪ Alpha):
+# rotar solo si la mejora de Net APR predicho en el horizonte del label (14 d) paga la fee de
+# entrada de la alternativa + 2 % del nocional. Margen 0 pierde por fees (28.0 % vs 29.3 % sin
+# rotar); margen 2 % da 34.6 %. A la posición abierta se le devuelve la fee de entrada que su
+# predicción descuenta (ya la pagó).
+ROTATION_HORIZON_DAYS = 14
+ROTATION_MARGIN = 0.02
+FEE_ROUNDTRIP = {"bsc": 0.0041, "cex": 0.0030}
+
+
+def rotation_gain_ok(cur_net_apr: float, alt_net_apr: float, cur_venue: str, alt_venue: str) -> bool:
+    fee_cur = FEE_ROUNDTRIP["bsc" if cur_venue == "bsc" else "cex"]
+    fee_alt = FEE_ROUNDTRIP["bsc" if alt_venue == "bsc" else "cex"]
+    cur_adj = cur_net_apr + fee_cur * 365 / ROTATION_HORIZON_DAYS * 100
+    gain = (alt_net_apr - cur_adj) / 100 / 365 * ROTATION_HORIZON_DAYS
+    return gain > fee_alt + ROTATION_MARGIN
 # Fallback (modelo caído): umbrales viejos en unidades de score 0–100.
 SWITCH_MIN_SCORE = 55
 SWITCH_SCORE_MARGIN = 10
@@ -518,6 +534,7 @@ def analyze_switch(position: dict, opportunities: list,
             "mode": opp_mode,
             "score": opp_score,
             "net_apr": opp.get("model_prediction"),
+            "spot_venue": opp.get("spot_venue", ""),
             "apr": opp.get("apr", 0) or round(alt_apr, 1),
             "switch_cost": switch_cost["total_cost"],
             "projected_gain_new": projected_new,
@@ -546,11 +563,13 @@ def analyze_switch(position: dict, opportunities: list,
     # los umbrales viejos.
     alt_clears_floor = False
     alt_beats_current = False
+    use_model = bool(best) and best.get("net_apr") is not None
     if best:
-        if best.get("net_apr") is not None:
+        if use_model:
             cur_metric = current_net_apr if current_net_apr is not None else 0
             alt_clears_floor = best["net_apr"] >= SWITCH_MIN_NET_APR
-            alt_beats_current = best["net_apr"] > cur_metric + SWITCH_NET_APR_MARGIN
+            alt_beats_current = rotation_gain_ok(cur_metric, best["net_apr"],
+                                                 position.get("spot_venue", ""), best.get("spot_venue", ""))
         else:
             alt_clears_floor = best["score"] >= SWITCH_MIN_SCORE
             alt_beats_current = best["score"] > current_score + SWITCH_SCORE_MARGIN
@@ -562,8 +581,9 @@ def analyze_switch(position: dict, opportunities: list,
         elif best["break_even_h"] < 48 and alt_clears_floor:
             recommendation = "CONSIDER"
 
-    # Factor in position health: if health is very low, lower threshold for switching
-    if position_health["health_score"] < 30 and best:
+    # Factor in position health: if health is very low, lower threshold for switching.
+    # Con modelo manda la regla calibrada (la salida por pagos ≤ 0 ya cubre la posición débil).
+    if position_health["health_score"] < 30 and best and not use_model:
         if (best["adjusted_switch_value"] > 0 and
                 best["break_even_h"] < 48 and alt_clears_floor):
             recommendation = "SWITCH"
