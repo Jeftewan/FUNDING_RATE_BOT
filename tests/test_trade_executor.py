@@ -87,7 +87,8 @@ class FakeEx:
             fee_ccy, fee = "USDT", qty * px * 0.0005
             self.short += qty if o["side"] == "sell" else -qty
         self.trades.append({"order": o["id"], "amount": qty, "price": px, "cost": qty * px,
-                            "fee": {"cost": fee, "currency": fee_ccy}})
+                            "fee": {"cost": fee, "currency": fee_ccy}, "side": o["side"],
+                            "symbol": o["symbol"], "timestamp": len(self.trades)})
 
     def fetch_order(self, oid, s):
         o = self.orders[oid]
@@ -100,8 +101,10 @@ class FakeEx:
         if o["status"] == "open":
             o["status"] = "canceled"
 
-    def fetch_my_trades(self, s, params=None):
+    def fetch_my_trades(self, s, since=None, limit=None, params=None):
         oid = (params or {}).get("orderId")
+        if oid is None:
+            return [dict(t) for t in self.trades if t["symbol"] == s]
         return [dict(t) for t in self.trades if t["order"] == oid]
 
     def fetch_balance(self):

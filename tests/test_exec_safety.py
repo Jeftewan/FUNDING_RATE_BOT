@@ -391,9 +391,9 @@ def bsc_env(monkeypatch):
     monkeypatch.setattr(te, "_ensure_markets", lambda cl: None)
     monkeypatch.setattr(te.time, "sleep", lambda s: None)
 
-    def close(real_impact, oracle_impact, short, qty=500.0):
+    def close(real_impact, oracle_impact, short, qty=500.0, held=None):
         box["agg"] = agg = _OracleAgg(c, real_impact, oracle_impact)
-        c.bal[t.TOKEN["address"].lower()] = ob.to_wei(qty, 18)
+        c.bal[t.TOKEN["address"].lower()] = ob.to_wei(qty if held is None else held, 18)
         ex.short = short
         pos = {"mode": "spot_perp", "symbol": "XYZ", "exchange": "Binance", "spot_venue": "bsc",
                "spot_qty": qty, "perp_qty": qty, "entry_price": 2.0}
@@ -439,3 +439,84 @@ def test_failed_close_after_sl_fill_records_perp_leg(env, monkeypatch):
         assert p.realized_price_pnl == pytest.approx(-60.0)
         assert p.protection_json["perp"]["status"] == "filled"
         assert p.protection_json["spot"]["status"] == "canceled"    # el reintento no la cancela
+
+
+# ── Cierre de JCT #46 (2026-10-24): short recomprado fuera de basyo ─────────────
+def _jct_state(ex, buyback_px=130.0):
+    """Venta límite del spot llenada y short recomprado a mano en la web (sin el SL)."""
+    ex.algo[ex.algo_of("STOP_MARKET")]["status"] = "canceled"   # el usuario movió el SL
+    ex.fill_spot_limit(1.0)
+    ex.book["BTC/USDT:USDT"] = (buyback_px - 0.1, buyback_px)
+    ex.create_order("BTC/USDT:USDT", "market", "buy", ex.short, None, {"clientOrderId": "web_x"})
+    assert ex.short == pytest.approx(0)
+
+
+def test_close_books_perp_bought_back_outside_basyo(sex):
+    sex.spot_bal["BTC"], sex.short, sex.liq = 2.0, 2.0, 148.0
+    prot = te.place_protection(CREDS, POS)
+    _jct_state(sex)
+    res = te.execute_close(CREDS, {**POS, "protection": prot, "spot_entry_price": 100.0})
+    assert res["ok"] and res["complete"] and not res.get("price_pnl_unknown"), res
+    spot_px = prot["spot_price"]
+    # Ambas piernas: (venta límite − entrada)·2 + (entrada perp − recompra web)·2.
+    assert res["perp_external"]["gross"] == pytest.approx(2.0)
+    assert res["price_pnl"] == pytest.approx((spot_px - 100.0) * 2 + (100.0 - 130.0) * 2)
+    assert res["exit_fees_usd"] >= 130.0 * 2 * 0.0005 - 1e-9          # comisión de la recompra
+
+
+def test_close_price_pnl_unknown_when_buyback_not_found(sex):
+    sex.spot_bal["BTC"], sex.short, sex.liq = 2.0, 2.0, 148.0
+    prot = te.place_protection(CREDS, POS)
+    sex.algo[sex.algo_of("STOP_MARKET")]["status"] = "canceled"
+    sex.fill_spot_limit(1.0)
+    sex.short = 0.0                                       # desapareció sin trades legibles
+    res = te.execute_close(CREDS, {**POS, "protection": prot, "spot_entry_price": 100.0})
+    assert res["ok"] and res["price_pnl"] is None and res["price_pnl_unknown"], res
+
+
+def test_bsc_dust_left_after_limit_fill_still_buys_back_short(bsc_env, monkeypatch):
+    close, ex = bsc_env
+    from exchanges import onchain_bsc as ob
+
+    def revert(self, *a, **k):
+        raise te.ExecError("RPC eth_estimateGas: execution reverted: Return amount is not enough")
+    monkeypatch.setattr(ob.BscSpotLeg, "trade", revert)
+    res = close(real_impact=0.0, oracle_impact=None, short=500, held=1e-11)
+    assert res["ok"] and res["complete"] and not res.get("partial_note"), res
+    assert ex.short == pytest.approx(0)                   # el short no queda abierto y sin SL
+
+
+def test_job_close_jct_records_both_legs(env, monkeypatch):
+    ex = SafeEx()
+    ex.liq = 148.0
+    app, runner, uid = _env_with(monkeypatch, env, ex)
+    pos_id = _open(runner, app, uid)
+    from core.db_models import UserHistory, UserPosition
+    with app.app_context():
+        p = UserPosition.query.get(pos_id)
+        spot_entry, perp_entry, qs, qp = p.spot_entry_price, p.entry_price, p.spot_qty, p.perp_qty
+        limit_px = p.protection_json["spot_price"]
+    _jct_state(ex)
+    monkeypatch.setattr(runner, "_alert", lambda *a, **k: None)
+    status, _, _, err = _run_sync(runner, app, uid, "close", {"position_id": pos_id, "symbol": "BTC"})
+    assert status == "done", err
+    with app.app_context():
+        h = UserHistory.query.filter_by(user_id=uid, symbol="BTC").order_by(UserHistory.id.desc()).first()
+        buy = next(t for t in ex.trades if t["side"] == "buy" and t["symbol"] == "BTC/USDT:USDT"
+                   and ex.orders[t["order"]].get("clientOrderId") == "web_x")
+        expected = (limit_px - spot_entry) * qs + (perp_entry * qp - buy["cost"] * qp / buy["amount"])
+        assert h.price_pnl == pytest.approx(expected, rel=1e-6)
+
+
+def test_real_net_breakdown_unknown_external_buyback_is_none():
+    from execution.jobs import real_net_breakdown
+
+    class Row:
+        realized_price_pnl = 438.44                        # solo la pierna spot (JCT #46)
+        entry_slippage_usd = None
+        entry_basis_pct = None
+        payments_json = [{"kind": "auto_close_partial", "price_pnl_unknown": "no encontrada"}]
+    assert real_net_breakdown(Row(), {"price_pnl": None})["price_pnl"] is None
+    Row.payments_json = []
+    assert real_net_breakdown(Row(), {"price_pnl": None, "price_pnl_unknown": "x"})["price_pnl"] is None
+    assert real_net_breakdown(Row(), {"price_pnl": -380.9})["price_pnl"] == pytest.approx(57.54)
