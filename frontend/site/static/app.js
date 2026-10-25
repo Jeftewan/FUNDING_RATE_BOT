@@ -633,10 +633,12 @@ function renderOpps(data) {
     // Net APR predicho por el modelo ML — número principal y discriminante.
     // Fallback al APR estimado si el modelo no predijo (model_prediction null).
     const netApr = o.model_prediction != null ? o.model_prediction : o.apr;
-    // Ganancia neta esperada en 14 d por cada $1.000 de CAPITAL a 1x. El APR del
-    // modelo es sobre el nocional perp; a 1x $1.000 = $500 spot + $500 de margen
-    // (nocional $500) → la mitad. Con apalancamiento L el nocional es L/(L+1).
-    const gain14 = o.model_prediction != null ? (o.model_prediction / 100) * 500 * 14 / 365 : null;
+    // Ganancia neta esperada en 14 d por cada $1.000 de CAPITAL al leverage
+    // recomendado. El APR del modelo es sobre el nocional perp; con leverage L el
+    // nocional es C·L/(L+1). Recomendado por backtest con seguros
+    // (reports/leverage_study_20261025_*.md): Alpha 2x, spot CEX 3x.
+    const levRec = o.spot_venue === 'bsc' ? 2 : 3;
+    const gain14 = o.model_prediction != null ? (o.model_prediction / 100) * 1000 * levRec / (levRec + 1) * 14 / 365 : null;
 
     const isExc = o.is_exceptional;
     const excReasons = (o.exceptional_reasons || []).join(' · ');
@@ -658,7 +660,7 @@ function renderOpps(data) {
       </div>
 
       <div class="opp-stats">
-        <div class="opp-stat" title="Ganancia neta esperada en 14 días por $1.000 de capital a 1x (modelo, descuenta fees)"><span class="label">Neto 14d 1K</span><span class="value ${gain14 == null ? '' : (gain14 >= 0 ? 'green' : 'red')}">${gain14 == null ? '—' : '$' + gain14.toFixed(2)}</span></div>
+        <div class="opp-stat" title="Ganancia neta esperada en 14 días por $1.000 de capital a ${levRec}x (modelo, descuenta fees)"><span class="label">Neto 14d 1K ${levRec}x</span><span class="value ${gain14 == null ? '' : (gain14 >= 0 ? 'green' : 'red')}">${gain14 == null ? '—' : '$' + gain14.toFixed(2)}</span></div>
         <div class="opp-stat"><span class="label">FR</span><span class="value green">${frPct}%</span></div>
         <div class="opp-stat"><span class="label">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
         <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
@@ -679,7 +681,7 @@ function renderOpps(data) {
 
       <div class="opp-actions">
         <label class="inp-label">Capital<input type="number" id="cap-${i}" placeholder="USD" class="inp-sm" style="width:70px"></label>
-        <label class="inp-label">Apal.<input type="number" id="lev-${i}" placeholder="1x" value="1" min="1" max="50" class="inp-sm" style="width:40px"></label>
+        <label class="inp-label">Apal.<input type="number" id="lev-${i}" placeholder="1x" value="${levRec}" min="1" max="3" class="inp-sm" style="width:40px" title="Recomendado ${levRec}x (backtest con seguros); máximo 3x"></label>
         <button class="btn btn-calc" onclick="calcEst('${o._id}',${i})">Calc</button>
         <button class="btn btn-enter" onclick="enterPosition('${o._id}',${i})">Entrar</button>
         ${execButton(o, i)}
@@ -707,7 +709,7 @@ function renderOpps(data) {
       const capEl = document.getElementById('cap-' + i);
       if (capEl) capEl.value = cached.capVal;
       const levEl = document.getElementById('lev-' + i);
-      if (levEl && cached.levVal > 1) levEl.value = cached.levVal;
+      if (levEl && cached.levVal) levEl.value = cached.levVal;
     }
   });
 }

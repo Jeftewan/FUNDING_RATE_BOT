@@ -799,6 +799,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         leverage = max(1, int(data.get("leverage", 1)))
         dry_run = bool(data.get("dry_run", False))
         twap = _parse_twap(data.get("twap"))
+        if leverage > config.MAX_LEVERAGE:
+            return jsonify({"ok": False, "msg": f"Apalancamiento máximo permitido: {config.MAX_LEVERAGE}x"})
 
         uid = get_current_user_id()
         if not uid or not get_db_persist():
