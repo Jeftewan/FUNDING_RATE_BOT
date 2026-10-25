@@ -16,16 +16,17 @@ class ProtEx(FakeEx):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.liq = None
+        self.mark = None
         self.algo = {}
         self.calls = []
 
     def create_order(self, s, typ, side, amount, price=None, params=None):
         params = params or {}
         self.calls.append((s, typ, side, amount, price, dict(params)))
-        if typ == "STOP_MARKET":
+        if typ in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
             self.n += 1
             oid = f"algo{self.n}"
-            self.algo[oid] = {"id": oid, "status": "open", "info": {}, "params": dict(params)}
+            self.algo[oid] = {"id": oid, "status": "open", "info": {}, "params": dict(params), "type": typ}
             return dict(self.algo[oid])
         o = super().create_order(s, typ, side, amount, price, params)
         b, a = self.book[s]
@@ -56,17 +57,29 @@ class ProtEx(FakeEx):
         out = super().fetch_positions(syms)
         for p in out:
             p["liquidationPrice"] = self.liq
+            p["markPrice"] = self.mark
         return out
 
     # helpers de test
-    def fire_sl(self):
-        oid = next(iter(self.algo))
+    def fire_sl(self, oid=None):
+        oid = oid or next(iter(self.algo))
         self.n += 1
         fill_id = str(self.n)
         self.orders[fill_id] = {"id": fill_id, "symbol": "BTC/USDT:USDT", "type": "market", "side": "buy",
                                 "amount": self.short, "price": None, "filled": 0.0, "status": "open"}
         self._fill(self.orders[fill_id], self.short)
         self.algo[oid].update(status="closed", info={"actualOrderId": fill_id})
+
+    def fill_spot_limit(self, frac=1.0):
+        """Llena la venta límite spot en reposo (la base ya estaba bloqueada)."""
+        o = next(o for o in self.orders.values() if o.get("hold"))
+        qty = o["amount"] * frac
+        self.spot_bal["BTC"] += qty
+        o["locked"] -= qty
+        self._fill(o, qty)
+
+    def algo_of(self, typ):
+        return next(oid for oid, a in self.algo.items() if a["type"] == typ)
 
 
 @pytest.fixture
@@ -86,8 +99,9 @@ POS = {"id": 1, "mode": "spot_perp", "symbol": "BTC", "exchange": "Binance", "en
 
 
 # ── Seguros: colocación ─────────────────────────────────────────────────────
-def test_protection_price_is_75pct_towards_liquidation():
-    assert te.protection_price(100, 150) == pytest.approx(137.5)
+def test_protection_price_is_80pct_towards_liquidation():
+    assert te.protection_price(100, 150) == pytest.approx(140)
+    assert te.protection_spot_price(140) == pytest.approx(140 * (1 - te.PROTECTION_SPOT_OFFSET))
 
 
 def test_place_protection_uses_real_liq_and_places_both_legs(pex):
@@ -95,14 +109,24 @@ def test_place_protection_uses_real_liq_and_places_both_legs(pex):
     prot = te.place_protection(CREDS, POS)
     assert prot["ok"] and not prot["errors"]
     assert prot["liq_source"] == "exchange"
-    assert prot["sl_price"] == pytest.approx(100 + 0.75 * 48)
+    assert prot["sl_price"] == pytest.approx(100 + 0.80 * 48)
     sl = next(c for c in pex.calls if c[1] == "STOP_MARKET")
     assert sl[2] == "buy" and sl[3] is None
     assert sl[5]["closePosition"] is True and sl[5]["workingType"] == "MARK_PRICE"
     assert sl[5]["triggerPrice"] == prot["sl_price"] and "reduceOnly" not in sl[5]
     tp = next(c for c in pex.calls if c[1] == "limit")
-    assert tp[2] == "sell" and tp[3] == pytest.approx(2.0) and tp[4] == prot["sl_price"]
+    # la venta spot va un poco por debajo del SL: en una subida sale primero el spot
+    assert tp[2] == "sell" and tp[3] == pytest.approx(2.0) and tp[4] == prot["spot_price"]
+    assert prot["spot_price"] == pytest.approx(prot["sl_price"] * (1 - te.PROTECTION_SPOT_OFFSET), abs=0.01)
+    assert prot["spot_price"] < prot["sl_price"]
     assert prot["perp"]["status"] == "open" and prot["spot"]["venue"] == "binance"
+
+
+def test_place_protection_without_spot_only_places_sl(pex):
+    pex.short, pex.liq = 2.0, 148.0
+    prot = te.place_protection(CREDS, {**POS, "spot_qty": 0.0})
+    assert prot["ok"] and not prot["errors"] and prot["spot"] is None
+    assert prot["perp"]["status"] == "open"
 
 
 def test_place_protection_falls_back_to_estimate(pex):
@@ -134,11 +158,14 @@ def test_close_after_sl_fired_only_sells_spot(pex):
     prot = te.place_protection(CREDS, POS)
     pex.fire_sl()
     assert pex.short == pytest.approx(0)
+    n_calls = len(pex.calls)
     res = te.execute_close(CREDS, {**POS, "protection": prot})
     assert res["ok"] and res["complete"], res
     assert res["perp_closed"] == 0 and res["spot_sold"] == pytest.approx(2.0, abs=0.001)
     assert res["protection_filled"]["perp_filled"] == pytest.approx(2.0)
     assert res["exit_fees_usd"] > 0
+    # spot desnudo: taker directo, sin ventana maker
+    assert [c[1] for c in pex.calls[n_calls:]] == ["market"]
 
 
 # ── Agregador DEX: fallback por región ──────────────────────────────────────
@@ -293,3 +320,109 @@ def test_watcher_renews_bsc_limit_before_expiry(env, monkeypatch):
     assert canceled == [11]
     assert saved[0]["spot"]["id"] == 12 and saved[0]["spot"]["status"] == "open"
     assert "PROTECTION_RENEWED" in alerts
+
+
+# ── Vigilante: caso B (short suelto) y modo caliente ────────────────────────
+def _opened_watcher(env, monkeypatch):
+    app, runner, ex, uid = _with_prot_ex(monkeypatch, env)
+    status, _, pos_id, err = _run_sync(runner, app, uid, "open",
+                                       {"symbol": "BTC", "opportunity": OPP, "capital": 300, "leverage": 2})
+    assert status == "done", err
+    from execution.protection import ProtectionWatcher
+    submitted, alerts = [], []
+    monkeypatch.setattr(runner, "submit", lambda uid, kind, p: submitted.append((kind, p)) or 99)
+    monkeypatch.setattr(runner, "_alert", lambda uid, sym, msg, **k: alerts.append(k.get("typ")))
+    return app, runner, ex, uid, pos_id, ProtectionWatcher(runner), submitted, alerts
+
+
+def _prot(app, pos_id):
+    from core.db_models import UserPosition
+    with app.app_context():
+        row = UserPosition.query.get(pos_id)
+        return dict(row.protection_json), row.spot_qty, row.perp_qty, row.realized_price_pnl
+
+
+def test_watcher_full_spot_fill_leaves_short_running_with_tp(env, monkeypatch):
+    app, runner, ex, uid, pos_id, w, submitted, alerts = _opened_watcher(env, monkeypatch)
+    prot0, spot0, perp0, _ = _prot(app, pos_id)
+    ex.fill_spot_limit()
+    w.tick()
+    assert not submitted                              # no recompra al instante
+    prot, spot_qty, perp_qty, pnl = _prot(app, pos_id)
+    assert prot["status"] == "runner" and "SPOT_TP_RUNNER" in alerts
+    assert prot["perp"]["status"] == "open"           # el SL duro sigue vivo
+    assert prot["spot"]["status"] == "filled" and prot["spot"]["fill_qty"] == pytest.approx(spot0)
+    assert spot_qty == pytest.approx(0) and perp_qty == pytest.approx(perp0)
+    assert pnl is not None
+    tp = ex.algo[ex.algo_of("TAKE_PROFIT_MARKET")]
+    assert tp["params"]["closePosition"] is True
+    assert tp["params"]["triggerPrice"] == pytest.approx(prot0["spot_price"] * (1 - te.RUNNER_RULES["binance"][0]), abs=0.01)
+    assert tp["type"] == "TAKE_PROFIT_MARKET" and prot["tp"]["max_secs"] == te.RUNNER_RULES["binance"][1]
+
+    w.tick()
+    assert not submitted                              # nada nuevo: sigue suelto
+    ex.fire_sl(ex.algo_of("TAKE_PROFIT_MARKET"))      # tocó el take profit
+    w.tick()
+    assert submitted and submitted[0][1]["trigger"] == "protection"
+    assert _prot(app, pos_id)[0]["triggered_by"] == "tp"
+
+
+def test_runner_close_job_cancels_sl_and_closes(env, monkeypatch):
+    app, runner, ex, uid, pos_id, w, submitted, alerts = _opened_watcher(env, monkeypatch)
+    ex.fill_spot_limit()
+    w.tick()
+    monkeypatch.undo()                                # submit real para el cierre
+    monkeypatch.setattr(te, "_build_client", lambda *a, **k: ex)
+    ex.fire_sl(ex.algo_of("TAKE_PROFIT_MARKET"))
+    status, res, _, err = _run_sync(runner, app, uid, "close", {"position_id": pos_id, "symbol": "BTC"})
+    assert status == "done", err
+    assert ex.short == pytest.approx(0, abs=1e-9)
+    assert ex.algo[ex.algo_of("STOP_MARKET")]["status"] == "canceled"
+    from core.db_models import UserPosition
+    with app.app_context():
+        assert UserPosition.query.get(pos_id).status != "active"
+
+
+def test_runner_times_out_and_buys_back(env, monkeypatch):
+    app, runner, ex, uid, pos_id, w, submitted, alerts = _opened_watcher(env, monkeypatch)
+    monkeypatch.setattr(te, "RUNNER_RULES", {"binance": (0.05, 0)})
+    ex.fill_spot_limit()
+    w.tick()
+    assert _prot(app, pos_id)[0]["status"] == "runner"
+    w.tick()
+    assert submitted and _prot(app, pos_id)[0]["triggered_by"] == "runner_timeout"
+
+
+def test_partial_spot_fill_still_closes(env, monkeypatch):
+    app, runner, ex, uid, pos_id, w, submitted, alerts = _opened_watcher(env, monkeypatch)
+    ex.fill_spot_limit(0.5)
+    w.tick()
+    assert submitted and _prot(app, pos_id)[0]["triggered_by"] == "spot"
+
+
+def test_runner_falls_back_to_close_if_tp_fails(env, monkeypatch):
+    app, runner, ex, uid, pos_id, w, submitted, alerts = _opened_watcher(env, monkeypatch)
+    ex.fill_spot_limit()
+
+    def boom(*a, **k):
+        raise RuntimeError("rechazada")
+    monkeypatch.setattr(te, "place_runner_tp", boom)
+    w.tick()
+    assert submitted and _prot(app, pos_id)[0]["triggered_by"] == "spot"
+
+
+def test_watcher_goes_hot_near_sl(env, monkeypatch):
+    app, runner, ex, uid, pos_id, w, submitted, alerts = _opened_watcher(env, monkeypatch)
+    sl = _prot(app, pos_id)[0]["sl_price"]
+    ex.mark = 100.0
+    w.tick()
+    assert w._hot is False
+    ex.mark = sl * 0.99
+    w.tick()
+    assert w._hot is True and not submitted
+
+
+def test_runner_rule_depends_on_spot_venue():
+    assert te.runner_rule({"spot_venue": "bsc"}) == te.RUNNER_RULES["bsc"]
+    assert te.runner_rule({"spot_venue": ""}) == te.RUNNER_RULES["binance"]
+    assert te.RUNNER_RULES["bsc"][0] > te.RUNNER_RULES["binance"][0]

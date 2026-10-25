@@ -283,12 +283,12 @@ class JobRunner:
         a poner sobre lo que queda abierto."""
         from exchanges import trade_executor as texec
         prot = pos.get("protection") or {}
-        if prot.get("status") != "active" or (pos.get("exchange") or "").lower()                 not in texec.PROTECTION_EXCHANGES:
+        if prot.get("status") not in ("active", "runner") or (pos.get("exchange") or "").lower()                 not in texec.PROTECTION_EXCHANGES:
             return
         try:
             wallet, _ = self._bsc_args(uid, pos, token)
             st = texec.protection_status(creds, pos, wallet)
-            if "open" in (st["perp"], st["spot"]):
+            if "open" in (st["perp"], st["spot"], st.get("tp")):
                 return
         except Exception as e:
             log.warning(f"protection status pos={pos.get('id')}: {e}")
@@ -423,9 +423,11 @@ class JobRunner:
                 # El cierre ya canceló (o vio llenados) los seguros: que un reintento no
                 # intente cancelarlos otra vez. _restore_protection los repone si aplica.
                 prot = dict(row.protection_json)
-                for leg, key in (("perp", "perp_filled"), ("spot", "spot_filled")):
+                tp_filled = float(pf.get("tp_filled") or 0)
+                for leg, filled in (("perp", float(pf.get("perp_filled") or 0) - tp_filled),
+                                    ("tp", tp_filled), ("spot", float(pf.get("spot_filled") or 0))):
                     if (prot.get(leg) or {}).get("status") == "open":
-                        prot[leg] = {**prot[leg], "status": "filled" if pf.get(key) else "canceled"}
+                        prot[leg] = {**prot[leg], "status": "filled" if filled > 1e-12 else "canceled"}
                 row.protection_json = prot
             if add_fees:
                 row.exit_fees_real = (row.exit_fees_real or 0) + add_fees
