@@ -44,7 +44,18 @@ Estado del proyecto al **2026-10-25** (auditoría de rentabilidad, rama `feat/pr
   30.7 % anual OOS, `p_prod>0` a 2x. Su riesgo por pierna usa velas 1d (in-sample L3 ≥ L2); con velas 1m
   (`leverage_study.py`) 3x pierde en Alpha → se mantiene `RECOMMENDED_LEV` Alpha 2x.
 - **Señales nuevas** (`market_feature_snapshots`, ver sección de tablas): recolección horaria desde este PR.
-  El basis se calcula con spot CEX → vacío para tokens Alpha (pendiente: mid on-chain).
+  Tokens solo-Alpha: `spot_source='alpha'`, spot = VWAP de las 5 velas 1m on-chain (API pública de
+  Binance Alpha) que terminan en `ts_hour` contra el VWAP del perp en las mismas velas
+  (`market_features.alpha_basis`, idéntica en el backfill); `alpha_liquidity_usd` solo online. El precio
+  de la lista Alpha no se usa: se desvía hasta ~3 % de los trades on-chain. Tokens Alpha *offline* no
+  se recolectan (tampoco se operan).
+- **¿Modelo nuevo con las señales?** (`scripts/new_signals_probe.py`, `reports/new_signals_probe_20261025.md`,
+  30 d de backfill, 453 símbolos con 98 Alpha): el **basis** trae información que el modelo no tiene (IC
+  sobre su residuo 0.17, t 11), también `log_oi_usd` (0.13) y top long/short (−0.11); ΔOI y taker no.
+  Pero un HistGB entrenado con ~1 semana rinde peor que el vigente (IC 0.30 vs 0.43) y mezclar el
+  ranking con el basis sube el IC global +0.006 pero **baja el top-5 que se opera** (funding 7 d 0.60 % →
+  0.25 % fuera de muestra) → **no se cambia el modelo**. Re-probar con ≥ 3 meses de señales (~ene-2027)
+  añadiéndolas a `ml_v2.py`; para usarlas en prod la inferencia tendrá que leer `market_feature_snapshots`.
 - **Mercado 2026**: funding BTC 11.9 % (2024) → 5.1 % (2025) → 3.0 % (2026 YTD); BTC/ETH a 10x no
   sirve (≈3–5 % anual sobre capital). 5–10 %/mes sostenido no es realista; 3–4 %/mes en meses buenos.
 - **JCT `user_history.id=46`**: registraba `price_pnl=+438` (faltaba la recompra manual del short); real
@@ -169,7 +180,7 @@ frontend/               # Servicio Railway "web" (rootDirectory=/frontend)
 | `scan_cache` | Último resultado del scan (opportunities_json, defi_json) |
 | `funding_rate_snapshots` | 90 días de tasas históricas, dedup por (symbol, exchange, funding_ts) |
 | `score_snapshots` | Evolución del score por oportunidad (ventana rolling 30 entradas) |
-| `market_feature_snapshots` | Señales horarias por par Binance spot_perp (clave única symbol, exchange, `ts_hour` = inicio de la hora UTC en epoch s): tasa estimada del próximo pago, mark/index, basis spot–perp (mids del book), OI y Δ1h, taker buy/sell, top long/short (posición), intervalo y cap/floor, volatilidad 7 d. Retención 120 d. Ver "Señales de mercado horarias" |
+| `market_feature_snapshots` | Señales horarias por par Binance spot_perp (clave única symbol, exchange, `ts_hour` = inicio de la hora UTC en epoch s): tasa estimada del próximo pago, mark/index, basis spot–perp (mids del book; tokens Alpha: VWAP 1m on-chain), `spot_source`, `alpha_liquidity_usd`, OI y Δ1h, taker buy/sell, top long/short (posición), intervalo y cap/floor, volatilidad 7 d. Retención 120 d. Ver "Señales de mercado horarias" |
 
 Las migraciones se aplican automáticamente al arrancar vía `_run_migrations()`. Para agregar columnas a tablas existentes, añadir `ALTER TABLE ADD COLUMN IF NOT EXISTS` al array `migrations` en `core/database.py`.
 
