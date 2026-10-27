@@ -1,6 +1,28 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-10-25** (auditoría de rentabilidad, rama `feat/profit-research`).
+Estado del proyecto al **2026-10-27** (investigación de viabilidad de la estrategia, rama `research/strategy-viability-20261027`).
+
+---
+
+## Investigación 2026-10-27 — viabilidad a largo plazo de la estrategia
+
+`reports/strategy_research_20261027.md` (literatura + mercado) y `reports/strategy_viability_20261027.md`
+(`scripts/strategy_viability.py`, mismo motor que `rotation_study.py`). Complementa `research_funding_ml_20261009.md`.
+- **Tesis:** el carry de majors ya es ~tasa libre de riesgo (BTC 3–6 %, Sharpe del carry negativo en 2025;
+  Ethena/ETF/vaults lo arbitran). El edge vive en la **cola de altcoins/Alpha**, fuera del alcance del capital
+  grande (sin spot CEX, sin colateral en Portfolio Margin, pools chicos). En el simulador el edge Alpha **no
+  decae**: CEX ∪ Alpha 13–23 % anualizado por trimestre 2025Q3–2026Q3 (cota inferior); CEX solo ≈ 0 o negativo
+  desde 2025Q2. Walk-forward 13 m: 29.3 %, 14/14 meses positivos.
+- **Robustez:** sin los top-10 tokens por PnL sigue 20.4 % anual (top-3 = 26 % del PnL); 14/14 meses positivos;
+  fee Alpha ×2 → 26.0 % (la fee no es el cuello).
+- **Capacidad = el límite real:** impacto on-chain medido con cotizaciones KyberSwap (`depth_curve`, cache
+  `cache/binance/alpha_depth_YYYYMMDD.csv`): 1 vía 0.25 % a 1 k USD, 0.92 % a 5 k, 4.8 % a 26 k (token mediano).
+  Simulado: 29 % hasta ~10 k de capital, 24 % a 26 k, 20 % a 52 k, 14 % a 104 k, 4 % a 260 k → techo ~15 k
+  USD/año cerca de 100 k. Prioridad: sizing por curva de impacto del token + TWAP on-chain.
+- **No aplica al nicho:** Portfolio Margin (Alpha vive en la wallet BSC), Boros (solo BTC/ETH/BNB/SOL), fijar con
+  trimestrales. Sí: Simple Earn para USDT ocioso, tasa implícita de Boros como termómetro de régimen.
+- **Monitorear:** realizado 90 d < 10 % anual dos trimestres seguidos → revisar la tesis; oferta de tokens Alpha
+  con perp; fee Alpha real > 0.8 %; reglas de funding/Alpha de Binance; casos de spot desnudo.
 
 ---
 
