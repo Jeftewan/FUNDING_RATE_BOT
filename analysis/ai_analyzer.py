@@ -80,7 +80,10 @@ OPP_SYSTEM_PROMPT = (
     "esperados para el capital indicado, liq = % de subida que liquida el short), fees_usd, beh (horas "
     "para recuperar fees), con (% de pagos favorables), streak (pagos favorables seguidos), z (z-score "
     "de la tasa actual; alto es normal en picos y el modelo ya lo pondero), mom (momentum), lr (ultimas "
-    "tasas %), mins (minutos al proximo pago).\n\n"
+    "tasas %), mins (minutos al proximo pago), conf (% de probabilidad calibrada de que el APR neto "
+    "realizado sea >= 5 %; null = sin modelo de confianza), rango ([p10, p90] del APR neto realizado: la "
+    "tasa suele caer a la mitad tras entrar, por eso el realizado queda bajo napr con frecuencia), tier "
+    "(alta/baja) y cap_sug (capital sugerido segun la confianza).\n\n"
     "Responde SOLO JSON: {\"analysis\":\"50-80 palabras: que paga, por que el modelo da ese veredicto, "
     "con numeros\",\"risks\":[\"1-3 riesgos concretos y medibles\"],\"watch\":\"que vigilar y cuando salir "
     "(regla del negocio: cerrar tras dos pagos seguidos <= 0)\",\"leverage\":\"una frase que justifique "
@@ -136,6 +139,10 @@ def _opp_facts(opp: dict, capital: float) -> dict:
         "mom": ind.get("momentum_signal", "flat") or "flat",
         "lr": [round(r * 100, 4) for r in rates[-10:]],
         "mins": round(opp.get("mins_to_next", -1) or -1),
+        "conf": round(opp["confidence"] * 100) if opp.get("confidence") is not None else None,
+        "rango": [opp.get("apr_p10"), opp.get("apr_p90")] if opp.get("apr_p10") is not None else None,
+        "tier": opp.get("confidence_tier"),
+        "cap_sug": round(capital * opp["size_mult"]) if opp.get("size_mult") else None,
     }
 
 

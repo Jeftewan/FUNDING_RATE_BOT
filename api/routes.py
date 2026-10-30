@@ -116,6 +116,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "allowed_exchanges": us.get("allowed_exchanges", ""),
                     "min_net_apr": us.get("min_net_apr", 10),
                     "hide_negative": us.get("hide_negative", True),
+                    "min_confidence": us.get("min_confidence", 0),
                     "capital_source": us.get("capital_source", "manual"),
                     "real_balances": us.get("real_balances"),
                     "auto_transfer": us.get("auto_transfer", False),
@@ -161,6 +162,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 db_data["min_net_apr"] = float(data["min_net_apr"])
             if "hide_negative" in data:
                 db_data["hide_negative"] = bool(data["hide_negative"])
+            if "min_confidence" in data:
+                db_data["min_confidence"] = max(0.0, min(100.0, float(data["min_confidence"] or 0)))
 
             get_db_persist().save_user_config(uid, db_data)
 

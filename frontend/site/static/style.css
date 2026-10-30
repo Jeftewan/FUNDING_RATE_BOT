@@ -532,6 +532,9 @@ body {
 .opp-badge.D { background: var(--red-bg); color: var(--red); border: 1px solid #ef444444; }
 
 .opp-score { font-size: 11px; color: var(--text-white); font-weight: 700; }
+.conf-chip { font-size: 9px; padding: 2px 6px; border-radius: 10px; font-family: var(--font-ui); font-weight: 700; white-space: nowrap; line-height: 1; }
+.conf-chip.conf-high { color: var(--green); background: var(--green-bg); }
+.conf-chip.conf-low { color: var(--orange); background: var(--orange-bg); }
 
 /* Indicator badges */
 .ind-badge { font-size: 8px; padding: 2px 6px; border-radius: 10px; font-family: var(--font-ui); font-weight: 700; letter-spacing: .3px; white-space: nowrap; line-height: 1; }

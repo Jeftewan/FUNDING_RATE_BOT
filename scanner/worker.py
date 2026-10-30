@@ -1088,6 +1088,7 @@ class ScannerWorker:
                         momentum_signal=indicators.get("momentum_signal", "flat") if isinstance(indicators, dict) else "flat",
                         model_prediction=opp.get("model_prediction"),
                         model_version=ml_scorer.model_version,
+                        confidence=opp.get("confidence"),
                         scan_number=scan_count,
                         captured_at=now,
                     ))

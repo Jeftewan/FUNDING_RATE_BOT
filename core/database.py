@@ -108,6 +108,9 @@ def _run_migrations(db):
         # validar predicciones previas contra el resultado real (ml_train.py).
         "ALTER TABLE score_snapshots ADD COLUMN IF NOT EXISTS model_prediction FLOAT",
         "ALTER TABLE score_snapshots ADD COLUMN IF NOT EXISTS model_version VARCHAR(50)",
+        # Confianza por oportunidad (analysis/ml_confidence) + filtro de display.
+        "ALTER TABLE score_snapshots ADD COLUMN IF NOT EXISTS confidence FLOAT",
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS min_confidence FLOAT DEFAULT 0",
         # Binance live: cantidades reales por pierna, origen y earnings reales.
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS spot_qty FLOAT",
         "ALTER TABLE user_positions ADD COLUMN IF NOT EXISTS perp_qty FLOAT",

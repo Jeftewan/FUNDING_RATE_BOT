@@ -25,6 +25,30 @@ Estado del proyecto al **2026-10-25** (auditoría de rentabilidad, rama `feat/pr
 
 ---
 
+## Confianza por oportunidad (2026-10-30, rama `feat/opportunity-confidence`)
+
+Problema: en los picks del modelo vigente solo ~43 % llega al APR predicho (54 % pred vs 36 % real) y la
+tasa cae a ~la mitad desde el día 1 (reversión a la media). `scripts/confidence_study.py` →
+`reports/confidence_20261030.md` (WF mensual + hold-out, 97 picks, todos Alpha):
+- **No rankear ni filtrar por probabilidad**: rank por Q10/P(alcanzar)/cota inferior pierde 4–7 pp anual;
+  los gates no suman. La P(APR ≥ 5 %) de un clasificador sale ~0.9 en todo y **no discrimina** en WF.
+- **Sí sirve el ancho relativo** `(q90 − q10)/max(|q50|, 5)` para dimensionar: tier alta 1.25× / baja 0.75×
+  → 30.7 → 32.5 % anual, DD 0.34 → 0.26 %, 3/3 trimestres calibrados. Tier alta: APR real medio 55 %,
+  baja 9 %.
+- Bandas cuantílicas crudas cubren ~56 % en los picks (sesgo de selección) → CQR sobre picks (q̂ ≈ 46 pp)
+  → 0.81. La banda es ancha a propósito.
+- Prod: `analysis/ml_confidence.py` (espejo de `ml_scorer`, fallo → None) lee
+  `models/confidence_model.joblib` (cabezas HistGB q10/q50/q90/p5, spec **settled_v1**: arbitrage arma esos
+  params con `_model_params(..., spec="settled_v1")` aunque el ranking sea estimate_v0). Solo spot_perp con
+  pred > 0. Campos: `confidence` (= frecuencia real de APR ≥ 5 % del tier, `tier_reach`), `apr_p10/p90`,
+  `confidence_tier`, `size_mult`, `rel_width`. El ranking NO cambia.
+- UI: chip "Conf. alta · 82%", stat "Rango APR", orden "Conf.", filtro `user_configs.min_confidence`, nota
+  de capital sugerido en el modal (decide el usuario). IA: `conf/rango/tier/cap_sug` en `facts`, veredicto
+  igual. Logging: `score_snapshots.confidence`, `entry_confidence`/`entry_apr_p10/p90` en `auto_open`.
+- Re-entreno: correr `python -u scripts/confidence_study.py --export` junto al loop de `ml_v2` (exporta
+  solo si pasa el gate). Pendiente: probar el basis como feature de confianza (IC 0.17 sobre el residuo)
+  en ~ene-2027. Kronos (foundation model OHLCV) evaluado y descartado para funding.
+
 ## Auditoría 2026-10-25 — de dónde sale la ganancia
 
 - **El edge está en tokens Alpha** (spot solo on-chain en Binance Alpha/BSC): los 17 trades Binance
@@ -116,6 +140,7 @@ analysis/
   scoring.py            # Heurístico v11.0 (0–100) — fallback del modelo ML
   ml_features.py        # Feature-builder compartido (paridad train/inferencia)
   ml_scorer.py          # Prod: carga el .joblib y rankea (modelo manda)
+  ml_confidence.py      # Prod: confianza/rango p10–p90/tier de sizing (no cambia el ranking)
   indicators.py         # Momentum, z-score, percentil, régimen
   fees.py               # Estimación fees (CCXT + orderbook + fallback)
   ai_analyzer.py        # Prompts Gemini, parse JSON, COMPRAR/MANTENER/EVITAR

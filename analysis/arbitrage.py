@@ -6,7 +6,7 @@ from analysis.funding import FundingAggregator
 from analysis.fees import (calculate_spot_perp_fees, calculate_cross_exchange_fees,
                            calculate_break_even_hours)
 from analysis.scoring import opportunity_score, stability_grade, grade_from_net_apr, estimated_hold_days
-from analysis import ml_scorer
+from analysis import ml_scorer, ml_confidence
 from analysis.ml_features import LOOKBACK, window_stats, fee_drag_deterministic
 
 log = logging.getLogger("bot")
@@ -35,14 +35,15 @@ class ArbitrageScanner:
         self._defi_exchanges = set(getattr(config, "DEFI_EXCHANGES", []))
 
     @staticmethod
-    def _model_params(all_rates_hist: list, fr, score_params: dict) -> dict:
-        """Params para el MODELO según el feature_spec del artefacto cargado.
+    def _model_params(all_rates_hist: list, fr, score_params: dict, spec: str = None) -> dict:
+        """Params para el MODELO según el feature_spec del artefacto cargado
+        (o `spec` explícito: el modelo de confianza siempre es settled_v1).
 
         settled_v1 (dataset Binance): ventana = las LOOKBACK liquidaciones
         anteriores a la última y "tasa actual" = la última liquidada — igual que
         scripts/ml_binance.py; ambas salen del mismo endpoint (/fapi/v1/fundingRate).
         """
-        if ml_scorer.feature_spec() != "settled_v1":
+        if (spec or ml_scorer.feature_spec()) != "settled_v1":
             return score_params
         from analysis.indicators import compute_all_indicators
         if len(all_rates_hist) < LOOKBACK + 1:
@@ -216,6 +217,13 @@ class ArbitrageScanner:
         score_heuristic = sc
         grade = grade_from_net_apr(model_pred) if model_pred is not None else stability_grade(display_score)
         est_days = estimated_hold_days(hist_dict, fr.payments_per_day)
+        # Confianza: solo donde se opera (pred > 0, zona de entrenamiento de las cabezas).
+        conf = None
+        if model_pred is not None and model_pred > 0 and ml_confidence.is_loaded():
+            conf_params = self._model_params(all_rates_hist, fr, score_params, spec="settled_v1")
+            if not conf_params.get("_thin"):
+                conf = ml_confidence.predict_confidence(conf_params, conf_params.get("_indicators"))
+        conf = conf or {}
 
         has_spot = spot_venue == "cex"
 
@@ -236,6 +244,12 @@ class ArbitrageScanner:
             score=display_score,
             score_heuristic=score_heuristic,
             model_prediction=model_pred,
+            confidence=conf.get("confidence"),
+            apr_p10=conf.get("apr_p10"),
+            apr_p90=conf.get("apr_p90"),
+            confidence_tier=conf.get("confidence_tier"),
+            size_mult=conf.get("size_mult"),
+            rel_width=conf.get("rel_width"),
             has_spot=has_spot,
             spot_venue="bsc" if spot_venue == "bsc" else fr.exchange.lower(),
             mins_to_next=fr.mins_to_next,
