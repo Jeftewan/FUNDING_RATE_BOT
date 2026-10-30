@@ -41,6 +41,11 @@ from analysis import ml_scorer
 _MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "models", "scoring_model.joblib")
 ml_scorer.load_model(_MODEL_PATH)
+# Confianza por oportunidad (scripts/confidence_study.py): opcional, sin ella la
+# tarjeta no muestra confianza/rango.
+from analysis import ml_confidence
+ml_confidence.load_model(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "models", "confidence_model.joblib"))
 
 # ── Exchange Manager (CCXT) ───────────────────────────────────
 from exchanges.manager import ExchangeManager

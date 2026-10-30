@@ -56,6 +56,8 @@ class UserConfig(db.Model):
     # Filtros por APR NETO esperado (model_prediction) y ocultar predicciones ≤ 0.
     min_net_apr = db.Column(db.Float, default=10)
     hide_negative = db.Column(db.Boolean, default=True)
+    # Filtro por confianza mínima (0–100 %, 0 = sin filtro).
+    min_confidence = db.Column(db.Float, default=0)
     # Auto-transfer USDT spot↔futuros (Binance) antes de abrir, si la key lo permite.
     auto_transfer = db.Column(db.Boolean, default=False)
     # Legacy WhatsApp columns kept for migration; unused by new code.
@@ -341,6 +343,8 @@ class ScoreSnapshot(db.Model):
     # la validación de predicciones previas en scripts/ml_train.py.
     model_prediction = db.Column(db.Float)
     model_version = db.Column(db.String(50))
+    # Confianza calibrada P(APR neto ≥ 5 %) (analysis/ml_confidence) → validación en vivo.
+    confidence = db.Column(db.Float)
     scan_number = db.Column(db.Integer, default=0)
     captured_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
                             nullable=False, index=True)

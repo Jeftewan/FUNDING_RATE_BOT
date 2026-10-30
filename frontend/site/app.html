@@ -64,6 +64,7 @@
       <div class="filter-row">
         <label title="APR neto esperado por el modelo (descuenta fees)">APR neto mín %<input type="number" id="f-napr" class="inp-sm" oninput="onFilterChange()"></label>
         <label><input type="checkbox" id="f-hideneg" checked onchange="onFilterChange()"> Ocultar neto ≤ 0</label>
+        <label title="Probabilidad calibrada de que el APR neto realizado sea ≥ 5 % (solo pares con confianza calculada)">Conf. mín %<input type="number" id="f-conf" class="inp-sm" min="0" max="100" oninput="onFilterChange()"></label>
         <label>APR bruto mín %<input type="number" id="f-apr" class="inp-sm" oninput="onFilterChange()"></label>
         <label>Días estab.<input type="number" id="f-days" class="inp-sm" oninput="onFilterChange()"></label>
         <label>Vol 24h mín<input type="number" id="f-vol" class="inp-sm" style="width:90px" oninput="onFilterChange()"></label>
@@ -78,6 +79,7 @@
     <div class="sort-bar" id="sort-bar">
       <input type="text" id="search-symbol" placeholder="Buscar..." class="inp-sm" style="width:90px" oninput="applyFilters()">
       <button class="sort-btn active" data-sort="netapr" onclick="setSort('netapr')">Net APR &#9660;</button>
+      <button class="sort-btn" data-sort="conf" onclick="setSort('conf')">Conf.</button>
       <button class="sort-btn" data-sort="apr" onclick="setSort('apr')">APR</button>
       <button class="sort-btn" data-sort="fr" onclick="setSort('fr')">FR</button>
       <button class="sort-btn" data-sort="net3d" onclick="setSort('net3d')">Neto 3d</button>

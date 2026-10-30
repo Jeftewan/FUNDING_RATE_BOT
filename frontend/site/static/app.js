@@ -127,7 +127,7 @@ function getFilterState() {
   ).map(c => c.value);
   const hn = document.getElementById('f-hideneg');
   return { apr: num('f-apr'), napr: num('f-napr'), hideNeg: hn ? hn.checked : true,
-           days: num('f-days'), vol: num('f-vol'), exchanges };
+           conf: num('f-conf'), days: num('f-days'), vol: num('f-vol'), exchanges };
 }
 
 function matchesFilters(o, f) {
@@ -135,6 +135,8 @@ function matchesFilters(o, f) {
   // Predicción ≤ 0 = el modelo espera perder dinero tras fees → oculta por defecto.
   if (f.hideNeg && pred != null && pred <= 0) return false;
   if (f.napr != null && pred != null && pred < f.napr) return false;
+  // Confianza mínima: solo filtra las que tienen confianza calculada.
+  if (f.conf != null && f.conf > 0 && o.confidence != null && o.confidence * 100 < f.conf) return false;
   if (f.apr != null && (o.apr || 0) < f.apr) return false;
   if (f.days != null && (o.estimated_hold_days || 0) < f.days) return false;
   if (f.vol != null && f.vol > 0) {
@@ -167,7 +169,7 @@ function toggleFilters() {
 }
 
 function resetFilters() {
-  ['f-apr','f-napr','f-days','f-vol'].forEach(id => {
+  ['f-apr','f-napr','f-conf','f-days','f-vol'].forEach(id => {
     const el = document.getElementById(id);
     if (el) el.value = '';
   });
@@ -189,6 +191,7 @@ async function saveFilters() {
     min_apr: f.apr != null ? f.apr : 0,
     min_net_apr: f.napr != null ? f.napr : 0,
     hide_negative: f.hideNeg,
+    min_confidence: f.conf != null ? f.conf : 0,
     min_stability_days: f.days != null ? f.days : 0,
     min_volume: f.vol != null ? f.vol : 0,
     allowed_exchanges: f.exchanges.join(','),
@@ -212,6 +215,7 @@ async function loadFilters() {
     };
     set('f-apr', cfg.min_apr);
     set('f-napr', cfg.min_net_apr);
+    if (cfg.min_confidence) set('f-conf', cfg.min_confidence);
     const hn = document.getElementById('f-hideneg');
     if (hn) hn.checked = cfg.hide_negative !== false;
     set('f-days', cfg.min_stability_days);
@@ -234,6 +238,8 @@ function sortAndFilter(opps) {
     // Ordena por Net APR predicho (número principal mostrado); fallback al score
     // calibrado solo cuando no hay predicción del modelo.
     netapr: o => (o.model_prediction != null ? o.model_prediction : (o.score || 0)),
+    // Más certeza primero: probabilidad del tier y, dentro del tier, banda más angosta.
+    conf: o => (o.confidence != null ? o.confidence * 100 - (o.rel_width || 0) / 1000 : -1),
     apr: o => o.apr || 0,
     fr: o => o.funding_rate || o.rate_differential || 0,
     net3d: o => o.net_3d_revenue_per_1000 || 0,
@@ -639,6 +645,13 @@ function renderOpps(data) {
     // (reports/leverage_study_20261025_*.md): Alpha 2x, spot CEX 3x.
     const levRec = o.spot_venue === 'bsc' ? 2 : 3;
     const gain14 = o.model_prediction != null ? (o.model_prediction / 100) * 1000 * levRec / (levRec + 1) * 14 / 365 : null;
+    // Confianza (analysis/ml_confidence): P(APR neto realizado ≥ 5 %) del tier y rango p10–p90.
+    const g14 = apr => (apr / 100) * 1000 * levRec / (levRec + 1) * 14 / 365;
+    const hasConf = o.confidence != null;
+    const confChip = hasConf
+      ? `<span class="conf-chip ${o.confidence_tier === 'alta' ? 'conf-high' : 'conf-low'}" title="Confianza ${o.confidence_tier}: en el backtest, ${Math.round(o.confidence * 100)} % de las entradas de este tier rindieron ≥ 5 % APR neto. Capital sugerido ×${o.size_mult}">Conf. ${o.confidence_tier} · ${Math.round(o.confidence * 100)}%</span>`
+      : '';
+    const rangeTip = 'Rango probable (p10–p90) del APR neto realizado. La tasa suele caer a la mitad tras entrar.';
 
     const isExc = o.is_exceptional;
     const excReasons = (o.exceptional_reasons || []).join(' · ');
@@ -656,13 +669,15 @@ function renderOpps(data) {
         <div class="opp-header-right">
           <span class="opp-badge ${grade}">${grade}</span>
           <span class="opp-score" title="${o.model_prediction != null ? 'APR neto esperado (modelo ML, descuenta fees)' : 'APR bruto (el modelo no predijo)'}">${netApr.toFixed(1)}%</span>
+          ${confChip}
         </div>
       </div>
 
       <div class="opp-stats">
-        <div class="opp-stat" title="Ganancia neta esperada en 14 días por $1.000 de capital a ${levRec}x (modelo, descuenta fees)"><span class="label">Neto 14d 1K ${levRec}x</span><span class="value ${gain14 == null ? '' : (gain14 >= 0 ? 'green' : 'red')}">${gain14 == null ? '—' : '$' + gain14.toFixed(2)}</span></div>
+        <div class="opp-stat" title="Ganancia neta esperada en 14 días por $1.000 de capital a ${levRec}x (modelo, descuenta fees)${hasConf ? '. Rango p10–p90: $' + g14(o.apr_p10).toFixed(2) + ' … $' + g14(o.apr_p90).toFixed(2) : ''}"><span class="label">Neto 14d 1K ${levRec}x</span><span class="value ${gain14 == null ? '' : (gain14 >= 0 ? 'green' : 'red')}">${gain14 == null ? '—' : '$' + gain14.toFixed(2)}</span></div>
+        ${hasConf ? `<div class="opp-stat" title="${rangeTip}"><span class="label">Rango APR</span><span class="value">${o.apr_p10.toFixed(0)}…${o.apr_p90.toFixed(0)}%</span></div>` : ''}
         <div class="opp-stat"><span class="label">FR</span><span class="value green">${frPct}%</span></div>
-        <div class="opp-stat"><span class="label">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
+        <div class="opp-stat" title="APR bruto de la tasa vigente. No es lo esperado: la tasa suele caer a la mitad tras entrar."><span class="label">APR</span><span class="value green${o.apr > 50 ? ' glow-green' : ''}">${o.apr?.toFixed(1)}%</span></div>
         <div class="opp-stat"><span class="label">3d Acum</span><span class="value">${o.accumulated_3d_pct?.toFixed(3)}%</span></div>
         <div class="opp-stat"><span class="label">$/dia 1K</span><span class="value blue">$${o.daily_income_per_1000?.toFixed(2)}</span></div>
         <div class="opp-stat"><span class="label">Neto 3d</span><span class="value blue">$${o.net_3d_revenue_per_1000?.toFixed(2)}</span></div>
@@ -697,6 +712,7 @@ function renderOpps(data) {
       symbol: o.symbol, mode: o.mode, exchange: o.exchange,
       long_exchange: o.long_exchange, short_exchange: o.short_exchange,
       has_spot: o.has_spot, spot_venue: o.spot_venue,
+      confidence: o.confidence, confidence_tier: o.confidence_tier, size_mult: o.size_mult,
     };
   });
 
@@ -1113,6 +1129,10 @@ function showExecConfirm(kind, meta) {
   const head = kind === 'open'
     ? `Vas a abrir una posición real con <strong>$${meta.capital}</strong> de capital y leverage <strong>x${meta.leverage}</strong> (margen aislado).`
     : `Vas a cerrar la posición real de ${sym} usando las cantidades registradas.`;
+  // Sugerencia de capital por confianza (backtest: sizing 1.25×/0.75× por tier). Solo informativa.
+  const sizeNote = kind === 'open' && meta.size_mult && meta.size_mult !== 1
+    ? `<div class="exec-note">Confianza <strong>${meta.confidence_tier}</strong> (${Math.round((meta.confidence || 0) * 100)} %): capital sugerido <strong>$${Math.round(meta.capital * meta.size_mult)}</strong> (×${meta.size_mult}). La decisión es tuya.</div>`
+    : '';
 
   return new Promise(resolve => {
     const overlay = document.createElement('div');
@@ -1122,6 +1142,7 @@ function showExecConfirm(kind, meta) {
         <div class="exec-title">${kind === 'open' ? 'Ejecutar órdenes' : 'Cerrar posición'} — ${sym}</div>
         <div class="exec-sub">${head}</div>
         <ul class="exec-legs">${legsHtml}</ul>
+        ${sizeNote}
         ${isCross ? '' : `
         <label class="exec-twap"><input type="checkbox" id="exec-twap-on"> TWAP pareado (montos grandes)</label>
         <div class="exec-twap-cfg" id="exec-twap-cfg" style="display:none">

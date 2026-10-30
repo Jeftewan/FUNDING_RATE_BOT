@@ -103,6 +103,7 @@ class DBPersistence:
             "allowed_exchanges": config.allowed_exchanges if config else "",
             "min_net_apr": (config.min_net_apr if config and config.min_net_apr is not None else 10),
             "hide_negative": (config.hide_negative if config and config.hide_negative is not None else True),
+            "min_confidence": (config.min_confidence if config and config.min_confidence is not None else 0),
             "positions": [self._pos_to_dict(p) for p in positions],
             "history": [self._hist_to_dict(h) for h in history],
             "total_earned": sum(p.earned_real for p in positions),
@@ -123,7 +124,8 @@ class DBPersistence:
         for key in ("total_capital", "min_volume", "min_apr",
                      "min_score", "min_stability_days", "max_positions",
                      "alert_minutes_before", "email_enabled", "tg_chat_id",
-                     "allowed_exchanges", "auto_transfer", "min_net_apr", "hide_negative"):
+                     "allowed_exchanges", "auto_transfer", "min_net_apr", "hide_negative",
+                     "min_confidence"):
             if key in data:
                 setattr(config, key, data[key])
 

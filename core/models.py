@@ -75,6 +75,15 @@ class SpotPerpOpportunity:
     score: int = 0
     score_heuristic: int = 0      # score v11.0 (fallback / comparación vs modelo)
     model_prediction: float = None  # net_apr crudo predicho por el modelo ML (o None)
+    # Confianza (analysis/ml_confidence): P(APR neto ≥ 5 %) del tier, rango p10–p90
+    # del APR neto, tier "alta"/"baja", multiplicador de capital sugerido y ancho
+    # relativo de la banda (menor = más certeza). None sin modelo.
+    confidence: float = None
+    apr_p10: float = None
+    apr_p90: float = None
+    confidence_tier: str = None
+    size_mult: float = None
+    rel_width: float = None
     has_spot: bool = True
     spot_venue: str = ""            # "binance" (spot CEX) | "bsc" (solo on-chain Alpha)
     spot_volume: float = 0
@@ -106,6 +115,12 @@ class SpotPerpOpportunity:
             "score": self.score, "has_spot": self.has_spot,
             "score_heuristic": self.score_heuristic,
             "model_prediction": self.model_prediction,
+            "confidence": self.confidence,
+            "apr_p10": self.apr_p10,
+            "apr_p90": self.apr_p90,
+            "confidence_tier": self.confidence_tier,
+            "size_mult": self.size_mult,
+            "rel_width": self.rel_width,
             "mins_to_next": self.mins_to_next,
             "next_funding_ts": self.next_funding_ts,
             "rsi": self.rsi,
