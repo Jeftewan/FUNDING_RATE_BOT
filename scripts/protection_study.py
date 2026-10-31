@@ -53,6 +53,15 @@ DELTAS = (0.0, 0.005, 0.01, 0.02)
 CALLBACKS = (0.01, 0.02, 0.03, 0.05, 0.08)
 TP_FALLS = (0.03, 0.05, 0.10, 0.20, 0.30)              # caída desde la venta spot
 TIMEOUTS = (5, 15, 30, 60, 120, 240, 720, 1440, HOLD_MIN)   # minutos
+# Caso A con espera (AIN #51): tras el SL el spot no se vende ya; queda una venta
+# límite al objetivo (sp = la del seguro, perp = precio de recompra del short → salida
+# neutra) con stop del spot desnudo X bajo el precio on-chain al
+# dispararse el SL (acota lo que se arriesga frente a vender ya) y tiempo máximo T.
+WAIT_TARGETS = ("sp", "perp")
+WAIT_STOPS = (0.01, 0.02, 0.03, 0.05, 1.0)             # 1.0 = sin stop
+WAIT_TIMEOUTS = (5, 15, 30, 60, 240, 1440)             # minutos
+LO_EDGE = 0.005           # la orden límite Kyber se llena si el on-chain la supera en ε
+TAKER_SLIPS = (0.005, 0.015)   # 1.5 % = lo que costó el swap de AIN #51 (con sándwich)
 KINDS = {"spot": "spot/monthly/klines", "perp": "futures/um/monthly/klines",
          "mark": "futures/um/monthly/markPriceKlines"}
 ALPHA_LIST_URL = "https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/cex/alpha/all/token/list"
@@ -143,8 +152,9 @@ def load_symbol(sym: str, months: list, venue: str = "binance"):
         sp = parts.pop("alpha").reindex(parts["perp"].index)
         sp["c"] = sp.c.ffill()
         sp["h"] = sp.h.fillna(sp.c)
+        sp["l"] = sp.l.fillna(sp.c)
         parts["spot"] = sp
-    df = pd.DataFrame({"spot_h": parts["spot"].h, "spot_c": parts["spot"].c,
+    df = pd.DataFrame({"spot_h": parts["spot"].h, "spot_l": parts["spot"].l, "spot_c": parts["spot"].c,
                        "perp_o": parts["perp"].o, "perp_h": parts["perp"].h,
                        "perp_l": parts["perp"].l, "perp_c": parts["perp"].c,
                        "mark_h": parts["mark"].h}).dropna().sort_index()
@@ -228,6 +238,9 @@ def simulate(sym: str, df: pd.DataFrame, spot_slip: float = SLIP) -> list:
                     # A: short recomprado por el SL; spot desnudo hasta venderlo.
                     row["case"] = "A"
                     buy = perp_fill(tp)
+                    if delta == 0.005:
+                        row.update(wait_exits(d, tp, end, sp, buy, e))
+                        row["sl"] = sl
                     for tag, lag in (("now60", 1), ("now10", 0)):
                         k = min(tp + lag, end - 1)
                         hit = _first(d["spot_h"][tp + 1:k + 1] > sp) if k > tp else -1
@@ -237,6 +250,40 @@ def simulate(sym: str, df: pd.DataFrame, spot_slip: float = SLIP) -> list:
                     row["case"] = "AB"
                     row["now60"] = row["now10"] = (sp - perp_fill(tp)) / e * 100
                 out.append(row)
+    return out
+
+
+def wait_exits(d: dict, tp: int, end: int, sp: float, buy: float, e: float) -> dict:
+    """Caso A: short recomprado en el minuto tp a `buy`. Spot desnudo con venta límite
+    al objetivo; sale taker si el on-chain cae al stop o vence T. Mismo minuto
+    límite y stop → cuenta el stop (conservador). `now_<slip>` = regla vigente
+    (vender ya, vigilante caliente). Resultado en % de la entrada."""
+    out = {f"now_{s}": (d["spot_c"][tp] * (1 - s) - buy) / e * 100 for s in TAKER_SLIPS}
+    out["sl_fill_lo"] = buy / (1 + SLIP)
+    out["sl_fill_hi"] = d["perp_h"][tp]
+    start = tp + 1
+    if start >= end:
+        return out
+    for tgt, px in (("sp", sp), ("perp", buy)):
+        w_fill = _first(d["spot_h"][start:end] >= px * (1 + LO_EDGE))
+        for x in WAIT_STOPS:
+            stop = d["spot_c"][tp] * (1 - x)
+            w_stop = _first(d["spot_l"][start:end] <= stop)
+            for T in WAIT_TIMEOUTS:
+                lim = min(T, end - start)
+                if 0 <= w_stop < lim and (w_fill < 0 or w_stop <= w_fill):
+                    kind, k = "stop", start + w_stop
+                elif 0 <= w_fill < lim:
+                    kind, k = "fill", start + w_fill
+                else:
+                    kind, k = "timeout", start + lim - 1
+                out[f"k_{tgt}_{x}_{T}"] = kind
+                for s in TAKER_SLIPS:
+                    if kind == "fill":
+                        sell = px
+                    else:
+                        sell = (min(stop, d["spot_c"][k]) if kind == "stop" else d["spot_c"][k]) * (1 - s)
+                    out[f"w_{tgt}_{x}_{T}_{s}"] = (sell - buy) / e * 100
     return out
 
 
@@ -313,6 +360,67 @@ def report(res: pd.DataFrame, syms: list, months: list, venue: str = "binance") 
     return "\n".join(L)
 
 
+def wait_report(res: pd.DataFrame, syms: list, months: list, venue: str) -> str:
+    """Caso A (δ = 0.5 %): vender el spot ya vs esperar con límite + stop + tiempo máximo.
+    Adoptable = media ≥ vender ya y p5 no peor que el de vender ya en más de 0.5 pp,
+    con el slippage taker realista (el más alto de TAKER_SLIPS) en los tres leverages."""
+    s_hi = TAKER_SLIPS[-1]
+    tl = lambda T: f"{T // 60} h" if T >= 60 else f"{T} min"  # noqa: E731
+    L = [f"# Salida del spot desnudo tras el SL — {datetime.now():%Y-%m-%d} — venue {venue}", "",
+         f"Símbolos ({len(syms)}): {', '.join(syms)}  ", f"Meses: {months[0]} → {months[-1]}; caso A con "
+         f"δ = 0.5 %, SL al {FRACTION:.0%} del camino a liquidación.  ",
+         "Resultado por evento en % del precio de entrada vs salida ideal (ambas piernas en el SL). "
+         f"`ya` = regla vigente (vender el spot taker en el minuto del SL). Espera: venta límite al "
+         f"objetivo (`sp` = la del seguro, `perp` = precio de recompra del short), llena si el on-chain "
+         f"la supera en {LO_EDGE:.1%}; stop X bajo el precio on-chain del minuto del SL y tiempo máximo T (al vencer, taker). "
+         f"Slippage taker {' / '.join(f'{x:.1%}' for x in TAKER_SLIPS)}.", ""]
+    keys = [(t, x, T) for t in WAIT_TARGETS for x in WAIT_STOPS for T in WAIT_TIMEOUTS]
+    ok_all = {k: True for k in keys}
+    score = {k: 0.0 for k in keys}
+    for lev in LEVERAGES:
+        a = res[(res.lev == lev) & (res.case == "A") & (res.delta == 0.005)].dropna(subset=[f"now_{s_hi}"])
+        if a.empty:
+            continue
+        base = a[f"now_{s_hi}"]
+        b_mean, b_p5 = base.mean(), base.quantile(.05)
+        slip_sl = (a.sl_fill_lo / a.sl - 1) * 100, (a.sl_fill_hi / a.sl - 1) * 100
+        L += [f"## Leverage {lev}x — {len(a)} eventos A", "",
+              f"Vender ya: media {a[f'now_{TAKER_SLIPS[0]}'].mean():+.2f} (slip {TAKER_SLIPS[0]:.1%}) / "
+              f"{b_mean:+.2f} (slip {s_hi:.1%}), p5 {b_p5:+.2f}, peor {base.min():+.2f}.  ",
+              f"Fill del SL vs trigger (cota baja = max(SL, open) / alta = high del minuto): mediana "
+              f"{slip_sl[0].median():+.2f} % / {slip_sl[1].median():+.2f} %, p90 {slip_sl[0].quantile(.9):+.2f} % / "
+              f"{slip_sl[1].quantile(.9):+.2f} %.", "",
+              f"| objetivo | stop | T máx | media {TAKER_SLIPS[0]:.1%} | media {s_hi:.1%} | p5 | peor | "
+              "% límite | % stop | % tiempo | adoptable |", "|" + "---|" * 11]
+        rows = []
+        for t, x, T in keys:
+            v = a[f"w_{t}_{x}_{T}_{s_hi}"]
+            kind = a[f"k_{t}_{x}_{T}"]
+            ok = v.mean() >= b_mean and v.quantile(.05) >= b_p5 - 0.5
+            ok_all[(t, x, T)] &= bool(ok)
+            score[(t, x, T)] += v.mean()
+            rows.append((v.mean(), [t, "sin stop" if x >= 1 else f"{x:.0%}", tl(T),
+                                    f"{a[f'w_{t}_{x}_{T}_{TAKER_SLIPS[0]}'].mean():+.2f}", f"{v.mean():+.2f}",
+                                    f"{v.quantile(.05):+.2f}", f"{v.min():+.2f}",
+                                    f"{(kind == 'fill').mean():.0%}", f"{(kind == 'stop').mean():.0%}",
+                                    f"{(kind == 'timeout').mean():.0%}", "sí" if ok else "no"]))
+        for _, cells in sorted(rows, key=lambda r: -r[0]):
+            L.append("| " + " | ".join(cells) + " |")
+        L.append("")
+    best = [k for k in keys if ok_all[k]]
+    best.sort(key=lambda k: -score[k])
+    L += ["## Veredicto", ""]
+    if best:
+        t, x, T = best[0]
+        L.append(f"Adoptable en los tres leverages y mejor media: objetivo `{t}`, stop "
+                 f"{'sin stop' if x >= 1 else f'{x:.0%}'}, T {tl(T)}. Otras adoptables: "
+                 + (", ".join(f"{a}/{'—' if b >= 1 else f'{b:.0%}'}/{tl(c)}" for a, b, c in best[1:6]) or "ninguna")
+                 + ".")
+    else:
+        L.append("Ninguna política de espera cumple el criterio en los tres leverages: se mantiene vender ya.")
+    return "\n".join(L) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", type=int, default=20)
@@ -342,6 +450,9 @@ def main():
     suffix = "_bsc" if args.venue == "bsc" else ""
     out = ROOT / "reports" / f"protection_study_{datetime.now():%Y%m%d}{suffix}.md"
     out.write_text(report(res, syms, months, args.venue), encoding="utf-8")
+    print(f"-> {out}")
+    out = ROOT / "reports" / f"naked_spot_exit_{datetime.now():%Y%m%d}{suffix}.md"
+    out.write_text(wait_report(res, syms, months, args.venue), encoding="utf-8")
     print(f"-> {out}")
 
 
