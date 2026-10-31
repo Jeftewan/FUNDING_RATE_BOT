@@ -159,6 +159,20 @@ def test_sign_accepts_lowercase_to(monkeypatch):
     assert sent["raw"].startswith("0x")
 
 
+def test_sign_uses_private_rpc_without_aggregator_broadcast(monkeypatch):
+    # Kyber no tiene broadcast: sin RPC privado la venta iba a la mempool pública (sándwich AIN #51).
+    monkeypatch.setattr(ob, "_nonce", lambda a: 0)
+    monkeypatch.setattr(ob, "_gas_limit", lambda s, tx, hint=None: 60_000)
+    urls = []
+    monkeypatch.setattr(ob, "_rpc", lambda m, p, url=None: urls.append(url) or "0xhash")
+    tx = {"to": "0x5dbde81fce337ff4bcaaee4ca3466c00aecae274", "data": "0x", "gasPrice": 50_000_000}
+    monkeypatch.setenv("BSC_PRIVATE_RPC_URL", "https://private.example")
+    assert ob._sign_and_send(WALLET, tx, None) == "0xhash"
+    monkeypatch.delenv("BSC_PRIVATE_RPC_URL")
+    ob._sign_and_send(WALLET, tx, None)
+    assert urls == ["https://private.example", None]
+
+
 def test_to_wei_exact_decimal():
     assert ob.to_wei(0.1, 18) == 10 ** 17
     assert ob.to_wei(50.3, 18) == 503 * 10 ** 17

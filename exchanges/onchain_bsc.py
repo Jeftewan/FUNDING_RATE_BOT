@@ -14,6 +14,7 @@ Sin web3.py (RAM): firma con eth-account y JSON-RPC vía requests.
 Habilitado con ONCHAIN_ENABLED=1 (+ credenciales del agregador).
 """
 import logging
+import math
 import os
 import time
 
@@ -30,6 +31,13 @@ NATIVE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
 DEFAULT_SLIPPAGE = 0.005          # 0.5%
 MAX_PRICE_IMPACT = 0.01           # 1%
 MAX_PRICE_IMPACT_EXIT = 0.05      # vender spot desnudo (short ya cerrado): peor es quedarse sin cobertura
+# Spot desnudo (AIN #51, 2026-10-31): un solo swap de 1690 tokens salió 1.46 % bajo el
+# mid, con sándwich. Se trocea si el total mueve > EXIT_SPLIT_IMPACT y cada tramo va con
+# slippage corto (menos botín para el sándwich); un tramo revertido reintenta con el normal.
+EXIT_SPLIT_IMPACT = 0.005
+EXIT_MAX_SLICES = 4
+EXIT_SLICE_GAP = 10               # s entre tramos: el pool se re-arbitra
+EXIT_SLIPPAGE = 0.003
 ONCHAIN_MAX_BASIS = 0.005         # compra on-chain hasta 0.5% sobre el perp bid (incluye fee del DEX)
 MIN_LIQUIDITY_USD = 200_000       # liquidez mínima del token (lista Alpha)
 RECEIPT_TIMEOUT = 90
@@ -68,8 +76,8 @@ def address_from_key(pk: str) -> str:
 
 
 # ── JSON-RPC ────────────────────────────────────────────────────────────────
-def _rpc(method: str, params: list):
-    r = requests.post(rpc_url(), json={"jsonrpc": "2.0", "id": 1, "method": method,
+def _rpc(method: str, params: list, url: str = None):
+    r = requests.post(url or rpc_url(), json={"jsonrpc": "2.0", "id": 1, "method": method,
                                        "params": params}, timeout=20)
     r.raise_for_status()
     j = r.json()
@@ -221,6 +229,14 @@ def _sign_and_send(wallet: dict, tx: dict, aggregator=None) -> str:
             return aggregator.broadcast(raw, acct.address)
         except Exception as e:
             log.warning(f"aggregator broadcast failed, fallback RPC: {e}")
+    # Sin broadcast protegido del agregador (Kyber, o Web3 API bloqueada por región) la tx
+    # iría a la mempool pública: RPC privado anti-MEV si está configurado.
+    private = os.environ.get("BSC_PRIVATE_RPC_URL", "")
+    if private:
+        try:
+            return _rpc("eth_sendRawTransaction", [raw], url=private)
+        except Exception as e:
+            log.warning(f"private RPC broadcast failed, fallback RPC público: {e}")
     return _rpc("eth_sendRawTransaction", [raw])
 
 
@@ -237,7 +253,6 @@ class BscSpotLeg:
     """
 
     venue = "bsc"
-    exit_max_impact = MAX_PRICE_IMPACT_EXIT
 
     def __init__(self, wallet: dict, token: dict, ctx, perp_cli, perp_sym,
                  max_slippage: float = DEFAULT_SLIPPAGE, aggregator=None):
@@ -254,6 +269,16 @@ class BscSpotLeg:
         self.agg = aggregator or get_aggregator()
         self.order_ids = []   # tx hashes
         self.fee_usd = 0.0
+        self.naked = False
+        self.exit_log = []    # tramos de la venta del spot desnudo (auditoría)
+        self._last_impact = None
+
+    def naked_exit(self):
+        """El SL (o una liquidación) ya cerró el short: vender pesa más que el precio
+        (impacto hasta MAX_PRICE_IMPACT_EXIT), pero troceado y con slippage corto."""
+        self.naked = True
+        self.max_impact = MAX_PRICE_IMPACT_EXIT
+        self.max_slippage = EXIT_SLIPPAGE
 
     def held_base(self) -> float:
         return from_wei(erc20_balance(self.token["address"], self.address), self.token["decimals"])
@@ -305,6 +330,7 @@ class BscSpotLeg:
             impact = q.get("price_impact")
         if impact is not None and impact > self.max_impact:
             raise RuntimeError(f"impacto de precio {impact * 100:.2f}% > máx {self.max_impact * 100:.1f}%")
+        self._last_impact = impact
         before_in = erc20_balance(src, self.address)
         before_out = erc20_balance(dst, self.address)
         txh = _sign_and_send(self.wallet, q["tx"], self.agg)
@@ -386,10 +412,50 @@ class BscSpotLeg:
         amt = min(target_base, self.held_base())
         if amt <= 0:
             return 0.0
-        spent, got, txh = self._swap(tok, dec, USDT, USDT_DECIMALS, amt)
-        on_fill(txh, {"gross": spent, "cost": got, "avg": got / spent if spent else 0,
-                      "fee_usd": 0.0, "fee_base": 0.0}, spent)
-        return spent
+        if not self.naked:
+            spent, got, txh = self._swap(tok, dec, USDT, USDT_DECIMALS, amt)
+            on_fill(txh, {"gross": spent, "cost": got, "avg": got / spent if spent else 0,
+                          "fee_usd": 0.0, "fee_base": 0.0}, spent)
+            return spent
+        n = self._exit_slices(amt)
+        sold = 0.0
+        for i in range(n):
+            if i:
+                if self.ctx.cancelled():
+                    break
+                time.sleep(EXIT_SLICE_GAP)
+            part = amt - sold if i == n - 1 else amt / n
+            try:
+                spent, got, txh = self._swap(tok, dec, USDT, USDT_DECIMALS, part)
+            except RuntimeError as e:
+                if "revertido" not in str(e) or self.max_slippage >= DEFAULT_SLIPPAGE:
+                    raise
+                log.warning(f"tramo {i + 1}/{n} {self.token['symbol']} revertido con slippage "
+                            f"{self.max_slippage:.1%}; reintento con {DEFAULT_SLIPPAGE:.1%}")
+                self.max_slippage = DEFAULT_SLIPPAGE
+                spent, got, txh = self._swap(tok, dec, USDT, USDT_DECIMALS, part)
+            self.exit_log.append({"slice": i + 1, "of": n, "qty": spent, "usdt": got,
+                                  "px": got / spent if spent else None, "tx": txh,
+                                  "impact_quoted": self._last_impact, "slippage": self.max_slippage})
+            on_fill(txh, {"gross": spent, "cost": got, "avg": got / spent if spent else 0,
+                          "fee_usd": 0.0, "fee_base": 0.0}, spent)
+            sold += spent
+        return sold
+
+    def _exit_slices(self, amt: float) -> int:
+        """Tramos para vender `amt` desnudo: ceil(impacto del total vs mid / EXIT_SPLIT_IMPACT),
+        entre 1 y EXIT_MAX_SLICES. Sin medición → 1 (no demorar la salida)."""
+        tok, dec = self.token["address"], self.token["decimals"]
+        try:
+            amt_wei = to_wei(amt, dec)
+            q = self.agg.quote(tok, USDT, amt_wei, self.address)
+            imp = self._impact_vs_mid(tok, dec, USDT, USDT_DECIMALS, amt_wei, q)
+        except Exception as e:
+            log.warning(f"tramos venta {self.token.get('symbol')}: {e}")
+            imp = None
+        if not imp:
+            return 1
+        return max(1, min(EXIT_MAX_SLICES, math.ceil(imp / EXIT_SPLIT_IMPACT)))
 
     def unwind(self, base_amt) -> bool:
         amt = min(base_amt, self.held_base())

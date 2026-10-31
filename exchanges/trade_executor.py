@@ -1952,9 +1952,10 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         raise ExecError("No se pudo leer la posición perp tras cancelar los seguros; cierre "
                         "abortado sin operar (los seguros se re-colocan).", code="POSITION_READ")
     perp_to_close = min(perp_qty, actual_short) if actual_short else 0.0
-    if onchain and not actual_short and hasattr(leg, "exit_max_impact"):
-        # Spot desnudo (SL o liquidación ya cerraron el short): vender pesa más que el precio.
-        leg.max_impact = leg.exit_max_impact
+    if onchain and not actual_short and hasattr(leg, "naked_exit"):
+        # Spot desnudo (SL o liquidación ya cerraron el short): vender pesa más que el
+        # precio, en tramos y con slippage corto (AIN #51).
+        leg.naked_exit()
     if onchain:
         spot_held = leg.held_base()
     else:
@@ -2077,6 +2078,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         ],
     }
     res.update(_close_pnl(position, state, hedger, prot_fill, ref, ext))
+    if getattr(leg, "exit_log", None):
+        res["exec"]["exit_swaps"] = leg.exit_log
     if error or ctx.cancelled():
         res["partial_note"] = str(error) if error else "Cancelado por el usuario"
     return res

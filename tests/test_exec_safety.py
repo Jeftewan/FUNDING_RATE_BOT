@@ -350,6 +350,7 @@ class _OracleAgg:
 
     def __init__(self, chain, real_impact=0.0, oracle_impact=0.0986):
         self.c, self.real, self.oracle = chain, real_impact, oracle_impact
+        self.slippages = []
 
     def out(self, src, amt):
         o = self.c._out(src, amt)
@@ -359,6 +360,7 @@ class _OracleAgg:
         return {"to_amount": self.out(src, amt), "price_impact": self.oracle}
 
     def swap_tx(self, src, dst, amt, wallet, slippage, max_impact=0.01):
+        self.slippages.append(slippage)
         q = self.c.swap_tx(src, dst, amt, wallet, slippage, max_impact)
         return {**q, "to_amount": self.out(src, amt), "price_impact": self.oracle}
 
@@ -377,7 +379,8 @@ def bsc_env(monkeypatch):
         src, dst, amt = tx["_swap"]
         c.bal[src.lower()] -= amt
         c.bal[dst.lower()] = c.bal.get(dst.lower(), 0) + box["agg"].out(src, amt)
-        return "0xtx"
+        box["n"] = box.get("n", 0) + 1
+        return f"0xtx{box['n']}"        # hash único: on_fill acumula por tx
     monkeypatch.setattr(ob, "_sign_and_send", send)
     monkeypatch.setattr(ob, "wait_receipt", lambda h, timeout=0: {
         "status": "0x1", "gasUsed": hex(150000), "effectiveGasPrice": hex(50_000_000)})
@@ -393,12 +396,14 @@ def bsc_env(monkeypatch):
 
     def close(real_impact, oracle_impact, short, qty=500.0, held=None):
         box["agg"] = agg = _OracleAgg(c, real_impact, oracle_impact)
+        box["last"] = agg
         c.bal[t.TOKEN["address"].lower()] = ob.to_wei(qty if held is None else held, 18)
         ex.short = short
         pos = {"mode": "spot_perp", "symbol": "XYZ", "exchange": "Binance", "spot_venue": "bsc",
                "spot_qty": qty, "perp_qty": qty, "entry_price": 2.0}
         return te.execute_close(t.CREDS, pos, spot_leg_factory=lambda pc, ps, ctx: ob.BscSpotLeg(
             t.WALLET, t.TOKEN, ctx, pc, ps, aggregator=agg))
+    close.box = box
     return close, ex
 
 
@@ -416,6 +421,44 @@ def test_naked_bsc_close_accepts_real_impact_but_hedged_close_does_not(bsc_env):
     assert ex.short == pytest.approx(500)
     res = close(real_impact=0.03, oracle_impact=None, short=0)      # spot desnudo: se vende
     assert res["ok"] and res["spot_sold"] == pytest.approx(500), res
+
+
+def test_naked_bsc_close_sells_in_slices_with_tight_slippage(bsc_env):
+    # AIN #51: un solo swap de todo el spot desnudo salió 1.46 % bajo el mid (con sándwich).
+    from exchanges import onchain_bsc as ob
+    close, ex = bsc_env
+    res = close(real_impact=0.012, oracle_impact=None, short=0)
+    assert res["ok"] and res["spot_sold"] == pytest.approx(500), res
+    swaps = res["exec"]["exit_swaps"]
+    assert 2 <= len(swaps) <= ob.EXIT_MAX_SLICES
+    assert sum(s["qty"] for s in swaps) == pytest.approx(500)
+    assert set(close.box["last"].slippages) == {ob.EXIT_SLIPPAGE}
+
+
+def test_hedged_bsc_close_is_one_swap_with_normal_slippage(bsc_env):
+    from exchanges import onchain_bsc as ob
+    close, ex = bsc_env
+    res = close(real_impact=0.0, oracle_impact=None, short=500)
+    assert res["ok"] and "exit_swaps" not in res["exec"], res
+    assert set(close.box["last"].slippages) == {ob.DEFAULT_SLIPPAGE}
+
+
+def test_naked_bsc_slice_reverted_retries_with_normal_slippage(bsc_env, monkeypatch):
+    from exchanges import onchain_bsc as ob
+    close, ex = bsc_env
+    send, receipt = ob._sign_and_send, ob.wait_receipt
+    calls = {"n": 0}
+
+    def flaky_send(wallet, tx, agg=None):
+        calls["n"] += 1
+        return "0xrev" if calls["n"] == 1 else send(wallet, tx, agg)
+    monkeypatch.setattr(ob, "_sign_and_send", flaky_send)
+    monkeypatch.setattr(ob, "wait_receipt", lambda h, timeout=0: {**receipt(h), "status": "0x0"}
+                        if h == "0xrev" else receipt(h))
+    res = close(real_impact=0.0, oracle_impact=None, short=0)
+    assert res["ok"] and res["spot_sold"] == pytest.approx(500), res
+    assert close.box["last"].slippages[0] == ob.EXIT_SLIPPAGE
+    assert close.box["last"].slippages[-1] == ob.DEFAULT_SLIPPAGE
 
 
 def test_failed_close_after_sl_fill_records_perp_leg(env, monkeypatch):
