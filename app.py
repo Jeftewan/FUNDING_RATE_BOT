@@ -46,6 +46,10 @@ ml_scorer.load_model(_MODEL_PATH)
 from analysis import ml_confidence
 ml_confidence.load_model(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "models", "confidence_model.joblib"))
+# Panel de analistas / consenso (scripts/analyst_study.py): opcional, sin él el
+# modal "Análisis" muestra solo gráficas y rachas.
+from analysis import analysts
+analysts.load_table()
 
 # ── Exchange Manager (CCXT) ───────────────────────────────────
 from exchanges.manager import ExchangeManager
