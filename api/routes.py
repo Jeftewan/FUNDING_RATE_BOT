@@ -516,11 +516,51 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         hit = _opp_ai_cache.get(key)
         if hit and time.time() - hit[0] < 1800:
             return jsonify({"ok": True, "analysis": hit[1], "cached": True})
-        result = analyze_opportunity(opp, config, capital=capital)
+        # El dict de la lista no trae la serie de tasas (lr salía vacío) → historial
+        # cacheado del scan; y el panel de analistas si hay tabla (mismo caché del modal).
+        panel = None
+        try:
+            h = scanner_worker.exchange_manager.fetch_funding_history(opp["symbol"], opp["exchange"], limit=30)
+            opp["history"] = {**(opp.get("history") or {}), "_rates": list(h.rates or [])}
+            from analysis import analysts, opportunity_analysis
+            if (analysts.table() and opp.get("mode", "spot_perp") == "spot_perp"
+                    and str(opp.get("exchange", "")).lower() == "binance"):
+                with state_manager.lock:
+                    all_data = list(state_manager.state.get("all_data", []))
+                panel = opportunity_analysis.get(opp, scanner_worker.exchange_manager, all_data,
+                                                 db_enabled, capital)[0].get("panel")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"AI context {opp_id}: {e}")
+        result = analyze_opportunity(opp, config, capital=capital, panel=panel)
         if len(_opp_ai_cache) > 200:
             _opp_ai_cache.clear()
         _opp_ai_cache[key] = (time.time(), result)
         return jsonify({"ok": True, "analysis": result, "cached": False})
+
+    # ── Opportunity full analysis (modal "Análisis") ────────────
+    @app.route("/api/opportunities/<opp_id>/analysis")
+    @auth_required
+    def api_opportunity_analysis(opp_id):
+        """Series (funding, precio/basis, OI, top L/S), rachas anteriores, panel de
+        analistas con consenso y frecuencias reales. Query opcional ?capital=.
+        Caché 30 min por settlement (analysis/opportunity_analysis.py)."""
+        from analysis import opportunity_analysis
+
+        try:
+            capital = max(10.0, float(flask_req.args.get("capital") or 1000))
+        except (TypeError, ValueError):
+            capital = 1000.0
+        with state_manager.lock:
+            s = state_manager.state
+            opp = next((dict(o) for o in s.get("opportunities", []) if o.get("_id") == opp_id), None)
+            all_data = list(s.get("all_data", []))
+        if not opp:
+            return jsonify({"ok": False, "msg": "Oportunidad no encontrada (re-escanea)"}), 404
+        if opp.get("mode", "spot_perp") != "spot_perp" or str(opp.get("exchange", "")).lower() != "binance":
+            return jsonify({"ok": False, "msg": "Análisis disponible solo para spot_perp Binance"}), 400
+        res, cached = opportunity_analysis.get(opp, scanner_worker.exchange_manager, all_data,
+                                               db_enabled, capital)
+        return jsonify({"ok": True, "analysis": res, "cached": cached})
 
     # ── Position AI Analysis ────────────────────────────────────
     @app.route("/api/positions/ai", methods=["POST"])

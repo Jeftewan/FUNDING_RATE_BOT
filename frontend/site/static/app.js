@@ -238,8 +238,8 @@ function sortAndFilter(opps) {
     // Ordena por Net APR predicho (número principal mostrado); fallback al score
     // calibrado solo cuando no hay predicción del modelo.
     netapr: o => (o.model_prediction != null ? o.model_prediction : (o.score || 0)),
-    // Más certeza primero: probabilidad del tier y, dentro del tier, banda más angosta.
-    conf: o => (o.confidence != null ? o.confidence * 100 - (o.rel_width || 0) / 1000 : -1),
+    // Consenso del panel de analistas (1–10); sin consenso → confianza del tier.
+    conf: o => (o.consensus != null ? o.consensus * 100 : o.confidence != null ? o.confidence * 100 - (o.rel_width || 0) / 1000 - 1000 : -2000),
     apr: o => o.apr || 0,
     fr: o => o.funding_rate || o.rate_differential || 0,
     net3d: o => o.net_3d_revenue_per_1000 || 0,
@@ -611,6 +611,246 @@ async function analyzeOppAI(oppId, i) {
   if (box) { box.innerHTML = oppAiHtml(oppId, i); if (_oppAiData[oppId]) box.classList.add('open'); }
 }
 
+// ── Modal "Análisis" por oportunidad ─────────────────────────
+// Gráficas tipo Coinglass (funding liquidado, precio spot vs perp + basis, OI y top
+// traders) + panel de analistas con consenso 1–10 y frecuencias REALES de casos
+// parecidos (backend: analysis/opportunity_analysis.py, models/analyst_table.json).
+let _anCharts = [];
+let _anData = null;
+let _anLastFocus = null;
+const AN_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M3 3v18h18"/><path d="M7 15l4-4 3 3 5-6"/></svg>';
+const VOTE_TXT = { '1': ['▲', 'Favorable', 'v-pos'], '0': ['●', 'Neutral', 'v-neu'], '-1': ['▼', 'Desfavorable', 'v-neg'] };
+
+function consClass(c) { return c == null ? '' : c >= 6 ? 'cons-pos' : c > 5 ? 'cons-neu' : 'cons-neg'; }
+function pct0(x) { return x == null ? '—' : Math.round(x * 100) + '%'; }
+function fmtDate(ms) { const d = new Date(ms); return d.toLocaleDateString('es-CO', { day: '2-digit', month: 'short' }); }
+function fmtNum(v, d = 2) { return v == null || isNaN(v) ? '—' : Number(v).toFixed(d); }
+function fmtUsdShort(v) { if (v == null) return '—'; const a = Math.abs(v); return a >= 1e9 ? (v / 1e9).toFixed(2) + 'B' : a >= 1e6 ? (v / 1e6).toFixed(1) + 'M' : a >= 1e3 ? (v / 1e3).toFixed(0) + 'K' : v.toFixed(0); }
+
+const AN_FMT = {   // cómo mostrar el valor de cada variable de analista
+  p_prod: v => v.toFixed(1) + '% APR', streak: v => v.toFixed(0) + ' pagos', pct: v => v.toFixed(0) + '%',
+  ep_med_days: v => v.toFixed(1) + ' d', ep_age_days: v => v.toFixed(1) + ' d', relw: v => v.toFixed(2),
+  regime_median_daily: v => (v * 365 * 100).toFixed(1) + '% APR', basis_24h: v => v.toFixed(3) + '%',
+  basis_chg_24h: v => (v >= 0 ? '+' : '') + v.toFixed(3) + ' pp', log_oi_usd: v => '$' + fmtUsdShort(Math.pow(10, v)),
+  oi_chg_24h_pct: v => (v >= 0 ? '+' : '') + v.toFixed(1) + '%', top_ls_24h: v => v.toFixed(2),
+  volatility_7d: v => (v * 100).toFixed(1) + '%/día',
+};
+
+function openAnalysis(oppId, i) {
+  const meta = _oppMeta[oppId] || {};
+  const cap = parseFloat(document.getElementById('cap-' + i)?.value) || 1000;
+  _anLastFocus = document.activeElement;
+  closeAnalysis();
+  const ov = document.createElement('div');
+  ov.className = 'an-overlay';
+  ov.id = 'an-overlay';
+  ov.innerHTML = `
+    <div class="an-modal" role="dialog" aria-modal="true" aria-labelledby="an-title">
+      <div class="an-head">
+        <div><h2 id="an-title">${escapeHtml(meta.symbol || oppId)} <span class="an-sub">${meta.spot_venue === 'bsc' ? 'Alpha on-chain' : 'Spot CEX'} · análisis</span></h2></div>
+        <button class="an-close" onclick="closeAnalysis()" aria-label="Cerrar análisis">✕</button>
+      </div>
+      <div class="an-tabs" role="tablist">
+        <button role="tab" class="an-tab active" aria-selected="true" data-tab="sum" onclick="anTab('sum')">Resumen</button>
+        <button role="tab" class="an-tab" aria-selected="false" data-tab="charts" onclick="anTab('charts')">Gráficas</button>
+        <button role="tab" class="an-tab" aria-selected="false" data-tab="eps" onclick="anTab('eps')">Picos anteriores</button>
+      </div>
+      <div class="an-body" id="an-body"><div class="an-skel"></div><div class="an-skel"></div><div class="an-skel short"></div></div>
+    </div>`;
+  ov.addEventListener('click', e => { if (e.target === ov) closeAnalysis(); });
+  document.body.appendChild(ov);
+  document.body.classList.add('no-scroll');
+  ov.querySelector('.an-close').focus();
+  loadAnalysis(oppId, cap);
+}
+
+function closeAnalysis() {
+  _anCharts.forEach(c => c.destroy());
+  _anCharts = [];
+  const ov = document.getElementById('an-overlay');
+  if (ov) {
+    ov.remove();
+    document.body.classList.remove('no-scroll');
+    if (_anLastFocus && _anLastFocus.focus) _anLastFocus.focus();
+  }
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && document.getElementById('an-overlay')) closeAnalysis(); });
+
+async function loadAnalysis(oppId, cap) {
+  const body = document.getElementById('an-body');
+  try {
+    const res = await fetch(`/api/opportunities/${encodeURIComponent(oppId)}/analysis?capital=${cap}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.msg || 'sin resultado');
+    _anData = data.analysis;
+    anTab('sum');
+  } catch (e) {
+    if (body) body.innerHTML = `<div class="an-error" role="alert">No se pudo cargar el análisis: ${escapeHtml(e.message)}
+      <button class="btn" onclick="loadAnalysis('${oppId}', ${cap})">Reintentar</button></div>`;
+  }
+}
+
+function anTab(tab) {
+  document.querySelectorAll('.an-tab').forEach(b => {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+  const body = document.getElementById('an-body');
+  if (!body || !_anData) return;
+  _anCharts.forEach(c => c.destroy());
+  _anCharts = [];
+  body.innerHTML = tab === 'charts' ? anChartsHtml(_anData) : tab === 'eps' ? anEpisodesHtml(_anData) : anSummaryHtml(_anData);
+  if (tab === 'charts') drawAnalysisCharts(_anData);
+}
+
+function outcomeLine(o, what) {
+  if (!o) return '';
+  return `<div class="an-outcome">
+    <div class="an-out-title">${what} <span class="an-n">(${o.n.toLocaleString('es-CO')} casos)</span></div>
+    <div class="an-out-grid">
+      <div><span class="label">Cumplió (APR ≥ 5 %)</span><span class="value">${pct0(o.reach5)}</span></div>
+      <div><span class="label">Terminó con ganancia</span><span class="value">${pct0(o.win)}</span></div>
+      <div><span class="label">APR neto mediano</span><span class="value ${o.med >= 0 ? 'green' : 'red'}">${fmtNum(o.med, 1)}%</span></div>
+      <div><span class="label">Rango típico (p25–p75)</span><span class="value">${fmtNum(o.p25, 0)}…${fmtNum(o.p75, 0)}%</span></div>
+      <div><span class="label">Duración mediana</span><span class="value">${fmtNum(o.hold_med, 1)} d</span></div>
+    </div></div>`;
+}
+
+function anSummaryHtml(a) {
+  const p = a.panel;
+  const m = a.model || {};
+  let gauge = '<div class="an-note">Sin tabla de analistas cargada: solo hay gráficas y rachas.</div>';
+  if (p && p.consensus != null) {
+    const pos = Math.max(0, Math.min(100, (p.consensus - 1) / 9 * 100));
+    gauge = `<div class="an-gauge ${consClass(p.consensus)}">
+      <div class="an-gauge-top"><span class="an-cons">${p.consensus.toFixed(1)}<small>/10</small></span><span class="an-cons-label">${escapeHtml(p.label || '')}</span></div>
+      <div class="an-gauge-bar" role="img" aria-label="Consenso ${p.consensus.toFixed(1)} de 10"><span style="left:${pos}%"></span></div>
+      <div class="an-gauge-scale"><span>1 Muy desfavorable</span><span>5.5 Neutral</span><span>10 Muy favorable</span></div>
+    </div>`;
+  }
+  // Los que votan primero; los informativos no muestran voto (no separaron fuera de muestra).
+  const rows = (p && p.analysts || []).slice().sort((a, b) => (b.votes - a.votes) || ((b.weight || 0) - (a.weight || 0))).map(x => {
+    const vt = !x.votes ? ['', 'No vota', 'v-na'] : x.vote == null ? ['–', 'Sin dato', 'v-na'] : VOTE_TXT[String(x.vote)];
+    const fmt = AN_FMT[x.feature];
+    const val = x.value == null ? '—' : (fmt ? fmt(x.value) : fmtNum(x.value, 3));
+    return `<tr class="${x.votes ? '' : 'an-info-row'}">
+      <td><div class="an-a-name">${escapeHtml(x.label)}${x.votes ? '' : ' <span class="an-tag">informativo</span>'}</div><div class="an-a-why">${escapeHtml(x.why || '')}</div></td>
+      <td class="num">${val}</td>
+      <td><span class="an-vote ${vt[2]}"><span aria-hidden="true">${vt[0]}</span> ${vt[1]}</span></td></tr>`;
+  }).join('');
+  const range = m.p10 != null ? `${fmtNum(m.p10, 0)}…${fmtNum(m.p90, 0)}%` : '—';
+  return `
+    ${gauge}
+    <div class="an-kpis">
+      <div><span class="label">APR neto predicho</span><span class="value">${fmtNum(m.pred, 1)}%</span></div>
+      <div><span class="label">Rango p10–p90</span><span class="value">${range}</span></div>
+      <div><span class="label">Capital sugerido</span><span class="value">${a.capital_sugerido != null ? '$' + a.capital_sugerido + ' (×' + a.size_mult + ')' : '—'}</span></div>
+    </div>
+    ${p && p.calib ? outcomeLine(p.calib, `Con consenso ${p.calib.lo}–${Math.min(p.calib.hi, 10)} en el último año`) : ''}
+    ${a.analog ? outcomeLine(a.analog, 'Casos parecidos (predicción y venue similares)') : ''}
+    ${rows ? `<h3 class="an-h3">Panel de analistas</h3>
+    <table class="an-table"><thead><tr><th>Analista</th><th>Valor</th><th>Voto</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="an-note">Solo votan los analistas que, fuera de muestra, separaron el APR realizado de forma consistente; los "informativos" se muestran como contexto. Las frecuencias son históricas, no garantía. El orden de la lista sigue siendo el del modelo.</div>` : ''}`;
+}
+
+function anChartsHtml(a) {
+  const box = (id, title, note) => `<section class="an-chart"><h3 class="an-h3">${title}</h3><div class="an-chart-wrap"><canvas id="${id}" aria-label="${title}" role="img"></canvas></div>${note ? `<div class="an-note">${note}</div>` : ''}</section>`;
+  const v = a.values || {};
+  let out = '';
+  out += a.funding ? box('anc-fr', 'Funding liquidado (APR por pago)', `Línea punteada = tasa base ${a.funding.base_apr}% APR. Pagos cada ${a.funding.interval_hours} h. Eje recortado a los valores típicos: los pagos extremos se ven completos en el tooltip.`) : '<div class="an-note">Sin historial de funding.</div>';
+  out += a.price ? box('anc-px', `Precio perp vs spot ${a.price.spot_source === 'alpha' ? '(on-chain)' : ''} y basis`, `Basis media 24 h: ${v.basis_24h == null ? '—' : v.basis_24h.toFixed(3) + '%'} · Positivo = el perp cotiza con prima sobre el spot.`) : '';
+  out += a.market ? box('anc-oi', 'Interés abierto y top traders long/short', `OI: ${v.log_oi_usd == null ? '—' : '$' + fmtUsdShort(Math.pow(10, v.log_oi_usd))} · cambio 24 h ${v.oi_chg_24h_pct == null ? '—' : v.oi_chg_24h_pct.toFixed(1) + '%'} · top L/S ${v.top_ls_24h == null ? '—' : v.top_ls_24h.toFixed(2)}`) : '';
+  out += a.model_history && a.model_history.some(h => h.pred != null) ? box('anc-mh', 'APR predicho por el modelo en los últimos scans', '') : '';
+  return out;
+}
+
+function anChartBase(extraScales) {
+  return {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: { legend: { labels: { color: '#aaa', font: { size: 10 }, boxWidth: 10 } },
+      tooltip: { callbacks: { title: items => items.length ? new Date(items[0].parsed.x).toLocaleString('es-CO') : '' } } },
+    scales: {
+      x: { type: 'linear', ticks: { color: '#888', font: { size: 9 }, maxTicksLimit: 6, callback: v => fmtDate(v) }, grid: { color: '#1a1d2344' } },
+      y: { ticks: { color: '#888', font: { size: 9 } }, grid: { color: '#1a1d2344' } },
+      ...(extraScales || {}),
+    },
+  };
+}
+
+function drawAnalysisCharts(a) {
+  if (typeof Chart === 'undefined') return;
+  const pts = (xs, ys) => xs.map((x, k) => ({ x, y: ys[k] })).filter(p => p.y != null);
+  if (a.funding && document.getElementById('anc-fr')) {
+    const f = a.funding;
+    const data = pts(f.ts, f.apr);
+    // Eje recortado a p2–p98: un pago extremo aplastaba el resto (el tooltip muestra el valor real).
+    const sv = data.map(p => p.y).sort((x, y) => x - y);
+    const q = k => sv.length ? sv[Math.min(sv.length - 1, Math.max(0, Math.floor(k * (sv.length - 1))))] : 0;
+    const yMin = Math.min(q(0.02), 0) * 1.2 - 1, yMax = Math.max(q(0.98), f.base_apr) * 1.2 + 1;
+    _anCharts.push(new Chart(document.getElementById('anc-fr'), {
+      type: 'bar',
+      data: { datasets: [
+        { label: 'APR del pago', data, backgroundColor: data.map(p => p.y >= 0 ? '#22c55eaa' : '#ef4444aa'), barThickness: 'flex', maxBarThickness: 4 },
+        { type: 'line', label: 'Base', data: [{ x: f.ts[0], y: f.base_apr }, { x: f.ts[f.ts.length - 1], y: f.base_apr }], borderColor: '#888', borderDash: [4, 4], pointRadius: 0, borderWidth: 1 },
+      ] },
+      options: anChartBase({ y: { min: yMin, max: yMax, ticks: { color: '#888', font: { size: 9 }, callback: v => Math.round(v) + '%' }, grid: { color: '#1a1d2344' } } }),
+    }));
+  }
+  if (a.price && document.getElementById('anc-px')) {
+    const p = a.price;
+    _anCharts.push(new Chart(document.getElementById('anc-px'), {
+      type: 'line',
+      data: { datasets: [
+        { label: 'Perp', data: pts(p.ts, p.perp), borderColor: '#3b82f6', pointRadius: 0, borderWidth: 1.2, yAxisID: 'y' },
+        { label: 'Spot', data: pts(p.ts, p.spot), borderColor: '#f59e0b', pointRadius: 0, borderWidth: 1.6, borderDash: [4, 3], yAxisID: 'y', order: 0 },
+        { label: 'Basis %', data: pts(p.ts, p.basis), borderColor: '#a855f7', backgroundColor: '#a855f722', fill: 'origin', pointRadius: 0, borderWidth: 1, yAxisID: 'y2' },
+      ] },
+      options: anChartBase({ y2: { position: 'right', ticks: { color: '#a855f7', font: { size: 9 }, callback: v => v + '%' }, grid: { display: false } } }),
+    }));
+  }
+  if (a.market && document.getElementById('anc-oi')) {
+    const m = a.market;
+    _anCharts.push(new Chart(document.getElementById('anc-oi'), {
+      type: 'line',
+      data: { datasets: [
+        { label: 'OI USD', data: pts(m.ts, m.oi_usd), borderColor: '#06b6d4', backgroundColor: '#06b6d422', fill: 'origin', pointRadius: 0, borderWidth: 1.2, yAxisID: 'y' },
+        { label: 'Top L/S', data: pts(m.ts, m.top_ls), borderColor: '#f59e0b', pointRadius: 0, borderWidth: 1.2, yAxisID: 'y2' },
+      ] },
+      options: anChartBase({
+        y: { ticks: { color: '#888', font: { size: 9 }, callback: v => '$' + fmtUsdShort(v) }, grid: { color: '#1a1d2344' } },
+        y2: { position: 'right', ticks: { color: '#f59e0b', font: { size: 9 } }, grid: { display: false } },
+      }),
+    }));
+  }
+  if (a.model_history && document.getElementById('anc-mh')) {
+    const h = a.model_history.filter(x => x.pred != null);
+    _anCharts.push(new Chart(document.getElementById('anc-mh'), {
+      type: 'line',
+      data: { datasets: [{ label: 'APR neto predicho', data: h.map(x => ({ x: x.ts, y: x.pred })), borderColor: '#22c55e', pointRadius: 2, borderWidth: 1.2 }] },
+      options: anChartBase({ y: { ticks: { color: '#888', font: { size: 9 }, callback: v => v + '%' }, grid: { color: '#1a1d2344' } } }),
+    }));
+  }
+}
+
+function anEpisodesHtml(a) {
+  const e = a.episodes || {};
+  const list = (e.list || []).slice().reverse();
+  const rows = list.map(x => `<tr><td>${fmtDate(x.start_ts)}</td><td class="num">${x.days.toFixed(1)} d</td>
+    <td class="num ${x.apr >= 0 ? 'green' : 'red'}">${x.apr.toFixed(1)}%</td><td>${x.ended ? 'Terminó (2 pagos ≤ 0)' : 'En curso'}</td></tr>`).join('');
+  return `
+    <div class="an-kpis">
+      <div><span class="label">Duración mediana (120 d)</span><span class="value">${e.ep_med_days == null ? '—' : e.ep_med_days.toFixed(1) + ' d'}</span></div>
+      <div><span class="label">Rachas terminadas (120 d)</span><span class="value">${e.ep_count ?? '—'}</span></div>
+      <div><span class="label">Edad de la racha actual</span><span class="value">${e.ep_age_days == null ? '—' : e.ep_age_days.toFixed(1) + ' d'}</span></div>
+      <div><span class="label">APR mediano por racha</span><span class="value">${e.apr_med == null ? '—' : e.apr_med.toFixed(1) + '%'}</span></div>
+    </div>
+    <div class="an-note">Racha = desde que la tasa supera la base hasta dos pagos seguidos ≤ 0 (la regla de salida de basyo). Si la racha actual ya supera la duración típica, el riesgo de que se apague pronto es mayor.</div>
+    ${rows ? `<table class="an-table"><thead><tr><th>Inicio</th><th>Duración</th><th>APR medio</th><th>Estado</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="an-note">Sin rachas en el último año.</div>'}`;
+}
+
 function renderOpps(data) {
   const rawOpps = data.opportunities || [];
   const opps = sortAndFilter(rawOpps);
@@ -648,9 +888,12 @@ function renderOpps(data) {
     // Confianza (analysis/ml_confidence): P(APR neto realizado ≥ 5 %) del tier y rango p10–p90.
     const g14 = apr => (apr / 100) * 1000 * levRec / (levRec + 1) * 14 / 365;
     const hasConf = o.confidence != null;
-    const confChip = hasConf
-      ? `<span class="conf-chip ${o.confidence_tier === 'alta' ? 'conf-high' : 'conf-low'}" title="Confianza ${o.confidence_tier}: en el backtest, ${Math.round(o.confidence * 100)} % de las entradas de este tier rindieron ≥ 5 % APR neto. Capital sugerido ×${o.size_mult}">Conf. ${o.confidence_tier} · ${Math.round(o.confidence * 100)}%</span>`
+    const consChip = o.consensus != null
+      ? `<span class="conf-chip ${o.consensus >= 6 ? 'conf-high' : o.consensus > 5 ? 'conf-mid' : 'conf-neg'}" title="Consenso del panel de analistas: ${o.consensus_label} (${o.consensus_votes} votos favorables). En el último año, los casos con este consenso tuvieron un APR neto mediano de ${o.consensus_med_apr}%. Detalle en Análisis.">Consenso ${o.consensus.toFixed(1)}</span>`
       : '';
+    const confChip = consChip || (hasConf
+      ? `<span class="conf-chip ${o.confidence_tier === 'alta' ? 'conf-high' : 'conf-low'}" title="Confianza ${o.confidence_tier}: en el backtest, ${Math.round(o.confidence * 100)} % de las entradas de este tier rindieron ≥ 5 % APR neto. Capital sugerido ×${o.size_mult}">Conf. ${o.confidence_tier} · ${Math.round(o.confidence * 100)}%</span>`
+      : '');
     const rangeTip = 'Rango probable (p10–p90) del APR neto realizado. La tasa suele caer a la mitad tras entrar.';
 
     const isExc = o.is_exceptional;
@@ -702,6 +945,7 @@ function renderOpps(data) {
         ${execButton(o, i)}
       </div>
       <div class="opp-est" id="est-${i}"></div>
+      ${!isCross && String(o.exchange).toLowerCase() === 'binance' ? `<button class="btn-analysis" onclick="openAnalysis('${o._id}',${i})">${AN_ICON}<span>Análisis: gráficas y analistas</span></button>` : ''}
       <div class="opp-ai${_oppAiData[o._id] ? ' open' : ''}" id="ai-${i}">${oppAiHtml(o._id, i)}</div>
     </div>`;
   }).join('');
@@ -713,6 +957,7 @@ function renderOpps(data) {
       long_exchange: o.long_exchange, short_exchange: o.short_exchange,
       has_spot: o.has_spot, spot_venue: o.spot_venue,
       confidence: o.confidence, confidence_tier: o.confidence_tier, size_mult: o.size_mult,
+      consensus: o.consensus, consensus_label: o.consensus_label,
     };
   });
 
@@ -1131,7 +1376,7 @@ function showExecConfirm(kind, meta) {
     : `Vas a cerrar la posición real de ${sym} usando las cantidades registradas.`;
   // Sugerencia de capital por confianza (backtest: sizing 1.25×/0.75× por tier). Solo informativa.
   const sizeNote = kind === 'open' && meta.size_mult && meta.size_mult !== 1
-    ? `<div class="exec-note">Confianza <strong>${meta.confidence_tier}</strong> (${Math.round((meta.confidence || 0) * 100)} %): capital sugerido <strong>$${Math.round(meta.capital * meta.size_mult)}</strong> (×${meta.size_mult}). La decisión es tuya.</div>`
+    ? `<div class="exec-note">${meta.consensus != null ? `Consenso <strong>${meta.consensus.toFixed(1)}</strong> (${meta.consensus_label})` : `Confianza <strong>${meta.confidence_tier}</strong> (${Math.round((meta.confidence || 0) * 100)} %)`}: capital sugerido <strong>$${Math.round(meta.capital * meta.size_mult)}</strong> (×${meta.size_mult}). La decisión es tuya.</div>`
     : '';
 
   return new Promise(resolve => {

@@ -1,0 +1,756 @@
+{
+ "version": "20261106",
+ "eval_window": [
+  "2025-11-06",
+  "2026-11-06"
+ ],
+ "signals_since": "2026-07-27",
+ "enter_napr": 5.0,
+ "analysts": {
+  "modelo": {
+   "feature": "p_prod",
+   "label": "Modelo",
+   "why": "APR neto que predice el modelo",
+   "cuts": [
+    9.84879,
+    20.386891
+   ],
+   "dir": 1,
+   "weight": 0.4041,
+   "votes": true,
+   "ic": 0.4041,
+   "consistency": 1.0,
+   "periods": 5,
+   "coverage": 1.0
+  },
+  "racha": {
+   "feature": "streak",
+   "label": "Racha",
+   "why": "pagos positivos seguidos",
+   "cuts": [
+    30.0,
+    30.0
+   ],
+   "dir": -1,
+   "weight": 0.083,
+   "votes": false,
+   "ic": -0.083,
+   "consistency": 0.8,
+   "periods": 5,
+   "coverage": 1.0
+  },
+  "constancia": {
+   "feature": "pct",
+   "label": "Constancia",
+   "why": "% de pagos positivos en los últimos 30",
+   "cuts": [
+    100.0,
+    100.0
+   ],
+   "dir": -1,
+   "weight": 0.0824,
+   "votes": false,
+   "ic": -0.0824,
+   "consistency": 0.8,
+   "periods": 5,
+   "coverage": 1.0
+  },
+  "picos": {
+   "feature": "ep_med_days",
+   "label": "Duración de picos",
+   "why": "mediana de días que duraron sus rachas anteriores",
+   "cuts": [
+    1.835,
+    14.17
+   ],
+   "dir": 1,
+   "weight": 0.0367,
+   "votes": false,
+   "ic": 0.0367,
+   "consistency": 0.6,
+   "periods": 5,
+   "coverage": 0.574
+  },
+  "edad": {
+   "feature": "ep_age_days",
+   "label": "Edad del pico",
+   "why": "días que lleva la racha actual",
+   "cuts": [
+    49.83,
+    133.0
+   ],
+   "dir": 1,
+   "weight": 0.0403,
+   "votes": true,
+   "ic": 0.0403,
+   "consistency": 0.8,
+   "periods": 5,
+   "coverage": 1.0
+  },
+  "incertidumbre": {
+   "feature": "relw",
+   "label": "Incertidumbre",
+   "why": "ancho del rango p10–p90 del modelo",
+   "cuts": [
+    1.740455,
+    2.380285
+   ],
+   "dir": -1,
+   "weight": 0.1905,
+   "votes": true,
+   "ic": -0.1905,
+   "consistency": 1.0,
+   "periods": 5,
+   "coverage": 1.0
+  },
+  "regimen": {
+   "feature": "regime_median_daily",
+   "label": "Régimen",
+   "why": "funding mediano del mercado",
+   "cuts": [
+    0.0003,
+    0.0003
+   ],
+   "dir": -1,
+   "weight": 0.0694,
+   "votes": false,
+   "ic": -0.0694,
+   "consistency": 0.8,
+   "periods": 5,
+   "coverage": 1.0
+  },
+  "basis": {
+   "feature": "basis_24h",
+   "label": "Basis",
+   "why": "prima perp vs spot, media 24 h",
+   "cuts": [
+    0.122863,
+    0.266641
+   ],
+   "dir": -1,
+   "weight": 0.0134,
+   "votes": false,
+   "ic": -0.0134,
+   "consistency": 0.54,
+   "periods": 13,
+   "coverage": 0.751
+  },
+  "basis_tend": {
+   "feature": "basis_chg_24h",
+   "label": "Tendencia basis",
+   "why": "cambio de la prima vs las 48 h previas",
+   "cuts": [
+    -0.04998,
+    0.046925
+   ],
+   "dir": 1,
+   "weight": 0.0021,
+   "votes": false,
+   "ic": 0.0021,
+   "consistency": 0.46,
+   "periods": 13,
+   "coverage": 0.75
+  },
+  "oi": {
+   "feature": "log_oi_usd",
+   "label": "Interés abierto",
+   "why": "tamaño del OI en USD (log)",
+   "cuts": [
+    6.565729,
+    6.787344
+   ],
+   "dir": 1,
+   "weight": 0.1701,
+   "votes": true,
+   "ic": 0.1701,
+   "consistency": 0.92,
+   "periods": 13,
+   "coverage": 0.809
+  },
+  "oi_tend": {
+   "feature": "oi_chg_24h_pct",
+   "label": "Flujo OI",
+   "why": "cambio del OI en 24 h",
+   "cuts": [
+    -0.867808,
+    0.63703
+   ],
+   "dir": -1,
+   "weight": 0.0097,
+   "votes": false,
+   "ic": -0.0097,
+   "consistency": 0.54,
+   "periods": 13,
+   "coverage": 0.809
+  },
+  "posicionamiento": {
+   "feature": "top_ls_24h",
+   "label": "Top traders",
+   "why": "long/short de los top traders, media 24 h",
+   "cuts": [
+    1.361963,
+    1.688408
+   ],
+   "dir": -1,
+   "weight": 0.0219,
+   "votes": false,
+   "ic": -0.0219,
+   "consistency": 0.46,
+   "periods": 13,
+   "coverage": 0.809
+  },
+  "volatilidad": {
+   "feature": "volatility_7d",
+   "label": "Volatilidad",
+   "why": "desvío diario 7 d del perp",
+   "cuts": [
+    0.038012,
+    0.063637
+   ],
+   "dir": 1,
+   "weight": 0.0996,
+   "votes": true,
+   "ic": 0.0996,
+   "consistency": 0.92,
+   "periods": 13,
+   "coverage": 0.809
+  }
+ },
+ "consensus_calib": [
+  {
+   "lo": 0,
+   "hi": 3.5,
+   "label": "Muy desfavorable",
+   "n": 34984,
+   "reach5": 0.85,
+   "win": 0.884,
+   "med": 13.2,
+   "p25": 7.0,
+   "p75": 23.1,
+   "hold_med": 30.0
+  },
+  {
+   "lo": 3.5,
+   "hi": 5.0,
+   "label": "Desfavorable",
+   "n": 19605,
+   "reach5": 0.877,
+   "win": 0.9,
+   "med": 17.8,
+   "p25": 9.3,
+   "p75": 28.2,
+   "hold_med": 30.0
+  },
+  {
+   "lo": 5.0,
+   "hi": 6.0,
+   "label": "Neutral",
+   "n": 17922,
+   "reach5": 0.917,
+   "win": 0.935,
+   "med": 20.7,
+   "p25": 13.0,
+   "p75": 31.2,
+   "hold_med": 30.0
+  },
+  {
+   "lo": 6.0,
+   "hi": 7.5,
+   "label": "Favorable",
+   "n": 21916,
+   "reach5": 0.928,
+   "win": 0.942,
+   "med": 23.5,
+   "p25": 15.4,
+   "p75": 33.9,
+   "hold_med": 30.0
+  },
+  {
+   "lo": 7.5,
+   "hi": 10.01,
+   "label": "Muy favorable",
+   "n": 36014,
+   "reach5": 0.938,
+   "win": 0.947,
+   "med": 30.0,
+   "p25": 19.4,
+   "p75": 46.1,
+   "hold_med": 30.0
+  }
+ ],
+ "consensus_calib_picks": [
+  {
+   "lo": 3.5,
+   "hi": 5.0,
+   "label": "Desfavorable",
+   "n": 2,
+   "reach5": 0.5,
+   "win": 0.5,
+   "med": -62.7,
+   "p25": -110.9,
+   "p75": -14.4,
+   "hold_med": 6.4
+  },
+  {
+   "lo": 5.0,
+   "hi": 6.0,
+   "label": "Neutral",
+   "n": 2,
+   "reach5": 0.0,
+   "win": 0.0,
+   "med": -43.4,
+   "p25": -57.1,
+   "p75": -29.7,
+   "hold_med": 3.9
+  },
+  {
+   "lo": 6.0,
+   "hi": 7.5,
+   "label": "Favorable",
+   "n": 8,
+   "reach5": 0.75,
+   "win": 0.75,
+   "med": 36.0,
+   "p25": 8.8,
+   "p75": 53.8,
+   "hold_med": 23.7
+  },
+  {
+   "lo": 7.5,
+   "hi": 10.01,
+   "label": "Muy favorable",
+   "n": 74,
+   "reach5": 0.811,
+   "win": 0.838,
+   "med": 45.7,
+   "p25": 19.0,
+   "p75": 77.7,
+   "hold_med": 30.0
+  }
+ ],
+ "analogs": {
+  "pred_cuts": [
+   6.56,
+   12.11,
+   18.49,
+   25.74
+  ],
+  "relw_cuts": [
+   1.74,
+   2.38
+  ],
+  "cells": {
+   "a0_p0_w0": {
+    "n": 433,
+    "reach5": 0.762,
+    "win": 0.845,
+    "med": 7.8,
+    "p25": 5.7,
+    "p75": 10.3,
+    "hold_med": 30.0
+   },
+   "a0_p0_w1": {
+    "n": 644,
+    "reach5": 0.674,
+    "win": 0.831,
+    "med": 7.3,
+    "p25": 3.1,
+    "p75": 9.2,
+    "hold_med": 29.1
+   },
+   "a0_p0_w2": {
+    "n": 2533,
+    "reach5": 0.624,
+    "win": 0.762,
+    "med": 7.2,
+    "p25": 0.6,
+    "p75": 8.9,
+    "hold_med": 30.0
+   },
+   "a0_p1_w0": {
+    "n": 572,
+    "reach5": 0.72,
+    "win": 0.86,
+    "med": 7.6,
+    "p25": 4.4,
+    "p75": 10.3,
+    "hold_med": 27.3
+   },
+   "a0_p1_w1": {
+    "n": 748,
+    "reach5": 0.717,
+    "win": 0.825,
+    "med": 7.6,
+    "p25": 3.8,
+    "p75": 10.9,
+    "hold_med": 30.0
+   },
+   "a0_p1_w2": {
+    "n": 714,
+    "reach5": 0.721,
+    "win": 0.775,
+    "med": 8.1,
+    "p25": 2.3,
+    "p75": 12.5,
+    "hold_med": 30.0
+   },
+   "a0_p2_w0": {
+    "n": 371,
+    "reach5": 0.739,
+    "win": 0.809,
+    "med": 8.3,
+    "p25": 4.0,
+    "p75": 11.2,
+    "hold_med": 30.0
+   },
+   "a0_p2_w1": {
+    "n": 436,
+    "reach5": 0.628,
+    "win": 0.711,
+    "med": 8.3,
+    "p25": -5.8,
+    "p75": 16.9,
+    "hold_med": 24.9
+   },
+   "a0_p2_w2": {
+    "n": 252,
+    "reach5": 0.75,
+    "win": 0.778,
+    "med": 10.2,
+    "p25": 5.1,
+    "p75": 19.0,
+    "hold_med": 27.9
+   },
+   "a0_p3_w0": {
+    "n": 162,
+    "reach5": 0.728,
+    "win": 0.815,
+    "med": 9.5,
+    "p25": 3.2,
+    "p75": 18.3,
+    "hold_med": 27.5
+   },
+   "a0_p3_w1": {
+    "n": 207,
+    "reach5": 0.715,
+    "win": 0.729,
+    "med": 12.0,
+    "p25": -2.9,
+    "p75": 25.5,
+    "hold_med": 24.2
+   },
+   "a0_p3_w2": {
+    "n": 132,
+    "reach5": 0.841,
+    "win": 0.864,
+    "med": 12.8,
+    "p25": 9.0,
+    "p75": 24.2,
+    "hold_med": 26.9
+   },
+   "a0_p4_w0": {
+    "n": 118,
+    "reach5": 0.653,
+    "win": 0.72,
+    "med": 9.6,
+    "p25": -1.9,
+    "p75": 16.6,
+    "hold_med": 21.7
+   },
+   "a0_p4_w1": {
+    "n": 80,
+    "reach5": 0.85,
+    "win": 0.887,
+    "med": 22.4,
+    "p25": 10.7,
+    "p75": 31.6,
+    "hold_med": 30.0
+   },
+   "a1_p0_w0": {
+    "n": 2724,
+    "reach5": 0.863,
+    "win": 0.888,
+    "med": 13.3,
+    "p25": 7.2,
+    "p75": 22.9,
+    "hold_med": 30.0
+   },
+   "a1_p0_w1": {
+    "n": 4505,
+    "reach5": 0.868,
+    "win": 0.898,
+    "med": 14.6,
+    "p25": 7.3,
+    "p75": 23.5,
+    "hold_med": 30.0
+   },
+   "a1_p0_w2": {
+    "n": 15243,
+    "reach5": 0.869,
+    "win": 0.894,
+    "med": 13.3,
+    "p25": 7.0,
+    "p75": 23.0,
+    "hold_med": 30.0
+   },
+   "a1_p1_w0": {
+    "n": 5461,
+    "reach5": 0.882,
+    "win": 0.898,
+    "med": 18.0,
+    "p25": 11.0,
+    "p75": 26.4,
+    "hold_med": 30.0
+   },
+   "a1_p1_w1": {
+    "n": 7870,
+    "reach5": 0.915,
+    "win": 0.928,
+    "med": 18.3,
+    "p25": 11.0,
+    "p75": 27.4,
+    "hold_med": 30.0
+   },
+   "a1_p1_w2": {
+    "n": 10739,
+    "reach5": 0.898,
+    "win": 0.909,
+    "med": 17.9,
+    "p25": 9.6,
+    "p75": 27.4,
+    "hold_med": 30.0
+   },
+   "a1_p2_w0": {
+    "n": 7989,
+    "reach5": 0.918,
+    "win": 0.939,
+    "med": 21.2,
+    "p25": 14.0,
+    "p75": 31.0,
+    "hold_med": 30.0
+   },
+   "a1_p2_w1": {
+    "n": 10726,
+    "reach5": 0.936,
+    "win": 0.949,
+    "med": 21.3,
+    "p25": 14.4,
+    "p75": 31.4,
+    "hold_med": 30.0
+   },
+   "a1_p2_w2": {
+    "n": 6256,
+    "reach5": 0.901,
+    "win": 0.919,
+    "med": 21.3,
+    "p25": 13.2,
+    "p75": 32.3,
+    "hold_med": 30.0
+   },
+   "a1_p3_w0": {
+    "n": 9590,
+    "reach5": 0.947,
+    "win": 0.957,
+    "med": 26.1,
+    "p25": 17.2,
+    "p75": 34.3,
+    "hold_med": 30.0
+   },
+   "a1_p3_w1": {
+    "n": 11569,
+    "reach5": 0.944,
+    "win": 0.956,
+    "med": 24.9,
+    "p25": 16.7,
+    "p75": 34.1,
+    "hold_med": 30.0
+   },
+   "a1_p3_w2": {
+    "n": 4485,
+    "reach5": 0.912,
+    "win": 0.923,
+    "med": 25.0,
+    "p25": 16.1,
+    "p75": 36.3,
+    "hold_med": 30.0
+   },
+   "a1_p4_w0": {
+    "n": 16020,
+    "reach5": 0.938,
+    "win": 0.944,
+    "med": 35.4,
+    "p25": 22.5,
+    "p75": 55.8,
+    "hold_med": 30.0
+   },
+   "a1_p4_w1": {
+    "n": 6715,
+    "reach5": 0.933,
+    "win": 0.942,
+    "med": 31.6,
+    "p25": 21.1,
+    "p75": 48.8,
+    "hold_med": 30.0
+   },
+   "a1_p4_w2": {
+    "n": 3122,
+    "reach5": 0.91,
+    "win": 0.92,
+    "med": 33.5,
+    "p25": 19.8,
+    "p75": 61.0,
+    "hold_med": 30.0
+   },
+   "a0_p0_wx": {
+    "n": 3610,
+    "reach5": 0.649,
+    "win": 0.784,
+    "med": 7.3,
+    "p25": 1.7,
+    "p75": 9.1,
+    "hold_med": 30.0
+   },
+   "a0_p1_wx": {
+    "n": 2034,
+    "reach5": 0.719,
+    "win": 0.817,
+    "med": 7.7,
+    "p25": 3.4,
+    "p75": 11.4,
+    "hold_med": 30.0
+   },
+   "a0_p2_wx": {
+    "n": 1059,
+    "reach5": 0.696,
+    "win": 0.761,
+    "med": 8.6,
+    "p25": 1.7,
+    "p75": 15.8,
+    "hold_med": 28.8
+   },
+   "a0_p3_wx": {
+    "n": 501,
+    "reach5": 0.752,
+    "win": 0.792,
+    "med": 12.3,
+    "p25": 5.4,
+    "p75": 21.3,
+    "hold_med": 26.3
+   },
+   "a0_p4_wx": {
+    "n": 223,
+    "reach5": 0.744,
+    "win": 0.794,
+    "med": 15.8,
+    "p25": 4.2,
+    "p75": 25.2,
+    "hold_med": 23.7
+   },
+   "a1_p0_wx": {
+    "n": 22472,
+    "reach5": 0.868,
+    "win": 0.894,
+    "med": 13.6,
+    "p25": 7.1,
+    "p75": 23.1,
+    "hold_med": 30.0
+   },
+   "a1_p1_wx": {
+    "n": 24070,
+    "reach5": 0.9,
+    "win": 0.913,
+    "med": 18.0,
+    "p25": 10.5,
+    "p75": 27.2,
+    "hold_med": 30.0
+   },
+   "a1_p2_wx": {
+    "n": 24971,
+    "reach5": 0.921,
+    "win": 0.938,
+    "med": 21.3,
+    "p25": 14.0,
+    "p75": 31.5,
+    "hold_med": 30.0
+   },
+   "a1_p3_wx": {
+    "n": 25644,
+    "reach5": 0.94,
+    "win": 0.951,
+    "med": 25.4,
+    "p25": 16.7,
+    "p75": 34.6,
+    "hold_med": 30.0
+   },
+   "a1_p4_wx": {
+    "n": 25857,
+    "reach5": 0.934,
+    "win": 0.941,
+    "med": 34.1,
+    "p25": 21.8,
+    "p75": 54.4,
+    "hold_med": 30.0
+   }
+  }
+ },
+ "ranking": {
+  "modelo (pred>0)": {
+   "pnl_usd": 1436.6,
+   "ret_ann_pct": 28.5,
+   "trades": 86,
+   "win_pct": 80.2,
+   "avg_hold_d": 20.3,
+   "days": 353
+  },
+  "modelo + filtro consenso > 5": {
+   "pnl_usd": 1444.6,
+   "ret_ann_pct": 28.7,
+   "trades": 86,
+   "win_pct": 80.2,
+   "avg_hold_d": 20.3,
+   "days": 353
+  },
+  "mezcla rango 1:0.3": {
+   "pnl_usd": 1574.4,
+   "ret_ann_pct": 31.3,
+   "trades": 83,
+   "win_pct": 84.3,
+   "avg_hold_d": 21.1,
+   "days": 353
+  },
+  "mezcla rango 1:1": {
+   "pnl_usd": 1375.7,
+   "ret_ann_pct": 27.3,
+   "trades": 79,
+   "win_pct": 88.6,
+   "avg_hold_d": 22.2,
+   "days": 353
+  },
+  "solo consenso": {
+   "pnl_usd": 956.5,
+   "ret_ann_pct": 19.0,
+   "trades": 71,
+   "win_pct": 90.1,
+   "avg_hold_d": 24.7,
+   "days": 353
+  }
+ },
+ "sizing": {
+  "sin sizing": {
+   "pnl": 1436.6234063999998,
+   "ann": 27.627373198247874,
+   "dd": 0.3573886752221601
+  },
+  "tiers ancho relativo (vigente)": {
+   "pnl": 1534.2289728999986,
+   "ann": 29.504403323128813,
+   "dd": 0.2656158249523424
+  },
+  "tiers consenso": {
+   "pnl": 1799.416515,
+   "ann": 34.604163747805416,
+   "dd": 0.42901968027420156
+  }
+ },
+ "size_by_consensus": true
+}

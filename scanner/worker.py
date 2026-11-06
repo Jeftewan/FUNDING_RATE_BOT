@@ -749,6 +749,8 @@ class ScannerWorker:
 
         # Sort by score DESC
         opportunities.sort(key=lambda o: o.get("score", 0), reverse=True)
+        # Consenso del panel de analistas (no cambia el orden; chip de la tarjeta).
+        self._attach_consensus(opportunities, all_data)
 
         # 6b. El análisis IA es bajo demanda (POST /api/opportunities/<id>/ai).
 
@@ -1051,6 +1053,65 @@ class ScannerWorker:
             log.warning(f"Market feature storage failed (non-critical): {e}")
             if hour is not None and self._mf_hour == hour:
                 self._mf_hour = None
+
+    # ── Consenso de analistas por oportunidad ─────────────────
+
+    def _recent_signal_rows(self, symbols: set, hours: int = 80) -> dict:
+        """{símbolo: filas horarias de market_feature_snapshots (últimas `hours`)} o {}."""
+        if not symbols or not self._flask_app:
+            return {}
+        try:
+            with self._flask_app.app_context():
+                from core.db_models import MarketFeatureSnapshot as M
+                lo = int(time.time() // 3600 * 3600) - hours * 3600
+                q = (M.query.with_entities(M.symbol, M.ts_hour, M.basis_pct, M.open_interest,
+                                           M.open_interest_usd, M.top_long_short_pos_ratio, M.volatility_7d)
+                     .filter(M.exchange == "Binance", M.ts_hour >= lo, M.symbol.in_(list(symbols)))
+                     .order_by(M.ts_hour.asc()).all())
+            out = {}
+            for r in q:
+                out.setdefault(r.symbol, []).append({
+                    "ts_hour": r.ts_hour, "basis_pct": r.basis_pct, "open_interest": r.open_interest,
+                    "open_interest_usd": r.open_interest_usd,
+                    "top_long_short_pos_ratio": r.top_long_short_pos_ratio, "volatility_7d": r.volatility_7d})
+            return out
+        except Exception as e:
+            log.warning(f"Señales para consenso no disponibles: {e}")
+            return {}
+
+    def _attach_consensus(self, opportunities: list, all_data: list):
+        """Agrega consensus/consensus_label/consensus_med_apr/consensus_reach a las
+        spot_perp Binance con predicción (analysis/analysts). Las rachas (necesitan
+        historia larga) solo se evalúan en el modal; aquí ese analista se abstiene."""
+        try:
+            from analysis import analysts
+            from analysis.opportunity_analysis import regime_median
+            from analysis.signal_features import signal_features
+            tbl = analysts.table()
+            if not tbl:
+                return
+            cands = [o for o in opportunities if o.get("mode") == "spot_perp"
+                     and o.get("exchange") == "Binance" and o.get("model_prediction") is not None]
+            sig = self._recent_signal_rows({o["symbol"] for o in cands})
+            regime, now = regime_median(all_data), time.time()
+            for o in cands:
+                h = o.get("history") or {}
+                vals = {"p_prod": o["model_prediction"], "relw": o.get("rel_width"),
+                        "streak": h.get("streak"), "pct": h.get("pct"), "regime_median_daily": regime}
+                vals.update(signal_features(sig.get(o["symbol"], []), now))
+                ev = analysts.evaluate(vals, tbl)
+                if not ev or ev.get("consensus") is None:
+                    continue
+                cal = ev.get("calib") or {}
+                voted = [a for a in ev["analysts"] if a["votes"] and a["vote"] is not None]
+                sm = analysts.size_mult(ev["consensus"], tbl)
+                if sm is not None:          # reemplaza el sizing por ancho relativo
+                    o["size_mult"] = sm
+                o.update(consensus=ev["consensus"], consensus_label=ev["label"],
+                         consensus_med_apr=cal.get("med"), consensus_reach=cal.get("reach5"),
+                         consensus_votes=f"{sum(a['vote'] > 0 for a in voted)}/{len(voted)}")
+        except Exception as e:
+            log.warning(f"Consenso no calculado: {e}")
 
     # ── Score Snapshot Storage (rolling window) ────────────────
 

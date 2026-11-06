@@ -1432,3 +1432,89 @@ body {
 @media (min-width: 1100px) {
   .c { max-width: 1000px; }
 }
+
+/* ── Modal "Análisis" por oportunidad ─────────────── */
+.btn-analysis {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-height: 40px;
+  margin-top: 8px; padding: 8px 12px; border-radius: var(--radius-sm);
+  background: var(--blue-bg); border: 1px solid #3b82f633; color: var(--blue);
+  font: 600 12px var(--font-ui); cursor: pointer; transition: background .15s, border-color .15s;
+}
+.btn-analysis:hover { background: #3b82f62a; border-color: #3b82f666; }
+.btn-analysis:focus-visible, .an-tab:focus-visible, .an-close:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+body.no-scroll { overflow: hidden; }
+.an-overlay {
+  position: fixed; inset: 0; z-index: 320; background: #000c;
+  display: flex; align-items: stretch; justify-content: center;
+}
+.an-modal {
+  background: var(--bg-card-solid); width: 100%; max-width: 860px; height: 100dvh;
+  display: flex; flex-direction: column; border-left: 1px solid var(--border-solid); border-right: 1px solid var(--border-solid);
+}
+@media (min-width: 900px) {
+  .an-overlay { align-items: center; padding: 24px; }
+  .an-modal { height: min(92dvh, 900px); border: 1px solid var(--border-solid); border-radius: 16px; box-shadow: 0 8px 40px rgba(0,0,0,.5); }
+}
+.an-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px 8px; }
+.an-head h2 { font: 700 18px var(--font-ui); color: var(--text-white); }
+.an-sub { font-size: 12px; font-weight: 500; color: var(--text-secondary); margin-left: 6px; }
+.an-close {
+  width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--border-hover);
+  background: transparent; color: var(--text-primary); font-size: 16px; cursor: pointer;
+}
+.an-close:hover { background: #ffffff10; }
+.an-tabs { display: flex; gap: 4px; padding: 0 12px; border-bottom: 1px solid var(--border-solid); }
+.an-tab {
+  min-height: 44px; padding: 0 14px; background: none; border: none; border-bottom: 2px solid transparent;
+  color: var(--text-secondary); font: 600 13px var(--font-ui); cursor: pointer;
+}
+.an-tab.active { color: var(--text-white); border-bottom-color: var(--blue); }
+.an-body { flex: 1; overflow-y: auto; padding: 16px; overscroll-behavior: contain; }
+.an-skel { height: 90px; border-radius: var(--radius-sm); margin-bottom: 12px;
+  background: linear-gradient(90deg, #15181e 25%, #1b1f27 50%, #15181e 75%); background-size: 200% 100%;
+  animation: an-shimmer 1.2s infinite; }
+.an-skel.short { height: 200px; }
+@keyframes an-shimmer { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .an-skel { animation: none; } }
+.an-error { color: var(--red); font-size: 13px; display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+.an-gauge { padding: 14px; border-radius: var(--radius); background: var(--bg-input); border: 1px solid var(--border-solid); margin-bottom: 14px; }
+.an-gauge-top { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+.an-cons { font: 700 34px var(--font); color: var(--text-white); }
+.an-cons small { font-size: 14px; color: var(--text-secondary); }
+.an-cons-label { font: 700 14px var(--font-ui); }
+.cons-pos .an-cons-label { color: var(--green); }
+.cons-neu .an-cons-label { color: var(--orange); }
+.cons-neg .an-cons-label { color: var(--red); }
+.an-gauge-bar { position: relative; height: 8px; border-radius: 4px;
+  background: linear-gradient(90deg, var(--red), var(--orange) 50%, var(--green)); }
+.an-gauge-bar span { position: absolute; top: -4px; width: 4px; height: 16px; margin-left: -2px; border-radius: 2px; background: #fff; box-shadow: 0 0 0 2px #000; }
+.an-gauge-scale { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-secondary); margin-top: 6px; }
+.an-kpis, .an-out-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 14px; }
+.an-kpis > div, .an-out-grid > div { background: var(--bg-input); border: 1px solid var(--border-solid); border-radius: var(--radius-sm); padding: 10px; display: flex; flex-direction: column; gap: 4px; }
+.an-kpis .label, .an-out-grid .label { font-size: 11px; color: var(--text-secondary); }
+.an-kpis .value, .an-out-grid .value { font: 600 15px var(--font); color: var(--text-white); font-variant-numeric: tabular-nums; }
+.an-kpis .value.green, .an-out-grid .value.green, .an-table .green { color: var(--green); }
+.an-kpis .value.red, .an-out-grid .value.red, .an-table .red { color: var(--red); }
+.an-outcome { margin-bottom: 6px; }
+.an-out-title { font: 600 13px var(--font-ui); color: var(--text-primary); margin-bottom: 8px; }
+.an-n { color: var(--text-secondary); font-weight: 400; }
+.an-h3 { font: 700 14px var(--font-ui); color: var(--text-white); margin: 6px 0 10px; }
+.an-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 10px; }
+.an-table th { text-align: left; font-size: 11px; font-weight: 600; color: var(--text-secondary); padding: 6px 8px; border-bottom: 1px solid var(--border-solid); }
+.an-table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.an-table td.num { font-family: var(--font); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.an-a-name { font-weight: 600; color: var(--text-primary); }
+.an-a-why { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+.an-info-row .an-a-name { color: var(--text-secondary); }
+.an-tag { font-size: 10px; font-weight: 500; padding: 1px 6px; border-radius: 8px; background: #ffffff10; color: var(--text-secondary); }
+.an-vote { font-weight: 600; white-space: nowrap; }
+.an-vote.v-pos { color: var(--green); }
+.an-vote.v-neu { color: var(--orange); }
+.an-vote.v-neg { color: var(--red); }
+.an-vote.v-na { color: var(--text-secondary); }
+.an-note { font-size: 12px; color: var(--text-secondary); line-height: 1.5; margin: 6px 0 14px; }
+.an-chart { margin-bottom: 18px; }
+.an-chart-wrap { position: relative; height: 220px; }
+@media (min-width: 900px) { .an-chart-wrap { height: 260px; } }
+.conf-chip.conf-mid { color: var(--orange); background: var(--orange-bg); }
+.conf-chip.conf-neg { color: var(--red); background: var(--red-bg); }

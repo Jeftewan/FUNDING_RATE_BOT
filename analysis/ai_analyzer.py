@@ -83,7 +83,9 @@ OPP_SYSTEM_PROMPT = (
     "tasas %), mins (minutos al proximo pago), conf (% de probabilidad calibrada de que el APR neto "
     "realizado sea >= 5 %; null = sin modelo de confianza), rango ([p10, p90] del APR neto realizado: la "
     "tasa suele caer a la mitad tras entrar, por eso el realizado queda bajo napr con frecuencia), tier "
-    "(alta/baja) y cap_sug (capital sugerido segun la confianza).\n\n"
+    "(alta/baja), cap_sug (capital sugerido segun la confianza), consenso (1-10 del panel de analistas; "
+    "5.5 neutro), votos (analista:+/=/-) e hist (casos historicos con ese consenso: n, reach5 = fraccion que "
+    "cumplio APR >= 5 %, win = fraccion con ganancia, med = APR neto mediano).\n\n"
     "Responde SOLO JSON: {\"analysis\":\"50-80 palabras: que paga, por que el modelo da ese veredicto, "
     "con numeros\",\"risks\":[\"1-3 riesgos concretos y medibles\"],\"watch\":\"que vigilar y cuando salir "
     "(regla del negocio: cerrar tras dos pagos seguidos <= 0)\",\"leverage\":\"una frase que justifique "
@@ -117,7 +119,19 @@ def opportunity_verdict(opp: dict) -> dict:
     return {"signal": "ENTRAR", "reason": f"Retorno neto esperado {napr:.1f} % anual sobre el nocional."}
 
 
-def _opp_facts(opp: dict, capital: float) -> dict:
+def _panel_facts(panel) -> dict:
+    """Resumen compacto del panel de analistas (analysis/analysts.evaluate) para el LLM."""
+    if not panel or panel.get("consensus") is None:
+        return {}
+    sign = {1: "+", 0: "=", -1: "-"}
+    cal = panel.get("calib") or {}
+    return {"consenso": panel["consensus"],
+            "votos": [f"{a['label']}:{sign.get(a['vote'], '?')}" for a in panel.get("analysts", [])
+                      if a.get("votes") and a.get("vote") is not None],
+            "hist": {k: cal.get(k) for k in ("n", "reach5", "win", "med")} if cal else None}
+
+
+def _opp_facts(opp: dict, capital: float, panel=None) -> dict:
     ind = opp.get("indicators", {}) or {}
     hist = opp.get("history", {}) or {}
     rates = hist.get("_rates") or []
@@ -143,10 +157,11 @@ def _opp_facts(opp: dict, capital: float) -> dict:
         "rango": [opp.get("apr_p10"), opp.get("apr_p90")] if opp.get("apr_p10") is not None else None,
         "tier": opp.get("confidence_tier"),
         "cap_sug": round(capital * opp["size_mult"]) if opp.get("size_mult") else None,
+        **_panel_facts(panel),
     }
 
 
-def analyze_opportunity(opp: dict, config, capital: float = 1000.0) -> dict:
+def analyze_opportunity(opp: dict, config, capital: float = 1000.0, panel=None) -> dict:
     """Análisis bajo demanda de UNA oportunidad.
 
     El veredicto es determinista (`opportunity_verdict`); Gemini solo redacta la
@@ -154,7 +169,7 @@ def analyze_opportunity(opp: dict, config, capital: float = 1000.0) -> dict:
     números sin texto del LLM (nunca lanza).
     """
     verdict = opportunity_verdict(opp)
-    facts = _opp_facts(opp, capital)
+    facts = _opp_facts(opp, capital, panel)
     out = {"signal": verdict["signal"], "reason": verdict["reason"], "facts": facts,
            "analysis": verdict["reason"], "risks": [], "watch": "", "leverage": "", "llm": False}
     api_key = _get_gemini_key(config)

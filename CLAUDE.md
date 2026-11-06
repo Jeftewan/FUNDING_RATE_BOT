@@ -1,6 +1,6 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-10-25** (auditoría de rentabilidad, rama `feat/profit-research`).
+Estado del proyecto al **2026-11-06** (panel de analistas y modal de análisis, rama `feat/opportunity-analysis`).
 
 ---
 
@@ -24,6 +24,40 @@ Estado del proyecto al **2026-10-25** (auditoría de rentabilidad, rama `feat/pr
 **El dashboard SPA no usa React.** Todo el threading del backend es stdlib. La landing es un bundle Vite estático servido por Caddy — el contenido visible vive en `frontend/site/static/landing/assets/index-*.js`, no en `frontend/site/index.html`. **Flask ya no sirve HTML** (`static_folder=None`): es API pura.
 
 ---
+
+## Análisis de oportunidad: panel de analistas + gráficas (2026-11-06, rama `feat/opportunity-analysis`)
+
+Pedido: dejar de ir a Coinglass para elegir y saber cuál oportunidad tiene más probabilidad de cumplirse.
+- **Modal "Análisis"** por tarjeta (Binance spot_perp) → `GET /api/opportunities/<id>/analysis?capital=`
+  (`analysis/opportunity_analysis.py`, caché 30 min por settlement, cada fuente opcional → `null`):
+  funding liquidado (`fapiPublicGetFundingRate` 1000), precio perp vs spot 1h × 30 d (Alpha: VWAP 1h
+  on-chain) + basis, OI USD y top L/S (`/futures/data` 1h), predicción en `score_snapshots`, rachas
+  anteriores. Pestañas Resumen / Gráficas (Chart.js, eje del funding recortado a p2–p98) / Picos.
+- **Panel de analistas** (`analysis/analysts.py`, tabla `models/analyst_table.json` de
+  `scripts/analyst_study.py --export`): cada variable vota por terciles; **solo votan las que separan el
+  APR realizado fuera de muestra** (|IC| ≥ 0.03 y signo estable ≥ 75 % de periodos, cortes no
+  degenerados). Votan: modelo (+0.40), incertidumbre `relw` (−0.19), OI `log_oi_usd` (+0.17),
+  `volatility_7d` (+0.10), edad de la racha (+0.04). **No separan**: basis, tendencia del basis, flujo de
+  OI, top traders (contexto). Consenso 1–10 = media de votos ponderada por IC.
+- **Hallazgo clave**: P(APR ≥ 5 %) es 85–94 % en todos los tramos → la probabilidad no discrimina; el
+  consenso sí ordena **cuánto** rinde (APR mediano 13 % → 30 %). La UI muestra frecuencias reales
+  (consenso y "análogos" = quintil de predicción × venue × ancho) con n de casos. Orden de la lista: el
+  del modelo (ordenar por consenso no fue robusto). **Sizing**: consenso reemplaza a `relw`
+  (1.25× ≥ 6 / 0.75× ≤ 5): 34.6 % vs 29.5 % anual, mejor en 5/5 trimestres (`size_by_consensus`).
+- Lista: `scanner/worker.py:_attach_consensus` agrega `consensus`, `consensus_label`, `consensus_votes`,
+  `consensus_med_apr`, `consensus_reach` y pisa `size_mult`; señales desde `market_feature_snapshots`
+  (últimas 80 h). La edad de la racha solo en el modal (necesita historia larga) → el chip puede diferir
+  un poco. Orden "Consenso" en la barra. IA: recibe `consenso/votos/hist` y ahora sí `lr` (antes vacío).
+- **Señales con historia** (`scripts/signals_dataset.py --days 105`, ~22 min): OI y top L/S de
+  data.binance.vision `futures/um/daily/metrics` (cada 5 min; columnas `sum_open_interest`,
+  `sum_open_interest_value`, `sum_toptrader_long_short_ratio` = top L/S posición; el taker de vision
+  es un punto de 5 min → no se usa), basis de velas 1h (CEX cierres; Alpha VWAP on-chain). Features
+  diarios en `analysis/signal_features.py` (mismo código offline/prod). Paridad `--check` vs prod:
+  ρ 0.93–1.00 salvo `basis_chg_24h` 0.66 (no usarla).
+- **Modelo v3 con señales** (`scripts/ml_v3_signals.py`, `reports/ml_v3_signals_20261106.md`): mejor en
+  WF (IC 0.532 vs 0.503, 177 vs 158 USD) pero peor en hold-out de 2 semanas con 4–6 trades → **no se
+  exporta**. Re-probar con ≥ 6 meses (`signals_dataset.py --days 200`). Reporte de analistas:
+  `reports/analyst_study_20261106.md`. Re-exportar la tabla junto al loop de `ml_v2`.
 
 ## Confianza por oportunidad (2026-10-30, rama `feat/opportunity-confidence`)
 
@@ -140,7 +174,10 @@ analysis/
   scoring.py            # Heurístico v11.0 (0–100) — fallback del modelo ML
   ml_features.py        # Feature-builder compartido (paridad train/inferencia)
   ml_scorer.py          # Prod: carga el .joblib y rankea (modelo manda)
-  ml_confidence.py      # Prod: confianza/rango p10–p90/tier de sizing (no cambia el ranking)
+  ml_confidence.py      # Prod: confianza/rango p10–p90 (no cambia el ranking)
+  analysts.py           # Panel de analistas: votos, consenso 1–10, calibración, rachas, sizing
+  opportunity_analysis.py # Modal "Análisis": series para gráficas + panel (caché por settlement)
+  signal_features.py    # Features diarios de señales horarias (paridad offline/prod)
   indicators.py         # Momentum, z-score, percentil, régimen
   fees.py               # Estimación fees (CCXT + orderbook + fallback)
   ai_analyzer.py        # Prompts Gemini, parse JSON, COMPRAR/MANTENER/EVITAR
