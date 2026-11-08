@@ -161,9 +161,11 @@ class ProtectionWatcher:
         r = self.runner
         r._save_protection(pos["id"], {**prot, "status": "triggered", "triggered_at": time.time(),
                                        "triggered_by": trigger})
+        r.cancel_armed_for_position(uid, pos["id"], "Seguro disparado: cierre urgente en curso")
         with self.app.app_context():
             jid = r.submit(uid, "close", {"position_id": int(pos["id"]), "symbol": pos.get("symbol", ""),
-                                          "twap": None, "token": token or {}, "trigger": "protection"})
+                                          "twap": {"slices": 1, "duration_s": 0}, "token": token or {},
+                                          "trigger": "protection"})
         r._alert(uid, pos.get("symbol", ""), f"{msg} (job #{jid}).", severity="WARNING",
                  typ="PROTECTION_TRIGGERED")
 
@@ -220,9 +222,10 @@ class ProtectionWatcher:
                 return False
             self._alerted[(pos["id"], "naked")] = now
             if _auto_unwind():
+                r.cancel_armed_for_position(uid, pos["id"], "Short desaparecido: cierre urgente en curso")
                 with self.app.app_context():
                     jid = r.submit(uid, "close", {"position_id": int(pos["id"]), "symbol": sym,
-                                                  "twap": None, "token": token or {},
+                                                  "twap": {"slices": 1, "duration_s": 0}, "token": token or {},
                                                   "trigger": "naked_spot"})
                 r._alert(uid, sym, f"El short de {sym} ya no existe (¿liquidado?) y el spot quedó "
                                    f"descubierto: vendiendo el spot (job #{jid}).", typ="NAKED_SPOT")

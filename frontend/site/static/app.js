@@ -1330,9 +1330,11 @@ async function autoExecuteOpen(oppId, idx) {
   const meta = { ..._oppMeta[oppId], capital: cap, leverage: lev };
   const ans = await showExecConfirm('open', meta);
   if (ans.choice === 'cancel') return;
+  // On-chain siempre pasa por la simulación: muestra el costo ida y vuelta antes de confirmar.
+  const previewFirst = ans.choice === 'dry' || meta.has_spot === false;
   await runExec('/api/execute_open',
-    { opportunity_id: oppId, capital: cap, leverage: lev, dry_run: ans.choice === 'dry', twap: ans.twap },
-    ans.choice === 'dry', 'open', `Apertura ${meta.symbol}`);
+    { opportunity_id: oppId, capital: cap, leverage: lev, dry_run: previewFirst, twap: ans.twap, execution: ans.execution },
+    previewFirst, 'open', `Apertura ${meta.symbol}`);
 }
 
 async function autoExecuteClose(posId, symbol) {
@@ -1345,7 +1347,7 @@ async function autoExecuteClose(posId, symbol) {
   const ans = await showExecConfirm('close', meta);
   if (ans.choice === 'cancel') return;
   await runExec('/api/execute_close',
-    { position_id: posId, dry_run: ans.choice === 'dry', twap: ans.twap },
+    { position_id: posId, dry_run: ans.choice === 'dry', twap: ans.twap, execution: ans.execution },
     ans.choice === 'dry', 'close', `Cierre ${symbol}`);
 }
 
@@ -1355,6 +1357,7 @@ function showExecConfirm(kind, meta) {
   const isCross = meta.mode === 'cross_exchange';
   const sym = meta.symbol;
   const onchain = !isCross && meta.has_spot === false;
+  const isBsc = !isCross && (onchain || meta.spot_venue === 'bsc');
   let legsHtml;
   if (kind === 'open') {
     legsHtml = isCross
@@ -1388,6 +1391,13 @@ function showExecConfirm(kind, meta) {
         <div class="exec-sub">${head}</div>
         <ul class="exec-legs">${legsHtml}</ul>
         ${sizeNote}
+        ${isBsc ? `
+        <label class="exec-twap" for="exec-mode">Ejecución</label>
+        <select id="exec-mode" class="exec-mode">
+          <option value="patient">Esperar basis favorable (hasta 6 h) · recomendado</option>
+          <option value="now">Ejecutar ahora</option>
+          <option value="limit">Orden límite on-chain (piloto)</option>
+        </select>` : ''}
         ${isCross ? '' : `
         <label class="exec-twap"><input type="checkbox" id="exec-twap-on"> TWAP pareado (montos grandes)</label>
         <div class="exec-twap-cfg" id="exec-twap-cfg" style="display:none">
@@ -1420,8 +1430,9 @@ function showExecConfirm(kind, meta) {
     };
     const close = (choice) => {
       const twap = readTwap();
+      const execution = overlay.querySelector('#exec-mode')?.value;
       overlay.remove(); document.removeEventListener('keydown', onEsc);
-      resolve({ choice, twap });
+      resolve({ choice, twap, execution });
     };
     overlay.querySelector('[data-action="cancel"]').onclick = () => close('cancel');
     overlay.querySelector('[data-action="dry"]').onclick = () => close('dry');
@@ -1477,6 +1488,7 @@ function watchJob(jobId, title, kind) {
     <div class="job-box" id="job-box">
       <div class="exec-spinner"></div>
       <div id="job-progress" class="job-progress">Iniciando…</div>
+      <button class="btn btn-calc" id="job-fire" style="width:100%;margin-top:10px;display:none" onclick="fireJob(${jobId})">Ejecutar ya</button>
       <button class="btn btn-secondary" style="width:100%;margin-top:10px" onclick="cancelJob(${jobId})">Detener (cubre lo ejecutado)</button>
       <div class="exec-note" style="margin-top:8px">Puedes cerrar esta ventana: la ejecución sigue en el servidor y recibirás el resultado por Telegram.</div>
     </div>`;
@@ -1490,19 +1502,26 @@ function watchJob(jobId, title, kind) {
       const pr = j.progress || {};
       const el = document.getElementById('job-progress');
       if (el) {
-        el.innerHTML = pr.phase === 'close'
-          ? `Spot vendido: <strong>${_fmtQty(pr.spot_sold)}</strong> · Short recomprado: <strong>${_fmtQty(pr.perp_closed)}</strong>`
-          : pr.phase === 'open'
-            ? `Spot neto: <strong>${_fmtQty(pr.spot_net)}</strong> · Short cubierto: <strong>${_fmtQty(pr.perp_hedged)}</strong>${pr.slices_done != null && j.params?.twap ? ` · tramo ${pr.slices_done + 1}/${j.params.twap.slices}` : ''}`
-            : `Estado: ${j.status}`;
+        el.innerHTML = j.status === 'armed'
+          ? _armedText(j)
+          : pr.phase === 'limit'
+            ? 'Orden límite on-chain activa: el perp se cubre con cada llenado.'
+            : pr.phase === 'close'
+              ? `Spot vendido: <strong>${_fmtQty(pr.spot_sold)}</strong> · Short recomprado: <strong>${_fmtQty(pr.perp_closed)}</strong>`
+              : pr.phase === 'open'
+                ? `Spot neto: <strong>${_fmtQty(pr.spot_net)}</strong> · Short cubierto: <strong>${_fmtQty(pr.perp_hedged)}</strong>${pr.slices_done != null && j.params?.twap ? ` · tramo ${pr.slices_done + 1}/${j.params.twap.slices}` : ''}`
+                : `Estado: ${j.status}`;
       }
-      if (['done', 'failed', 'canceled', 'interrupted'].includes(j.status)) {
+      const fireBtn = document.getElementById('job-fire');
+      if (fireBtn) fireBtn.style.display = j.status === 'armed' ? '' : 'none';
+      if (['done', 'failed', 'canceled', 'cancelled', 'expired', 'interrupted'].includes(j.status)) {
         _jobTimer = null;
         const r = j.result || {};
         if (j.status === 'done') {
           showExecResult(title, { exec: r }, false, j);
         } else {
-          document.getElementById('modal-title').textContent = `${title} · ${j.status === 'failed' ? 'falló' : j.status}`;
+          const statusLabel = { failed: 'falló', expired: 'venció la espera', cancelled: 'cancelado' }[j.status] || j.status;
+          document.getElementById('modal-title').textContent = `${title} · ${statusLabel}`;
           document.getElementById('modal-body').innerHTML = `
             <div class="exec-warn">${j.error || r.msg || 'La ejecución no se completó'}</div>
             ${r.partial ? '<div class="exec-note">Se guardó la parte ejecutada y cubierta como posición.</div>' : ''}`;
@@ -1511,10 +1530,52 @@ function watchJob(jobId, title, kind) {
         if (kind === 'open') loadCurrentOpps();
         return;
       }
+      if (j.status === 'armed') { _jobTimer = setTimeout(poll, 15000); return; }
     } catch (e) { /* reintento */ }
     _jobTimer = setTimeout(poll, 2000);
   };
   poll();
+}
+
+function _armedText(j) {
+  const pr = j.progress || {};
+  const wait = j.params?.wait || {};
+  const until = wait.deadline ? new Date(wait.deadline * 1000).toLocaleTimeString() : '—';
+  const now = pr.basis_pct != null ? `${(+pr.basis_pct).toFixed(3)}%` : 'midiendo…';
+  const how = wait.mode === 'limit' ? 'orden límite' : 'swap';
+  return `Esperando basis para ${how}: actual <strong>${now}</strong> · umbral <strong>${(+wait.theta).toFixed(2)}%</strong> · vence ${until}`;
+}
+
+async function fireJob(jobId) {
+  try {
+    const res = await fetch(`/api/exec/jobs/${jobId}/fire`, { method: 'POST' });
+    const data = await res.json();
+    showToast(data.msg || 'Solicitado', data.ok ? 'info' : 'warning');
+    loadArmedJobs();
+  } catch (e) { showToast('Error de red', 'error'); }
+}
+
+async function cancelArmedJob(jobId) {
+  await cancelJob(jobId);
+  setTimeout(loadArmedJobs, 1000);
+}
+
+async function loadArmedJobs() {
+  const box = document.getElementById('armed-jobs');
+  if (!box) return;
+  try {
+    const res = await fetch('/api/exec/jobs/armed');
+    if (!res.ok) return;
+    const data = await res.json();
+    box.innerHTML = (data.jobs || []).map(j => `
+      <div class="armed-job">
+        <div><strong>${j.kind === 'open' ? 'Apertura' : 'Cierre'} ${j.params?.symbol || ''}</strong> · ${_armedText(j)}</div>
+        <div class="armed-actions">
+          <button class="btn btn-secondary" onclick="cancelArmedJob(${j.id})">Cancelar</button>
+          <button class="btn btn-calc" onclick="fireJob(${j.id})">Ejecutar ya</button>
+        </div>
+      </div>`).join('');
+  } catch (e) { /* non-fatal */ }
 }
 
 async function cancelJob(jobId) {
@@ -1573,8 +1634,16 @@ function showExecResult(title, data, isDry, job) {
     if (!w.ok) extra += `<div class="exec-warn" style="margin:6px 0">${w.msg}</div>`;
     else if ((w.transfers || []).length) extra += `<div class="exec-note">Se transferirá automáticamente: ${w.transfers.map(t => `$${t.amount} → ${t.to === 'future' ? 'Futuros' : 'Spot'}`).join(', ')}</div>`;
   }
+  const cost = ex.execution_cost;
+  if (cost && cost.rt_cost_pct != null) {
+    extra += `<div class="est-row"><span>Costo ida y vuelta estimado</span><span class="est-val">${(+cost.rt_cost_pct).toFixed(2)}%</span></div>`;
+    if (cost.payback_days != null) {
+      extra += `<div class="est-row"><span>Días de funding para pagarlo</span><span class="est-val">${cost.payback_days}</span></div>`;
+      if (cost.payback_days > 10) extra += `<div class="exec-warn" style="margin:6px 0">Tarda más de 10 días en pagar su costo. Confirma solo si piensas sostener la posición ese tiempo.</div>`;
+    }
+  }
   if (tw && tw.suggest) {
-    extra += `<div class="exec-note">Sugerido TWAP: ${tw.slices} tramos en ~${Math.round(tw.duration_s / 60)} min (profundidad ±0.2%: ${tw.depth_usd_0_2pct ? '$' + Math.round(tw.depth_usd_0_2pct) : 'n/d'}).</div>`;
+    extra += `<div class="exec-note">Sugerido TWAP: ${tw.slices} tramos en ~${Math.round(tw.duration_s / 60)} min${tw.depth_usd_0_2pct ? ` (profundidad ±0.2%: $${Math.round(tw.depth_usd_0_2pct)})` : (tw.impact_pct != null ? ` (impacto sin trocear: ${(+tw.impact_pct).toFixed(2)}%)` : '')}.</div>`;
   }
   if (ex.drift) extra += `<div class="exec-warn" style="margin:6px 0">${ex.drift}</div>`;
   if (ex.partial_note) extra += `<div class="exec-warn" style="margin:6px 0">${ex.partial_note}</div>`;
@@ -1605,6 +1674,7 @@ window._runExecContinue = function () {
 
 // ── Positions ─────────────────────────────────────────────────
 async function loadPositions() {
+  loadArmedJobs();
   const posEl = document.getElementById('pos-list');
   if (!posEl.children.length || posEl.querySelector('.skeleton-card')) showSkeletons(posEl, 2);
   try {

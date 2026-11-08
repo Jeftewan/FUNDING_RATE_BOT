@@ -825,6 +825,18 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         from exchanges import onchain_bsc
         return lambda pc, ps, ctx: onchain_bsc.BscSpotLeg(wallet, token, ctx, pc, ps)
 
+    def _execution_wait(execution, spot_venue, side, notional):
+        """(wait, error). On-chain espera basis por defecto; 'now' ejecuta ya; 'limit' es el piloto."""
+        from exchanges import onchain_bsc
+        from execution.jobs import wait_params
+        if spot_venue != "bsc" or execution == "now":
+            return None, None
+        if execution == "limit":
+            if notional > onchain_bsc.LIMIT_MAX_USD:
+                return None, f"El piloto de orden límite admite hasta ${onchain_bsc.LIMIT_MAX_USD} por orden."
+            return wait_params("limit", side), None
+        return wait_params("basis", side), None
+
     @app.route("/api/execute_open", methods=["POST"])
     @auth_required
     def api_execute_open():
@@ -919,8 +931,13 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
 
         if not job_runner:
             return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
-        if job_runner.active_job(uid):
+        wait, err = _execution_wait(data.get("execution"), spot_venue, "buy", capital - capital / (leverage + 1))
+        if err:
+            return jsonify({"ok": False, "msg": err})
+        if not wait and job_runner.active_job(uid):
             return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
+        if job_runner.armed_open_for_symbol(uid, opp.get("symbol")):
+            return jsonify({"ok": False, "msg": f"Ya hay una apertura de {opp.get('symbol')} esperando basis."})
 
         # Fondos en la wallet correcta (y transfer automático si está habilitado).
         if is_binance_sp:
@@ -935,6 +952,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             "allow_market_fallback": bool(data.get("allow_market_fallback", True)),
             "spot_venue": "bsc" if spot_venue == "bsc" else "", "token": token or {},
         }
+        if wait:
+            params["wait"] = wait
         jid = job_runner.submit_exclusive(uid, "open", params)
         if jid is None:
             return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
@@ -1050,11 +1069,19 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
 
         if not job_runner:
             return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
-        if job_runner.active_job(uid):
+        notional = float(pos.get("spot_qty") or 0) * float(pos.get("entry_price") or 0)
+        wait, err = _execution_wait(data.get("execution"), "bsc" if pos.get("spot_venue") == "bsc" else "",
+                                    "sell", notional)
+        if err:
+            return jsonify({"ok": False, "msg": err})
+        if job_runner.active_job_for_position(uid, db_pos_id, include_armed=True):
+            return jsonify({"ok": False, "msg": "Esta posición ya tiene un cierre en curso o en espera."})
+        if not wait and job_runner.active_job(uid):
             return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
-        jid = job_runner.submit_exclusive(uid, "close", {"position_id": db_pos_id,
-                                                         "symbol": pos.get("symbol"),
-                                                         "twap": twap, "token": token})
+        close_params = {"position_id": db_pos_id, "symbol": pos.get("symbol"), "twap": twap, "token": token}
+        if wait:
+            close_params["wait"] = wait
+        jid = job_runner.submit_exclusive(uid, "close", close_params)
         if jid is None:
             return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
         log.info(f"Exec job #{jid} close pos={db_pos_id} user={uid}")
@@ -1078,6 +1105,24 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         job = job_runner.active_job(uid) if job_runner and uid else None
         return jsonify({"ok": True, "job": job_runner.to_dict(job) if job else None})
 
+    @app.route("/api/exec/jobs/armed")
+    @auth_required
+    def api_exec_jobs_armed():
+        uid = get_current_user_id()
+        jobs = job_runner.armed_jobs(uid) if job_runner and uid else []
+        return jsonify({"ok": True, "jobs": [job_runner.to_dict(j) for j in jobs]})
+
+    @app.route("/api/exec/jobs/<int:job_id>/fire", methods=["POST"])
+    @auth_required
+    def api_exec_job_fire(job_id):
+        from core.db_models import ExecutionJob
+        uid = get_current_user_id()
+        job = ExecutionJob.query.filter_by(id=job_id, user_id=uid).first()
+        if not job or job.status != "armed" or not job_runner:
+            return jsonify({"ok": False, "msg": "La ejecución ya no está en espera"})
+        job_runner.request_fire(job)
+        return jsonify({"ok": True, "msg": "Se ejecutará en el próximo ciclo (máx. 1 min)"})
+
     @app.route("/api/exec/jobs/<int:job_id>/cancel", methods=["POST"])
     @auth_required
     def api_exec_job_cancel(job_id):
@@ -1085,7 +1130,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         from core.db_models import ExecutionJob
         uid = get_current_user_id()
         job = ExecutionJob.query.filter_by(id=job_id, user_id=uid).first()
-        if not job or job.status not in ("queued", "running"):
+        if not job or job.status not in ("queued", "running", "armed"):
             return jsonify({"ok": False, "msg": "El job no está activo"})
         job.cancel_requested = True
         _db.session.commit()

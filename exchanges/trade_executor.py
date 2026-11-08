@@ -1080,15 +1080,16 @@ def _cancel_bsc_limit(wallet, spot) -> tuple:
     return (alive, *_bsc_filled(spot, o))
 
 
-def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None) -> dict:
-    """Cancela las órdenes de seguro vivas. Devuelve fees/qty de lo que ya se
-    había llenado (para sumarlo al cierre)."""
+def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None,
+                               only=None) -> dict:
+    """Cancela las órdenes de seguro vivas (`only`: solo esas piernas). Devuelve
+    fees/qty de lo que ya se había llenado (para sumarlo al cierre)."""
     out = {"perp_filled": 0.0, "perp_cost": 0.0, "tp_filled": 0.0, "spot_filled": 0.0,
            "spot_cost": 0.0, "fee_usd": 0.0}
     alive = []
     for leg, label in (("perp", "SL del short"), ("tp", "take profit del short")):
         perp = prot.get(leg)
-        if not _leg_active(perp):
+        if not _leg_active(perp) or (only and leg not in only):
             continue
         o = None
         for attempt in range(3):
@@ -1114,7 +1115,7 @@ def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wal
             if leg == "tp":
                 out["tp_filled"] = f["gross"]
     spot = prot.get("spot")
-    if _leg_active(spot):
+    if _leg_active(spot) and (not only or "spot" in only):
         if spot.get("venue") == "bsc":
             if wallet:
                 bsc_alive, filled, cost = _cancel_bsc_limit(wallet, spot)
@@ -1541,7 +1542,8 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
 
     if dry_run:
         sugg = twap_suggestion(spot_cli, spot_sym, plan["spot_size"]) if not onchain else \
-            {"suggest": plan["spot_size"] > 5000, "slices": 1, "duration_s": 0}
+            {"suggest": False, "slices": 1, "duration_s": 0}
+        cost = {}
         if onchain:
             # Cotización real del agregador: valida acceso (región/keys) y basis.
             try:
@@ -1551,10 +1553,13 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
                 plan["spot_amt"] = plan["base_target"]
                 if px:
                     plan["basis_pct"] = round((plan["perp_bid"] - px) / px * 100, 4)
+                sugg = leg.suggest_slices(plan["base_target"], "buy", ref_px=plan["perp_bid"])
+                cost = leg.cost_estimate(plan["base_target"], plan["perp_bid"])
+                cost["payback_days"] = payback_days(cost.get("rt_cost_pct"), opp)
             except Exception as e:
                 raise ExecError(f"No se pudo cotizar el spot on-chain: {e}", code="ONCHAIN_QUOTE")
         return {
-            "ok": True, "dry_run": True,
+            "ok": True, "dry_run": True, "execution_cost": cost,
             "entry_price": plan["perp_mid"],
             "entry_fees_usd": round(plan["spot_size"] * 2 * 0.0006, 4),
             "order_ids": [],
@@ -1605,6 +1610,9 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
             return False
         return bool(spot_ask and perp_bid and spot_ask <= perp_bid * (1 + MAX_NEG_BASIS))
 
+    if onchain and not (twap or {}).get("slices") and hasattr(leg, "suggest_slices") \
+            and not hasattr(leg, "limit_window"):
+        twap = leg.suggest_slices(plan["base_target"], "buy", ref_px=plan.get("perp_bid") or plan["perp_mid"])
     slices = max(1, int((twap or {}).get("slices") or 1))
     duration = float((twap or {}).get("duration_s") or 0)
     interval = duration / slices if slices > 1 else 0
@@ -1661,7 +1669,8 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
         if state["spot_net"] > 0:
             unwound = _unwind_spot(leg, state["spot_net"])
             msg += f" (spot residual {'vendido' if unwound else 'NO vendido — revisa'})"
-        return {"ok": False, "msg": msg, "unwound": True}
+        return {"ok": False, "msg": msg, "unwound": True,
+                "limit_unfilled": bool(getattr(leg, "unfilled", False) and not error and not ctx.cancelled())}
 
     res = _open_result(exchange, spot_sym, perp_sym, leg, hedger, state, leverage, onchain)
     res["ok"] = True
@@ -1713,7 +1722,8 @@ def _open_result(exchange, spot_sym, perp_sym, leg, hedger, state, leverage, onc
         "exposure": hedger.hedged * perp_px,
         "capital_used": state["spot_cost"] + hedger.hedged * perp_px / max(1, leverage),
         "order_ids": spot_ids + hedger.order_ids,
-        "entry_mode": "onchain_swap" if onchain else "maker_paired",
+        "entry_mode": getattr(leg, "entry_mode", "onchain_swap") if onchain else "maker_paired",
+        "swaps": list(getattr(leg, "swaps", [])), "limit_log": list(getattr(leg, "limit_log", [])),
         "basis_pct": basis,
         "spot_venue": "bsc" if onchain else exchange.lower(),
         "legs": [
@@ -1943,10 +1953,13 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     # Seguros primero: la venta límite bloquea la base (saldo libre) y el SL no
     # debe dispararse a mitad del cierre. Lo que ya llenaron cuenta como salida.
     prot_fill = {}
+    # Venta límite de cierre: comparte saldo con el seguro spot; el SL sigue vivo durante la espera.
+    keep_sl = bool(getattr(leg, "keep_perp_sl", False))
     if position.get("protection") and not dry_run:
         prot_fill = _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym,
                                                position["protection"],
-                                               getattr(leg, "wallet", None))
+                                               getattr(leg, "wallet", None),
+                                               only=("spot",) if keep_sl else None)
     actual_short = _open_perp_size(perp_cli, perp_sym, "short")
     if actual_short is None:
         raise ExecError("No se pudo leer la posición perp tras cancelar los seguros; cierre "
@@ -1972,6 +1985,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     if dry_run:
         _, _, pmid = _top_of_book(perp_cli, perp_sym, position.get("entry_price", 0))
         return {"ok": True, "dry_run": True, "drift": drift,
+                "twap": leg.suggest_slices(spot_to_sell, "sell") if onchain and spot_to_sell
+                and hasattr(leg, "suggest_slices") else None,
                 "exit_fees_usd": round(spot_to_sell * pmid * 2 * 0.0006, 4), "order_ids": [],
                 "legs": [
                     {"side": "sell", "kind": "spot", "symbol": spot_sym, "amount": spot_to_sell,
@@ -2012,6 +2027,9 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         if err:
             raise ExecError(f"Falló la recompra del perp: {err}", code="HEDGE_FAILED")
 
+    if onchain and actual_short and spot_to_sell and not twap.get("slices") \
+            and hasattr(leg, "suggest_slices") and not hasattr(leg, "limit_window"):
+        twap = leg.suggest_slices(spot_to_sell, "sell")
     slices = max(1, int(twap.get("slices") or 1))
     duration = float(twap.get("duration_s") or 0)
     interval = duration / slices if slices > 1 else 0
@@ -2019,6 +2037,7 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     if spot_to_sell and not actual_short:
         window = 0       # spot desnudo (el SL ya cerró el short): taker ya, sin esperar maker
     error = None
+    short_gone = False
     try:
         for i in range(slices):
             if ctx.cancelled():
@@ -2036,6 +2055,7 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     except ExecError as e:
         error = e
     except Exception as e:
+        short_gone = type(e).__name__ == "ShortGone"
         error = ExecError(f"Error vendiendo el spot: {e}")
 
     # Cobertura final: el perp se cierra en proporción a lo vendido; si se vendió
@@ -2045,7 +2065,7 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     remaining = max(0.0, spot_to_sell - state["sold"])
     fully_sold = (spot_to_sell <= 0 or state["sold"] >= spot_to_sell * 0.999
                   or (not error and not ctx.cancelled() and _is_dust(leg, remaining, ref)))
-    if hedger.failed is None:
+    if hedger.failed is None and not short_gone:
         target = perp_to_close if fully_sold else state["sold"] * ratio
         hedger.target(target, force_all=fully_sold)
     if hedger.failed is not None:
@@ -2080,9 +2100,72 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     res.update(_close_pnl(position, state, hedger, prot_fill, ref, ext))
     if getattr(leg, "exit_log", None):
         res["exec"]["exit_swaps"] = leg.exit_log
+    if getattr(leg, "swaps", None):
+        res["exec"]["swaps"] = leg.swaps
+    if getattr(leg, "limit_log", None):
+        res["exec"]["limit_log"] = leg.limit_log
     if error or ctx.cancelled():
         res["partial_note"] = str(error) if error else "Cancelado por el usuario"
+    if keep_sl:
+        res["kept_legs"] = ["perp", "tp"]
+        res["short_gone"] = short_gone
+        res["limit_unfilled"] = bool(getattr(leg, "unfilled", False) and not state["sold"]
+                                     and not error and not ctx.cancelled())
+        if res["complete"] and position.get("protection"):
+            # Ya no hay short: un closePosition vivo cerraría una posición futura del símbolo.
+            try:
+                _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, position["protection"],
+                                           None, only=("perp", "tp"))
+            except ExecError as e:
+                res["sl_cancel_error"] = str(e)
     return res
+
+
+def expected_daily_pct(opp: dict) -> float:
+    """Funding diario esperado (% del nocional): predicción del modelo, o la tasa vigente."""
+    pred = opp.get("model_prediction")
+    if pred and pred > 0:
+        return float(pred) / 365
+    return float(opp.get("daily_income_per_1000") or 0) / 10
+
+
+def payback_days(rt_cost_pct, opp: dict):
+    """Días de funding para pagar el costo ida y vuelta. None si no se puede estimar."""
+    daily = expected_daily_pct(opp)
+    return round(rt_cost_pct / daily, 1) if rt_cost_pct is not None and daily > 0 else None
+
+
+class BasisProbe:
+    """Basis ejecutable al tamaño de cada tramo, en %: lo que capturaría operar ahora."""
+
+    def __init__(self, perp_cli, perp_sym, leg, side: str, base: float, slices: int):
+        self.perp_cli, self.perp_sym, self.leg = perp_cli, perp_sym, leg
+        self.side, self.part = side, base / max(1, slices)
+
+    def read(self) -> dict:
+        bid, ask, _ = _top_of_book(self.perp_cli, self.perp_sym, 0)
+        if self.side == "buy":
+            px = self.leg.quote_price(self.part, "buy", ref_px=bid)
+            pct = (bid - px) / px * 100 if px else None
+        else:
+            px = self.leg.quote_price(self.part, "sell")
+            pct = (px - ask) / ask * 100 if px and ask else None
+        return {"basis_pct": None if pct is None else round(pct, 4), "px": px, "perp": bid or ask}
+
+
+def basis_probe(creds_by_exchange: dict, exchange: str, symbol: str, spot_leg_factory, side: str,
+                base: float = None, capital: float = None, leverage: int = 1) -> BasisProbe:
+    """Prepara la lectura periódica del basis de una ejecución en espera. Reusa los clientes
+    (cargar mercados en cada lectura pesa); `base` o, para abrir, capital y leverage."""
+    perp_cli = _build_client(exchange, creds_by_exchange[exchange.lower()], default_type="swap")
+    _ensure_markets(perp_cli)
+    perp_sym = to_ccxt_symbol(symbol, "swap")
+    leg = spot_leg_factory(perp_cli, perp_sym, ExecContext())
+    bid, _, mid = _top_of_book(perp_cli, perp_sym, 0)
+    if base is None:
+        base = (capital - capital / (leverage + 1)) / mid if mid else 0
+    slices = int(leg.suggest_slices(base, side, ref_px=bid).get("slices") or 1)
+    return BasisProbe(perp_cli, perp_sym, leg, side, base, slices)
 
 
 def _is_dust(leg, amt: float, ref) -> bool:

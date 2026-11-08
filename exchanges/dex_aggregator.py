@@ -34,6 +34,8 @@ CHAIN_ID = "56"
 # Binance Web3: 40301/40302 región bloqueada, 40304 "compliance restriction" (NL).
 REGION_CODES = {40301, 40302, 40304}
 REGION_TTL = 3600
+KYBER_RETRIES = 3
+KYBER_RETRY_STATUS = {403, 429, 500, 502, 503, 504}
 
 
 class AggregatorError(RuntimeError):
@@ -200,8 +202,13 @@ class KyberSwapAggregator:
         self.h = {"x-client-id": self.CLIENT_ID}
 
     def _req(self, method, path, params=None, body=None):
-        r = requests.request(method, self.BASE + path, params=params, json=body, headers=self.h,
-                             timeout=15)
+        # Kyber limita con 403/429 sin avisar (job #31 de ZEST: "Forbidden" y cierre fallido).
+        for attempt in range(KYBER_RETRIES + 1):
+            r = requests.request(method, self.BASE + path, params=params, json=body, headers=self.h,
+                                 timeout=15)
+            if r.status_code not in KYBER_RETRY_STATUS or attempt == KYBER_RETRIES:
+                break
+            time.sleep(float(r.headers.get("Retry-After") or 2 ** attempt))
         try:
             j = r.json()
         except ValueError:
