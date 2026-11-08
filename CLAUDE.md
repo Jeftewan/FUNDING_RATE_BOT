@@ -1,6 +1,18 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-11-06** (panel de analistas y modal de análisis, rama `feat/opportunity-analysis`).
+Estado del proyecto al **2026-11-08** (costo de ejecución on-chain, rama `feat/onchain-execution`).
+
+---
+
+## Ejecución on-chain: costo de entrada y salida (2026-11-08, rama `feat/onchain-execution`)
+
+Caso **ZEST #52** (1,601 USD, 9 d): funding +12.20, comisiones −1.55, basis a mid +2.22, slippage −18.72, neto −5.86. El swap de entrada pagó 0.93 %: sándwich en el bloque 130479149 (idx 2 y 4 compran y revenden 13,355.5 ZEST en el pool `0x238a3588`, ≈ 6.3 USD) más impacto real. `scripts/swap_audit.py`: 4 de 15 swaps con sándwich (0.78 % vs 0.22 % de slippage medio); 4/11 antes de `BSC_PRIVATE_RPC_URL`, 0/4 después. Balance de las 5 cerradas: slippage = 180 % del funding.
+- **Volumen 24 h on-chain y `liquidity` de la lista Alpha predicen poco** (ρ −0.24 a −0.45); lo que decide es la cotización a tamaño completo. Impacto casi lineal en tamaño.
+- `reports/execution_study_20261108.md` (`scripts/execution_study.py`, walk-forward, funding ≥ 0.05 %/día): ida y vuelta swap inmediato −0.79 % mediana; **swap paciente troceado 6 h basis ≥ 0.4 %: +0.30 %, p5 −0.54 %**, 5/5 trimestres → espera activa por defecto. Límite con gate +0.22 % con p5 −1.03 %. Dos límites al mismo precio: nunca > 0 (no atómicas; compra límite llena al bajar, venta límite al subir).
+- **Fase 1**: `DEFAULT_SLIPPAGE` 0.2 % (recotiza 2 veces si revierte); `_sign_and_send(allow_public=False)` en swaps normales: sin canal protegido aborta, nunca mempool pública (solo `naked_exit` y `unwind`). `exec.swaps` guarda cotizado, mínimo, impacto y canal. Kyber con backoff ante 403/429.
+- **Fase 2**: `dry_run` on-chain devuelve `execution_cost` (`rt_cost_pct`, `payback_days`) y el modal siempre simula primero. Auto-troceo apertura y cierre (`suggest_slices`: tramos ≤ 0.15 % de impacto, máx 6, 45 s); los cierres del vigilante pasan `twap` de 1 tramo.
+- **Fase 3**: job `armed` (no ocupa el cupo de `_ACTIVE`; `execution: patient|now|limit` en `/api/execute_open|close`, default patient en BSC). Basis ejecutable al tamaño del tramo: entrada ≥ 0.25, salida ≥ −0.15 (`PATIENT_*`), 6 h. Vence → `expired` + Telegram (la posición sigue). `entry_time` = `fired_at`. Vigilante cancela el `armed` (`cancel_armed_for_position`) y nunca espera. Rutas `/api/exec/jobs/armed`, `/<id>/fire`.
+- **Fase 4 (piloto, opt-in, ≤ 3,000 USD)**: `BscLimitLeg` una sola límite on-chain anclada al perp (θ 0.2 %, tope 0.1 % sobre mid, TTL ≤ 10 min, re-ancla si se mueve ≥ 0.1 %); perp taker por cada llenado medido por `balanceOf`. Sin llenar: entrada `expired`, salida re-arma swap paciente. El SL sigue vivo durante la venta (`keep_perp_sl`, solo se cancela el seguro spot y se repone si no vende). Reinicio con orden viva: `_recover_limit` cierra la orden, mide saldo y cubre contra el short real. **Evaluar tras ≥ 10 órdenes contra swap paciente; si no gana, se apaga.**
 
 ---
 

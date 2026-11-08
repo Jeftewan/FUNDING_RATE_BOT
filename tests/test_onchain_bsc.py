@@ -43,7 +43,7 @@ def chain(monkeypatch):
     monkeypatch.setattr(ob, "erc20_balance", lambda tok, owner: c.bal.get(tok.lower(), 0))
     monkeypatch.setattr(ob, "erc20_allowance", lambda tok, o, sp: c.allow.get(tok.lower(), 0))
 
-    def send(wallet, tx, agg=None):
+    def send(wallet, tx, agg=None, **kw):
         if tx.get("_swap"):
             src, dst, amt = tx["_swap"]
             if amt > c.bal.get(src.lower(), 0):
@@ -184,7 +184,7 @@ def test_onchain_close_full_balance_with_float_dust(chain, perp):
     perp.short = 170
     pos = {"mode": "spot_perp", "symbol": "XYZ", "exchange": "Binance", "spot_venue": "bsc",
            "spot_qty": 170.163324011631, "perp_qty": 170, "entry_price": 2.0}
-    res = te.execute_close(CREDS, pos, spot_leg_factory=_factory(chain))
+    res = te.execute_close(CREDS, pos, spot_leg_factory=_factory(chain), twap={"slices": 1, "duration_s": 0})
     assert res["ok"] and res["complete"], res
     assert chain.bal[TOKEN["address"].lower()] == 0
     assert perp.short == pytest.approx(0)

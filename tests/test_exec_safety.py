@@ -375,7 +375,7 @@ def bsc_env(monkeypatch):
     monkeypatch.setattr(ob, "erc20_balance", lambda tok, owner: c.bal.get(tok.lower(), 0))
     monkeypatch.setattr(ob, "erc20_allowance", lambda tok, o, sp: 10 ** 40)
 
-    def send(wallet, tx, agg=None):
+    def send(wallet, tx, agg=None, **kw):
         src, dst, amt = tx["_swap"]
         c.bal[src.lower()] -= amt
         c.bal[dst.lower()] = c.bal.get(dst.lower(), 0) + box["agg"].out(src, amt)
@@ -394,14 +394,14 @@ def bsc_env(monkeypatch):
     monkeypatch.setattr(te, "_ensure_markets", lambda cl: None)
     monkeypatch.setattr(te.time, "sleep", lambda s: None)
 
-    def close(real_impact, oracle_impact, short, qty=500.0, held=None):
+    def close(real_impact, oracle_impact, short, qty=500.0, held=None, twap=None):
         box["agg"] = agg = _OracleAgg(c, real_impact, oracle_impact)
         box["last"] = agg
         c.bal[t.TOKEN["address"].lower()] = ob.to_wei(qty if held is None else held, 18)
         ex.short = short
         pos = {"mode": "spot_perp", "symbol": "XYZ", "exchange": "Binance", "spot_venue": "bsc",
                "spot_qty": qty, "perp_qty": qty, "entry_price": 2.0}
-        return te.execute_close(t.CREDS, pos, spot_leg_factory=lambda pc, ps, ctx: ob.BscSpotLeg(
+        return te.execute_close(t.CREDS, pos, twap=twap, spot_leg_factory=lambda pc, ps, ctx: ob.BscSpotLeg(
             t.WALLET, t.TOKEN, ctx, pc, ps, aggregator=agg))
     close.box = box
     return close, ex
@@ -416,7 +416,8 @@ def test_bsc_sell_ignores_oracle_impact_when_pool_is_fine(bsc_env):
 
 def test_naked_bsc_close_accepts_real_impact_but_hedged_close_does_not(bsc_env):
     close, ex = bsc_env
-    res = close(real_impact=0.03, oracle_impact=None, short=500)    # short vivo: 3 % se bloquea
+    res = close(real_impact=0.03, oracle_impact=None, short=500,    # short vivo: 3 % se bloquea
+                twap={"slices": 1, "duration_s": 0})
     assert res["spot_sold"] == 0 and "impacto" in (res.get("partial_note") or ""), res
     assert ex.short == pytest.approx(500)
     res = close(real_impact=0.03, oracle_impact=None, short=0)      # spot desnudo: se vende
@@ -449,7 +450,7 @@ def test_naked_bsc_slice_reverted_retries_with_normal_slippage(bsc_env, monkeypa
     send, receipt = ob._sign_and_send, ob.wait_receipt
     calls = {"n": 0}
 
-    def flaky_send(wallet, tx, agg=None):
+    def flaky_send(wallet, tx, agg=None, **kw):
         calls["n"] += 1
         return "0xrev" if calls["n"] == 1 else send(wallet, tx, agg)
     monkeypatch.setattr(ob, "_sign_and_send", flaky_send)
@@ -458,7 +459,7 @@ def test_naked_bsc_slice_reverted_retries_with_normal_slippage(bsc_env, monkeypa
     res = close(real_impact=0.0, oracle_impact=None, short=0)
     assert res["ok"] and res["spot_sold"] == pytest.approx(500), res
     assert close.box["last"].slippages[0] == ob.EXIT_SLIPPAGE
-    assert close.box["last"].slippages[-1] == ob.DEFAULT_SLIPPAGE
+    assert close.box["last"].slippages[-1] == ob.NAKED_RETRY_SLIPPAGE
 
 
 def test_failed_close_after_sl_fill_records_perp_leg(env, monkeypatch):

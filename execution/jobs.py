@@ -22,6 +22,19 @@ from datetime import datetime, timezone
 log = logging.getLogger("bot.jobs")
 
 _ACTIVE = ("queued", "running")
+_ARMED = "armed"
+ARMED_POLL = 60
+# Basis ejecutable al tamaño de cada tramo, en %. Equivale a basis a mid ≥ 0.4 para entrar y ≤ 0
+# para salir menos ~0.15 % de impacto por tramo (reports/execution_study_20261108.md).
+PATIENT_WINDOW_S = 6 * 3600
+PATIENT_ENTRY_BASIS = 0.25
+PATIENT_EXIT_BASIS = -0.15
+
+
+def wait_params(mode: str, side: str) -> dict:
+    """Configuración de una ejecución en espera. mode: 'basis' (swap) o 'limit' (piloto)."""
+    return {"mode": mode, "side": side, "deadline": time.time() + PATIENT_WINDOW_S,
+            "theta": PATIENT_ENTRY_BASIS if side == "buy" else PATIENT_EXIT_BASIS}
 
 
 class JobRunner:
@@ -48,18 +61,39 @@ class JobRunner:
         return ExecutionJob.query.filter(ExecutionJob.user_id == user_id,
                                          ExecutionJob.status.in_(_ACTIVE)).first()
 
-    def active_job_for_position(self, user_id, position_id):
+    def active_job_for_position(self, user_id, position_id, include_armed=False):
         from core.db_models import ExecutionJob
         if position_id is None:
             return None
+        statuses = _ACTIVE + (_ARMED,) if include_armed else _ACTIVE
         return ExecutionJob.query.filter(ExecutionJob.user_id == user_id,
                                          ExecutionJob.position_id == int(position_id),
-                                         ExecutionJob.status.in_(_ACTIVE)).first()
+                                         ExecutionJob.status.in_(statuses)).first()
+
+    def armed_jobs(self, user_id):
+        from core.db_models import ExecutionJob
+        return ExecutionJob.query.filter(ExecutionJob.user_id == user_id,
+                                         ExecutionJob.status == _ARMED).order_by(ExecutionJob.id).all()
+
+    def armed_open_for_symbol(self, user_id, symbol):
+        return next((j for j in self.armed_jobs(user_id)
+                     if j.kind == "open" and (j.params_json or {}).get("symbol") == symbol), None)
+
+    def cancel_armed_for_position(self, user_id, position_id, reason):
+        from core.db_models import ExecutionJob
+        with self._submit_lock, self.app.app_context():
+            jobs = ExecutionJob.query.filter(ExecutionJob.user_id == user_id,
+                                             ExecutionJob.position_id == int(position_id),
+                                             ExecutionJob.status == _ARMED).all()
+            ids = [j.id for j in jobs]
+        for jid in ids:
+            self._update(jid, status="cancelled", error=reason)
 
     def submit_exclusive(self, user_id: int, kind: str, params: dict):
-        """submit() solo si el usuario no tiene otro job activo (atómico). None si ocupado."""
+        """submit() solo si el usuario no tiene otro job activo (atómico). None si ocupado.
+        Una ejecución en espera no ocupa el cupo: horas de espera no bloquean otras operaciones."""
         with self._submit_lock:
-            if self.active_job(user_id):
+            if not params.get("wait") and self.active_job(user_id):
                 return None
             return self.submit(user_id, kind, params)
 
@@ -67,14 +101,92 @@ class JobRunner:
         """Crea el job (llamar dentro de app context) y lanza su thread."""
         from core.database import db
         from core.db_models import ExecutionJob
-        job = ExecutionJob(user_id=user_id, kind=kind, status="queued",
+        armed = bool(params.get("wait"))
+        job = ExecutionJob(user_id=user_id, kind=kind, status=_ARMED if armed else "queued",
                            params_json=params, progress_json={}, result_json={},
                            position_id=params.get("position_id"))
         db.session.add(job)
         db.session.commit()
         jid = job.id
-        threading.Thread(target=self._run, args=(jid,), daemon=True, name=f"job-{jid}").start()
+        target = self._watch_armed if armed else self._run
+        threading.Thread(target=target, args=(jid,), daemon=True, name=f"job-{jid}").start()
         return jid
+
+    # ── Ejecución en espera de basis ───────────────────────────────────
+    def _watch_armed(self, jid):
+        probe = None
+        while True:
+            job = self._load(jid)
+            if not job or job["status"] != _ARMED:
+                return
+            try:
+                wait = job["params"]["wait"]
+                if self._cancelled(jid):
+                    self._update(jid, status="cancelled", error="Cancelado por el usuario")
+                    return
+                if job["kind"] == "close" and not self._load_pos(job["params"]["position_id"]):
+                    self._update(jid, status="cancelled", error="La posición ya no está activa")
+                    return
+                if wait.get("force") and self._fire(job):
+                    return
+                if time.time() >= float(wait["deadline"]):
+                    self._expire(job)
+                    return
+                if not wait.get("force"):
+                    probe = probe or self._make_probe(job)
+                    read = probe.read()
+                    self._update(jid, progress_json={"phase": "armed", **read, "theta": wait["theta"],
+                                                     "deadline": wait["deadline"]})
+                    if read["basis_pct"] is not None and read["basis_pct"] >= wait["theta"] and self._fire(job):
+                        return
+            except Exception as e:
+                log.warning(f"armed job {jid}: {e}")
+                probe = None
+            time.sleep(ARMED_POLL)
+
+    def _make_probe(self, job):
+        from exchanges import trade_executor as texec
+        p, uid = job["params"], job["user_id"]
+        factory = self._swap_leg_factory(uid, p["token"], p.get("max_slippage"))
+        if job["kind"] == "open":
+            opp = p["opportunity"]
+            creds = self._creds(uid, [opp["exchange"]])
+            return texec.basis_probe(creds, opp["exchange"], opp["symbol"], factory, "buy",
+                                     capital=float(p["capital"]), leverage=int(p["leverage"]))
+        pos = self._load_pos(p["position_id"])
+        creds = self._creds(uid, [pos["exchange"]])
+        return texec.basis_probe(creds, pos["exchange"], pos["symbol"], factory, "sell",
+                                 base=float(pos["spot_qty"]))
+
+    def _fire(self, job) -> bool:
+        """Pasa a ejecución si el usuario no tiene otro job corriendo. False → sigue en espera."""
+        jid = job["id"]
+        with self._submit_lock:
+            with self.app.app_context():
+                if self.active_job(job["user_id"]):
+                    return False
+            params = {**job["params"], "fired_at": time.time()}
+            if params["wait"].get("force"):
+                params["wait"] = {**params["wait"], "mode": "basis"}
+            self._update(jid, status="queued", params_json=params)
+        threading.Thread(target=self._run, args=(jid,), daemon=True, name=f"job-{jid}").start()
+        return True
+
+    def _expire(self, job):
+        p, sym = job["params"], job["params"].get("symbol", "")
+        msg = (f"{sym}: el basis no llegó al umbral en la ventana; no se abrió la posición."
+               if job["kind"] == "open" else
+               f"{sym}: el basis no llegó al umbral en la ventana; la posición sigue abierta cobrando funding.")
+        self._update(job["id"], status="expired", error=msg)
+        self._alert(job["user_id"], sym, msg, severity="INFO", typ="EXEC_WAIT_EXPIRED")
+
+    def request_fire(self, job):
+        """«Ejecutar ya»: la espera termina en el próximo ciclo, con swap."""
+        from core.database import db
+        params = dict(job.params_json or {})
+        params["wait"] = {**params["wait"], "force": True}
+        job.params_json = params
+        db.session.commit()
 
     @staticmethod
     def to_dict(job) -> dict:
@@ -135,8 +247,13 @@ class JobRunner:
         last = {"t": 0}
 
         def progress(data):
-            # Throttle de escrituras a DB (≥1 s entre updates).
-            if time.time() - last["t"] >= 1:
+            # Throttle de escrituras a DB (≥1 s entre updates), salvo estado que debe sobrevivir
+            # a un reinicio (orden límite viva): los avances de la cobertura no lo pisan.
+            if "limit" in data:
+                last["limit"] = data["limit"]
+            elif last.get("limit"):
+                data = {**data, "limit": last["limit"]}
+            if data.pop("_force", False) or time.time() - last["t"] >= 1:
                 last["t"] = time.time()
                 self._update(jid, progress_json=data)
 
@@ -162,14 +279,18 @@ class JobRunner:
     def _spot_leg_factory(self, uid, params):
         if params.get("spot_venue") != "bsc":
             return None
+        limit = (params.get("wait") or {}).get("mode") == "limit"
+        return self._swap_leg_factory(uid, params.get("token") or {}, params.get("max_slippage"), limit)
+
+    def _swap_leg_factory(self, uid, token, max_slippage=None, limit=False):
         from exchanges import onchain_bsc
         wallet = self._load_wallet(uid)
         if not wallet:
             raise RuntimeError("Configura tu wallet BSC dedicada en la pestaña Cuenta")
-        token = params.get("token") or {}
-        return lambda perp_cli, perp_sym, ctx: onchain_bsc.BscSpotLeg(
+        cls = onchain_bsc.BscLimitLeg if limit else onchain_bsc.BscSpotLeg
+        return lambda perp_cli, perp_sym, ctx: cls(
             wallet, token, ctx, perp_cli, perp_sym,
-            max_slippage=float(params.get("max_slippage", onchain_bsc.DEFAULT_SLIPPAGE)))
+            max_slippage=float(max_slippage if max_slippage is not None else onchain_bsc.DEFAULT_SLIPPAGE))
 
     def _run(self, jid):
         job = self._load(jid)
@@ -207,16 +328,24 @@ class JobRunner:
         fill = res if res.get("ok") else res.get("partial")
         pos_id = None
         if fill and (fill.get("perp_qty") or 0) > 0:
-            # entry_time = inicio del job: el funding cobrado durante un TWAP largo
-            # también pertenece a esta posición.
+            # entry_time = inicio de la ejecución: el funding cobrado durante un TWAP largo
+            # también pertenece a esta posición; las horas en espera de basis, no.
             started = job.get("created_at")
             entry_ms = int(started.replace(tzinfo=timezone.utc).timestamp() * 1000) if started else None
+            if p.get("fired_at"):
+                entry_ms = int(float(p["fired_at"]) * 1000)
             pos_id = self._save_open_position(uid, jid, opp, p, fill, entry_ms=entry_ms)
         prot = None
         # También una apertura parcial (falló la cobertura del resto) queda con seguros.
         if pos_id and mode == "spot_perp":
             prot = self._protect(uid, pos_id, creds, ctx, token=p.get("token"))
             res["protection"] = prot
+        if res.get("limit_unfilled"):
+            sym = opp.get("symbol", "")
+            msg = f"{sym}: la orden límite no se llenó en la ventana; no se abrió la posición."
+            self._update(jid, status="expired", result_json=_jsonable(res), error=msg)
+            self._alert(uid, sym, msg, severity="INFO", typ="EXEC_WAIT_EXPIRED")
+            return
         status = "done" if res.get("ok") else "failed"
         self._update(jid, status=status, result_json=_jsonable(res), position_id=pos_id,
                      error=None if res.get("ok") else res.get("msg"))
@@ -294,6 +423,46 @@ class JobRunner:
             log.warning(f"protection status pos={pos.get('id')}: {e}")
         self._protect(uid, pos["id"], creds, token=token)
 
+    def _restore_after_close(self, uid, pos, creds, token, res):
+        if res.get("kept_legs"):
+            self._restore_spot_protection(uid, pos, token)
+        else:
+            self._restore_protection(uid, pos, creds, token)
+
+    def _restore_spot_protection(self, uid, pos, token=None):
+        """La venta límite de cierre reemplazó al seguro spot: si no vendió todo, se repone
+        (el SL del short nunca se canceló, así que _restore_protection no actuaría)."""
+        from exchanges import kyber_limit_order as klo
+        from exchanges import onchain_bsc as bsc
+        prot = dict(pos.get("protection") or {})
+        spot = dict(prot.get("spot") or {})
+        if spot.get("venue") != "bsc" or prot.get("status") not in ("active", "runner"):
+            return
+        sym = pos.get("symbol", "")
+        try:
+            wallet, token = self._bsc_args(uid, pos, token)
+            held = bsc.from_wei(bsc.erc20_balance(token["address"], wallet["address"]), int(token["decimals"]))
+            qty = min(float(pos.get("spot_qty") or 0), held)
+            if qty <= 0:
+                return
+            lo = klo.place_sell(wallet, token, qty, prot.get("spot_price") or prot["sl_price"])
+            prot["spot"] = {**spot, "id": lo["id"], "status": "open", "qty": qty, "expires_at": lo["expires_at"]}
+            self._save_protection(pos["id"], prot)
+        except Exception as e:
+            log.error(f"restore spot protection pos={pos.get('id')}: {e}")
+            self._alert(uid, sym, f"{sym}: no se pudo reponer la venta límite del seguro: {e}. Ponla manualmente.")
+
+    def _rearm_close(self, job):
+        """Venta límite sin llenar: el cierre sigue por swap paciente."""
+        p = dict(job["params"])
+        p.pop("fired_at", None)
+        p["wait"] = wait_params("basis", "sell")
+        self._update(job["id"], status=_ARMED, params_json=p, error="Límite sin llenar: esperando basis para swap")
+        self._alert(job["user_id"], p.get("symbol", ""),
+                    f"{p.get('symbol', '')}: la venta límite no se llenó; el cierre sigue esperando basis "
+                    f"para hacer swap.", severity="INFO", typ="EXEC_WAIT_EXPIRED")
+        threading.Thread(target=self._watch_armed, args=(job["id"],), daemon=True).start()
+
     def _save_open_position(self, uid, jid, opp, p, fill, entry_ms=None) -> int:
         from core.db_persistence import DBPersistence
         from portfolio.manager import open_position
@@ -368,6 +537,21 @@ class JobRunner:
                                       uid, {**p, "spot_venue": pos.get("spot_venue"),
                                             "token": p.get("token") or {}}))
         sym = pos.get("symbol", "")
+        if res.get("sl_cancel_error"):
+            self._alert(uid, sym, f"{sym}: cierre completo pero el SL sigue vivo ({res['sl_cancel_error']}). "
+                                  f"Cancélalo en Binance antes de abrir de nuevo este símbolo.")
+        if res.get("short_gone"):
+            # El SL cerró el short durante la venta límite: el vigilante lanza el cierre urgente.
+            if res.get("spot_sold") or res.get("perp_closed"):
+                self._apply_partial_close(pos, res, add_fees=float(res.get("exit_fees_usd") or 0))
+            self._update(jid, status="failed", result_json=_jsonable(res), error=res.get("partial_note"))
+            self._alert(uid, sym, f"{sym}: el SL se disparó durante la venta límite. El vigilante cierra "
+                                  f"lo que quede.", severity="WARNING")
+            return
+        if res.get("limit_unfilled"):
+            self._restore_spot_protection(uid, self._load_pos(pos["id"]) or pos, p.get("token"))
+            self._rearm_close(job)
+            return
         if res.get("price_pnl_unknown"):
             self._alert(uid, sym, f"{sym}: el short se cerró fuera de basyo y su recompra no se pudo "
                                   f"leer ({res['price_pnl_unknown']}). El PnL de precio queda sin "
@@ -378,7 +562,7 @@ class JobRunner:
             # Si algo se ejecutó, ajustar cantidades registradas (y sus fees reales).
             if res.get("spot_sold") or res.get("perp_closed") or _protection_qty(res):
                 self._apply_partial_close(pos, res, add_fees=float(res.get("exit_fees_usd") or 0))
-            self._restore_protection(uid, self._load_pos(pos["id"]) or pos, creds, p.get("token"))
+            self._restore_after_close(uid, self._load_pos(pos["id"]) or pos, creds, p.get("token"), res)
             return
 
         exit_fees = float(res.get("exit_fees_usd") or 0)
@@ -392,7 +576,7 @@ class JobRunner:
                 # Los seguros sí cerraron una pierna (p. ej. el SL): registrarla, o el
                 # reintento la daría por abierta y perdería su PnL (AGT #44, 2026-10-23).
                 self._apply_partial_close(pos, res, add_fees=exit_fees)
-            self._restore_protection(uid, pos, creds, p.get("token"))
+            self._restore_after_close(uid, pos, creds, p.get("token"), res)
             return
         if res.get("complete", True) and not res.get("partial_note"):
             # Último income real antes de cerrar (captura el pago más reciente).
@@ -409,7 +593,7 @@ class JobRunner:
                          error=res.get("partial_note"))
             remaining = self._load_pos(pos["id"])
             if remaining:
-                self._restore_protection(uid, remaining, creds, p.get("token"))
+                self._restore_after_close(uid, remaining, creds, p.get("token"), res)
 
     def _apply_partial_close(self, pos, res, add_fees=0.0):
         from core.database import db
@@ -432,9 +616,10 @@ class JobRunner:
                 # intente cancelarlos otra vez. _restore_protection los repone si aplica.
                 prot = dict(row.protection_json)
                 tp_filled = float(pf.get("tp_filled") or 0)
+                kept = res.get("kept_legs") or ()
                 for leg, filled in (("perp", float(pf.get("perp_filled") or 0) - tp_filled),
                                     ("tp", tp_filled), ("spot", float(pf.get("spot_filled") or 0))):
-                    if (prot.get(leg) or {}).get("status") == "open":
+                    if leg not in kept and (prot.get(leg) or {}).get("status") == "open":
                         prot[leg] = {**prot[leg], "status": "filled" if filled > 1e-12 else "canceled"}
                 row.protection_json = prot
             if add_fees:
@@ -506,17 +691,24 @@ class JobRunner:
         from core.db_models import ExecutionJob
         try:
             with self.app.app_context():
-                stale = [(j.id, j.status) for j in
-                         ExecutionJob.query.filter(ExecutionJob.status.in_(_ACTIVE)).all()]
+                stale = [(j.id, j.status, (j.progress_json or {}).get("limit")) for j in
+                         ExecutionJob.query.filter(ExecutionJob.status.in_(_ACTIVE + (_ARMED,))).all()]
         except Exception as e:
             log.warning(f"job recovery query failed: {e}")
             return
-        for jid, status in stale:
+        for jid, status, limit in stale:
+            if status == _ARMED:
+                # Sin órdenes vivas: la espera continúa donde iba.
+                threading.Thread(target=self._watch_armed, args=(jid,), daemon=True).start()
+                continue
             if status == "queued":
                 threading.Thread(target=self._run, args=(jid,), daemon=True).start()
                 continue
             try:
-                self._reconcile(jid)
+                if limit:
+                    self._recover_limit(jid, limit)
+                else:
+                    self._reconcile(jid)
             except Exception as e:
                 log.exception(f"reconcile job {jid} failed: {e}")
                 self._update(jid, status="interrupted",
@@ -526,6 +718,91 @@ class JobRunner:
                     self._alert(job["user_id"], job["params"].get("symbol", ""),
                                 f"Job #{jid} interrumpido por reinicio y no se pudo reconciliar: "
                                 f"{e}. Revisa tu cuenta.")
+
+    def _recover_limit(self, jid, limit):
+        """Reinicio con orden límite viva: se cierra la orden, se mide por saldo lo llenado
+        y se cubre contra el short real. El TTL corto acota lo que pudo pasar mientras tanto."""
+        from exchanges import kyber_limit_order as klo
+        from exchanges import onchain_bsc as bsc
+        job = self._load(jid)
+        uid, side = job["user_id"], limit["side"]
+        token, wallet = limit["token"], self._load_wallet(uid)
+        if limit.get("order_id"):
+            klo.finalize(wallet, int(limit["order_id"]), bsc.LIMIT_CANCEL_WAIT, bsc.LIMIT_POLL)
+        now = bsc.erc20_balance(token["address"], wallet["address"])
+        start = int(limit["start_wei"])
+        filled = bsc.from_wei(max(0, now - start if side == "buy" else start - now), int(token["decimals"]))
+        px = float(limit.get("order_px") or 0)
+        prior = float(limit.get("prior_base") or 0)
+        cost = float(limit.get("prior_cost") or 0) + max(0.0, filled - prior) * px
+        if job["kind"] == "open":
+            self._recover_limit_open(job, filled, cost)
+        else:
+            self._recover_limit_close(job, filled, cost)
+
+    def _recover_limit_open(self, job, filled, cost):
+        from exchanges import trade_executor as texec
+        jid, uid, p = job["id"], job["user_id"], job["params"]
+        opp = p["opportunity"]
+        sym = opp.get("symbol", "")
+        if filled <= 0:
+            self._update(jid, status="interrupted", error="Reinicio con orden límite sin llenar; no se abrió")
+            return
+        creds = self._creds(uid, [opp["exchange"]])
+        perp_cli = texec._build_client(opp["exchange"], creds[opp["exchange"].lower()], "swap")
+        texec._ensure_markets(perp_cli)
+        perp_sym = texec.to_ccxt_symbol(sym, "swap")
+        ctx = self._ctx(jid)
+        have = texec._open_perp_size(perp_cli, perp_sym, "short") or 0.0
+        hedger = texec.PerpHedger(perp_cli, perp_sym, ctx, opening=True)
+        err = hedger.target(max(0.0, filled - have)) if filled > have else None
+        qty = have + hedger.hedged
+        if err or qty <= 0:
+            raise RuntimeError(f"no se pudo cubrir {filled:g} tras el reinicio: {err}")
+        px = hedger.avg or texec._mid_price(perp_cli, perp_sym, opp.get("price", 0))
+        pos_id = self._save_open_position(uid, jid, opp, p, {
+            "spot_qty": filled, "perp_qty": qty, "entry_price": px, "entry_fees_usd": hedger.fee_usd,
+            "exposure": qty * px, "spot_venue": "bsc", "spot_avg_price": cost / filled,
+            "capital_used": cost + qty * px / max(1, int(p["leverage"])), "entry_mode": "onchain_limit",
+            "partial_note": "Recuperada tras reinicio con orden límite viva"})
+        if pos_id:
+            self._protect(uid, pos_id, creds, ctx, token=p.get("token"))
+        msg = f"{sym}: reinicio con orden límite viva. Llenado {filled:g}, cubierto {qty:g}. Revisa la posición."
+        self._update(jid, status="interrupted", position_id=pos_id, error=msg)
+        self._alert(uid, sym, msg, severity="WARNING")
+
+    def _recover_limit_close(self, job, sold, proceeds):
+        from exchanges import trade_executor as texec
+        jid, uid, p = job["id"], job["user_id"], job["params"]
+        pos = self._load_pos(p["position_id"])
+        if not pos:
+            self._update(jid, status="interrupted", error="Reinicio: la posición ya no está activa")
+            return
+        sym = pos.get("symbol", "")
+        creds = self._creds(uid, [pos["exchange"]])
+        perp_cli = texec._build_client(pos["exchange"], creds[pos["exchange"].lower()], "swap")
+        texec._ensure_markets(perp_cli)
+        perp_sym = texec.to_ccxt_symbol(sym, "swap")
+        spot_qty, perp_qty = float(pos["spot_qty"] or 0), float(pos["perp_qty"] or 0)
+        ratio = perp_qty / spot_qty if spot_qty else 0
+        short_now = texec._open_perp_size(perp_cli, perp_sym, "short") or 0.0
+        buy = max(0.0, short_now - (perp_qty - sold * ratio))
+        hedger = texec.PerpHedger(perp_cli, perp_sym, self._ctx(jid), opening=False, max_base=buy)
+        err = hedger.target(buy) if buy > 0 else None
+        if err:
+            raise RuntimeError(f"no se pudo recomprar el perp tras el reinicio: {err}")
+        pnl = None
+        if pos.get("spot_entry_price") and pos.get("entry_price") and hedger.hedged:
+            pnl = round(proceeds - float(pos["spot_entry_price"]) * sold
+                        + (float(pos["entry_price"]) - hedger.avg) * hedger.hedged, 6)
+        self._apply_partial_close(pos, {"spot_sold": sold, "perp_closed": hedger.hedged, "price_pnl": pnl,
+                                        "kept_legs": ["perp", "tp"], "protection_filled": {},
+                                        "partial_note": "Recuperada tras reinicio con venta límite viva"},
+                                  add_fees=hedger.fee_usd)
+        self._restore_spot_protection(uid, self._load_pos(pos["id"]) or pos, p.get("token"))
+        msg = f"{sym}: reinicio con venta límite viva. Vendido {sold:g}, recomprado {hedger.hedged:g}. Revisa la posición."
+        self._update(jid, status="interrupted", error=msg)
+        self._alert(uid, sym, msg, severity="WARNING")
 
     def _reconcile(self, jid):
         from core.database import db
