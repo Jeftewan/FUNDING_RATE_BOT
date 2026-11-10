@@ -15,6 +15,7 @@ La suma es exacta salvo redondeo y coincide con `entry_slippage.spot`.
 """
 import argparse
 import json
+import statistics
 import sys
 from pathlib import Path
 
@@ -25,6 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from swap_audit import _engine, _json, rpc  # noqa: E402
 
 FAPI = "https://fapi.binance.com/fapi/v1/aggTrades"
+ENGINE_RHO = 0.8     # scripts/_exec_engine.py
+MIN_PUSH = 0.0005    # por debajo de 0.05 % el empuje no se distingue del ruido
 
 
 def block_time(tx):
@@ -85,6 +88,38 @@ def retention(d):
     return {"mean_excess_move_pct": sum(moves) / len(moves) * 100, "n": len(moves), "fee_floor_pct": fee * 100}
 
 
+def rho_from_swap(s):
+    """Retención del empuje por minuto medida tras un tramo (`recovery`): empuje = cuánto se separó
+    el mid del perp respecto de antes del swap. None si no hay datos o el empuje es ruido."""
+    buy = s.get("side", "buy") == "buy"
+    marks = [m for m in s.get("recovery") or [] if m.get("mid") and m.get("perp")]
+    if len(marks) < 2 or not (s.get("perp_ref") and s.get("impact") and s.get("quoted_out") and s.get("in")):
+        return None
+    quoted = s["in"] / s["quoted_out"] if buy else s["quoted_out"] / s["in"]
+    before = (quoted / (1 + s["impact"]) if buy else quoted / (1 - s["impact"])) / s["perp_ref"]
+    push = [(1 if buy else -1) * (m["mid"] / m["perp"] - before) / before for m in marks]
+    if push[0] < MIN_PUSH:
+        return None
+    t0 = marks[0]["t"]
+    rates = [max(p / push[0], 0.0) ** (60 / (m["t"] - t0)) for m, p in zip(marks[1:], push[1:]) if m["t"] > t0]
+    return {"rho": statistics.median(rates), "push_pct": push[0] * 100, "n": len(rates)} if rates else None
+
+
+def rho_report(jobs):
+    """ρ por token con todos los tramos que tienen recuperación medida."""
+    by_token = {}
+    for job in jobs:
+        for s in swaps_of(job["result"]):
+            r = rho_from_swap(s)
+            if r:
+                by_token.setdefault(job["params"].get("symbol"), []).append(r["rho"])
+    print(f"\nρ medido por minuto (el motor asume {ENGINE_RHO}):")
+    for sym, vals in sorted(by_token.items()):
+        print(f"  {sym}: mediana {statistics.median(vals):.3f} ({len(vals)} tramos)")
+    if not by_token:
+        print("  sin tramos con recuperación medida")
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
@@ -111,6 +146,7 @@ def main():
         print(f"  USD: latencia {d['latency']:+.2f} · comisión+impacto {d['cost']:+.2f} · deriva {d['drift']:+.2f} "
               f"= {d['total']:+.2f} (reportado spot {d['reported_spot_slip']})")
         print("  retención:", json.dumps(retention(d)))
+    rho_report(jobs)
 
 
 if __name__ == "__main__":

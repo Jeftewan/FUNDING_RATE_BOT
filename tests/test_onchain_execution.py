@@ -111,9 +111,76 @@ def test_suggest_slices_from_measured_impact(chain, perp):
     assert s["slices"] == 3 and s["duration_s"] == 3 * ob.SLICE_GAP and s["suggest"]
 
 
-def test_suggest_slices_without_measure_does_not_split(chain, perp):
+def test_suggest_slices_without_measure_uses_max(chain, perp, monkeypatch):
+    monkeypatch.setattr(ob.time, "sleep", lambda s: None)
     chain.quote = MagicMock(side_effect=RuntimeError("sin ruta"))
-    assert _leg(chain, perp).suggest_slices(100, "sell")["slices"] == 1
+    s = _leg(chain, perp).suggest_slices(100, "sell")
+    assert s["slices"] == ob.SLICE_MAX and not s["measured"]
+
+
+def test_suggest_slices_zero_impact_is_not_a_measure(chain, perp, monkeypatch):
+    monkeypatch.setattr(ob.time, "sleep", lambda s: None)
+
+    def quote(src, dst, amt, wallet):    # el tamaño completo sale mejor que el mid: dato inconsistente
+        if src.lower() == ob.USDT.lower():
+            return {"to_amount": int(amt / 2.0)}
+        return {"to_amount": int(amt * (2.02 if amt > 50 * 10 ** 18 else 2.0))}
+    chain.quote = quote
+    assert _leg(chain, perp).suggest_slices(100, "sell")["slices"] == ob.SLICE_MAX
+
+
+def test_job37_falling_market_still_splits(chain, perp, monkeypatch):
+    monkeypatch.setattr(ob.time, "sleep", lambda s: None)
+    original = chain.quote
+
+    def falling(*a):
+        chain.price *= 0.996
+        return original(*a)
+    chain.quote = falling
+    assert _leg(chain, perp).suggest_slices(100, "buy", ref_px=2.0)["slices"] == ob.SLICE_MAX
+
+
+def test_min_slices_is_respected(chain, perp):
+    assert _leg(chain, perp).suggest_slices(100, "sell", min_slices=5)["slices"] == 5
+
+
+def test_recovery_marks_once_each_and_failure_does_not_interrupt(chain, perp):
+    leg = _leg(chain, perp)
+    leg.swaps = [{"side": "buy", "perp_ref": 2.0}]
+    for t in (0, 5, 60, 300, 600, 900):
+        leg.recovery_tick(t)
+    assert [m["t"] for m in leg.swaps[0]["recovery"]] == list(ob.RECOVERY_MARKS)
+    leg.swaps = [{"side": "buy", "perp_ref": 2.0}]
+    chain.quote = MagicMock(side_effect=RuntimeError("sin ruta"))
+    leg.recovery_tick(0)
+    assert leg.swaps[0]["recovery"][0]["mid"] is None
+
+
+def test_rho_from_recovery():
+    from scripts.execution_decomp import rho_from_swap
+    swap = {"side": "buy", "in": 100.0, "quoted_out": 100.0, "impact": 1e-9, "perp_ref": 1.0,
+            "recovery": [{"t": 0, "mid": 1.01, "perp": 1.0}, {"t": 60, "mid": 1.005, "perp": 1.0}]}
+    assert rho_from_swap(swap)["rho"] == pytest.approx(0.5, abs=0.01)
+    assert rho_from_swap({**swap, "recovery": swap["recovery"][:1]}) is None
+
+
+def test_open_returns_basis_gone_without_operating(chain, perp, monkeypatch):
+    monkeypatch.setattr(te.time, "sleep", lambda s: None)
+    fac = lambda pc, ps, ctx: _leg(chain, pc, ctx=ctx)      # noqa: E731
+    before = chain.bal[ob.USDT.lower()]
+    res = te.execute_open(CREDS, OPP, capital=200, leverage=1, spot_leg_factory=fac, twap={"min_basis": 5.0})
+    assert res["code"] == "BASIS_GONE" and chain.bal[ob.USDT.lower()] == before
+
+
+def test_open_uses_fire_slices_and_logs_plan(chain, perp, monkeypatch):
+    monkeypatch.setattr(te.time, "sleep", lambda s: None)
+    fac = lambda pc, ps, ctx: _leg(chain, pc, ctx=ctx)      # noqa: E731
+    res = te.execute_open(CREDS, OPP, capital=200, leverage=1, spot_leg_factory=fac,
+                          twap={"min_slices": 5, "min_basis": -99})
+    assert res["ok"], res
+    assert len(res["swaps"]) == 5 and res["slices_plan"]["slices"] == 5
+    assert res["slices_plan"]["first_basis_pct"] is not None
+    assert res["swaps"][0]["recovery"] and "recovery" not in res["swaps"][-1]
 
 
 def test_dry_run_reports_round_trip_cost(chain, perp):
@@ -213,6 +280,30 @@ def test_armed_fires_only_when_basis_reaches_threshold(env, monkeypatch):  # noq
     status, params, _ = _status(app, jid)
     assert status == "queued" and params.get("fired_at")
     assert params["fire_read"]["basis_pct"] == 0.3
+
+
+def test_basis_gone_rearms_without_saving(env, monkeypatch):  # noqa: F811
+    app, runner, _, uid = env
+    jid = _armed(app, uid)
+    monkeypatch.setattr(te, "execute_open", MagicMock(return_value={
+        "ok": False, "code": "BASIS_GONE", "basis_pct": -0.3, "msg": "x"}))
+    monkeypatch.setattr(runner, "_creds", lambda *a: {"binance": {}})
+    monkeypatch.setattr(runner, "_spot_leg_factory", lambda *a: None)
+    timer = MagicMock()
+    monkeypatch.setattr(J.threading, "Timer", timer)
+    job = runner._load(jid)
+    job["params"] = {**job["params"], "fired_at": 1.0, "fire_read": {"basis_pct": 0.3, "slices": 3}}
+    runner._run_open(job)
+    assert te.execute_open.call_args.kwargs["twap"] == {"min_slices": 3, "min_basis": 0.0}
+    status, params, _ = _status(app, jid)
+    assert status == "armed" and "fired_at" not in params and "fire_read" not in params
+    assert timer.call_count == 1
+
+
+def test_forced_execution_has_no_basis_guard(env):  # noqa: F811
+    _, runner, _, _ = env
+    assert runner._exec_plan({"wait": {"theta": 0.25, "force": True}, "twap": None}) is None
+    assert runner._exec_plan({"twap": {"slices": 1, "duration_s": 0}}) == {"slices": 1, "duration_s": 0}
 
 
 def test_armed_expires_without_entering(env, monkeypatch):  # noqa: F811

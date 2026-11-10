@@ -1,8 +1,16 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-11-10** (metodología única de ejecución y seguros on-chain + ARIA #56, rama `fix/onchain-exit-offline-token`, PR #120).
+Estado del proyecto al **2026-11-10** (troceo a prueba de fallos y estudio de tamaño, rama `feat/adaptive-sizing`).
 
 ---
+
+## ¿Umbrales fijos o adaptativos? (2026-11-10, rama `feat/adaptive-sizing`)
+
+Job #37 (JCT, posición #58): disparó con basis +0.34 % a tamaño de tramo y compró **de un golpe** 2,082 USD con 0.57 % de impacto → basis real −0.35 %, slippage 12.79 USD. Causa probable (el valor no se guardaba): `suggest_slices` trataba impacto 0/`None` como 1 tramo y, con el mercado cayendo, el mid leído antes quedó sobre el precio a tamaño completo.
+- **Arreglo**: `_stable_impact` mide con dos cotizaciones completas alrededor del mid (deriva ≤ 0.1 %, 3 intentos); sin medición válida → `SLICE_MAX`. Los tramos evaluados al disparar son el mínimo a ejecutar (`fire_read.slices` → `min_slices`). `_fire_guard` re-cotiza antes del primer tramo: basis < θ − 0.25 (`FIRE_BASIS_MARGIN`) → `BASIS_GONE`, el job vuelve a `armed` sin operar y, al cerrar, antes de cancelar los seguros. Cierres forzados y spot desnudo exentos.
+- **Medición de ρ**: cada tramo guarda `recovery` (mid y perp a 0/60/300/600 s) y el job `slices_plan` (tramos, impacto, basis previo, libro del perp). `scripts/execution_decomp.py` imprime ρ por token. **Con ρ = 1 todo cambia**: 2,100 USD fijos pasan de +6.75 a −3.65 USD por intento; solo ≤ 1,575 USD queda positivo. Tras ≥ 10 ejecuciones decidir la pausa: ρ ≈ 1 → reducir tamaños y volver a 45 s; ρ variable por token → pausa según recuperación medida.
+- **θ adaptativo no sirve** (no repetir): con pausa 15 min, θ entre 0 y 0.25 rinde casi igual y 13 reglas según costo, impacto, σ del basis o funding no superan a 0.25 (mejor Δ +0.01 pp). La ventaja de θ alto en tamaños grandes venía de la pausa de 1 min. θ de salida: oráculo ≤ 0.02 pp.
+- **Tamaño por token tampoco pasó** (`scripts/size_study.py`, `reports/size_study_20261110.md`): ni topes de impacto ni valor esperado cumplen el criterio; contra 2,100 USD fijos los topes pierden en el caso base (cartera 5 cupos: +1,485 a +1,833 vs +2,022) y solo ayudan si el costo real es mayor. No se implementó capital sugerido. Más cupos con posiciones menores dio más USD (8 cupos, tope 0.6 %: +3,082), pero no estaba en el criterio y una sola trayectoria es ruidosa (3,000 fijos: +280): hipótesis por probar. Re-correr con varias fotos de costo.
 
 ## Metodología de ejecución y seguros on-chain (vigente desde 2026-11-10, PR #120)
 

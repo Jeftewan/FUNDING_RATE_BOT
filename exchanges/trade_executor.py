@@ -852,14 +852,17 @@ def near_liquidation(perp_cli, perp_sym: str, fraction: float = SLICE_HOT_FRACTI
     return False
 
 
-def slice_pause(ctx, seconds: float, hot=None) -> bool:
-    """Pausa entre tramos. True = dejar de esperar (hot() avisó que el mark va hacia el SL)."""
+def slice_pause(ctx, seconds: float, hot=None, tick=None) -> bool:
+    """Pausa entre tramos. True = dejar de esperar (hot() avisó que el mark va hacia el SL).
+    `tick(segundos transcurridos)` corre en cada vuelta (auditoría de la recuperación del pool)."""
     rest, checked = seconds, None
     while rest > 0 and not ctx.cancelled():
         if hot and (checked is None or checked - rest >= SLICE_HOT_CHECK_S):
             checked = rest
             if hot():
                 return True
+        if tick:
+            tick(seconds - rest)
         time.sleep(min(5, rest))
         rest -= 5
     return False
@@ -1633,7 +1636,12 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
         return bool(spot_ask and perp_bid and spot_ask <= perp_bid * (1 + MAX_NEG_BASIS))
 
     if onchain and not (twap or {}).get("slices"):
-        twap = leg.suggest_slices(plan["base_target"], "buy", ref_px=plan.get("perp_bid") or plan["perp_mid"])
+        fire = twap or {}
+        twap = leg.suggest_slices(plan["base_target"], "buy", ref_px=plan.get("perp_bid") or plan["perp_mid"],
+                                  min_slices=int(fire.get("min_slices") or 1))
+        gone = _fire_guard(perp_cli, perp_sym, leg, "buy", plan["base_target"], twap, fire.get("min_basis"))
+        if gone:
+            return gone
     slices = max(1, int((twap or {}).get("slices") or 1))
     duration = float((twap or {}).get("duration_s") or 0)
     interval = duration / slices if slices > 1 else 0
@@ -1652,7 +1660,8 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
             if need > 0:
                 leg.trade("buy", need, on_fill, window, taker_ok)
             if i < slices - 1 and slice_pause(ctx, interval - (time.time() - t0),
-                                              lambda: near_liquidation(perp_cli, perp_sym)):
+                                              lambda: near_liquidation(perp_cli, perp_sym),
+                                              getattr(leg, "recovery_tick", None)):
                 state["partial_reason"] = "el precio se acercó a la liquidación entre tramos"
                 break
     except ExecError as e:
@@ -1699,6 +1708,8 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
                                else f"Ejecución parcial: {state['partial_reason']}")
     res["filled_ratio"] = round(min(1.0, state["spot_net"] / base_target), 4) if base_target else None
     res["liquidation"] = liq
+    if onchain:
+        res["slices_plan"] = twap
     return res
 
 
@@ -1820,9 +1831,18 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     leg = spot_leg_factory(perp_cli, perp_sym, ctx) if onchain else None
     # El short se lee ANTES de tocar nada: si no se puede leer, no se opera (vender
     # el spot creyendo que no hay short dejaría el short abierto y sin rastrear).
-    if _open_perp_size(perp_cli, perp_sym, "short") is None:
+    pre_short = _open_perp_size(perp_cli, perp_sym, "short")
+    if pre_short is None:
         raise ExecError("No se pudo leer la posición perp en el exchange; cierre abortado "
                         "sin operar. Reintenta en unos minutos.", code="POSITION_READ")
+    # Tramos y guarda antes de cancelar los seguros: si el basis ya no alcanza, la posición sigue
+    # protegida y el job vuelve a esperar.
+    if onchain and not dry_run and pre_short and spot_qty and not twap.get("slices"):
+        fire = twap
+        twap = leg.suggest_slices(spot_qty, "sell", min_slices=int(fire.get("min_slices") or 1))
+        gone = _fire_guard(perp_cli, perp_sym, leg, "sell", spot_qty, twap, fire.get("min_basis"))
+        if gone:
+            return gone
     # Seguros primero: la venta límite bloquea la base (saldo libre) y el SL no
     # debe dispararse a mitad del cierre. Lo que ya llenaron cuenta como salida.
     prot_fill = {}
@@ -1839,6 +1859,7 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         # Spot desnudo (SL o liquidación ya cerraron el short): vender pesa más que el
         # precio, en tramos y con slippage corto (AIN #51).
         leg.naked_exit()
+        twap = {}        # naked_exit trocea por su cuenta, sin pausas de 15 min
     if onchain:
         spot_held = leg.held_base()
     else:
@@ -1896,8 +1917,6 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         if err:
             raise ExecError(f"Falló la recompra del perp: {err}", code="HEDGE_FAILED")
 
-    if onchain and actual_short and spot_to_sell and not twap.get("slices"):
-        twap = leg.suggest_slices(spot_to_sell, "sell")
     slices = max(1, int(twap.get("slices") or 1))
     duration = float(twap.get("duration_s") or 0)
     interval = duration / slices if slices > 1 else 0
@@ -1915,7 +1934,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
                 # Cerrar tiene prioridad: taker incondicional tras la ventana maker.
                 leg.trade("sell", need, on_fill, window, lambda *_: True)
             if i < slices - 1 and interval and slice_pause(ctx, interval - (time.time() - t0),
-                                                           lambda: near_liquidation(perp_cli, perp_sym)):
+                                                           lambda: near_liquidation(perp_cli, perp_sym),
+                                                           getattr(leg, "recovery_tick", None)):
                 interval = 0     # sin seguros y cerca de liquidación: el resto sale ya
     except ExecError as e:
         error = e
@@ -1966,6 +1986,7 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         res["exec"]["exit_swaps"] = leg.exit_log
     if getattr(leg, "swaps", None):
         res["exec"]["swaps"] = leg.swaps
+        res["exec"]["slices_plan"] = twap
     if error or ctx.cancelled():
         res["partial_note"] = str(error) if error else "Cancelado por el usuario"
     return res
@@ -1990,7 +2011,7 @@ class BasisProbe:
 
     def __init__(self, perp_cli, perp_sym, leg, side: str, base: float, slices: int):
         self.perp_cli, self.perp_sym, self.leg = perp_cli, perp_sym, leg
-        self.side, self.part = side, base / max(1, slices)
+        self.side, self.slices, self.part = side, max(1, slices), base / max(1, slices)
 
     def read(self) -> dict:
         bid, ask, _ = _top_of_book(self.perp_cli, self.perp_sym, 0)
@@ -2000,7 +2021,39 @@ class BasisProbe:
         else:
             px = self.leg.quote_price(self.part, "sell")
             pct = (px - ask) / ask * 100 if px and ask else None
-        return {"basis_pct": None if pct is None else round(pct, 4), "px": px, "perp": bid or ask}
+        return {"basis_pct": None if pct is None else round(pct, 4), "px": px, "perp": bid or ask,
+                "slices": self.slices}
+
+
+def perp_book_stats(perp_cli, perp_sym: str, band: float = 0.002):
+    """Spread y profundidad del perp a ±band (auditoría). None si no se pudo leer."""
+    try:
+        book = perp_cli.fetch_order_book(perp_sym, limit=100)
+        bid, ask = book["bids"][0][0], book["asks"][0][0]
+        mid = (bid + ask) / 2
+        return {"spread_pct": round((ask - bid) / mid * 100, 4),
+                "bid_usd": round(sum(p * q for p, q, *_ in book["bids"] if p >= mid * (1 - band))),
+                "ask_usd": round(sum(p * q for p, q, *_ in book["asks"] if p <= mid * (1 + band)))}
+    except Exception as e:
+        log.info(f"libro perp {perp_sym}: {e}")
+        return None
+
+
+def _fire_guard(perp_cli, perp_sym: str, leg, side: str, base: float, plan: dict, min_basis):
+    """Antes del primer tramo, con los tramos definitivos: anota basis y libro del perp en `plan`.
+    Si la ejecución salió de una espera y el basis ya no alcanza (o no se puede leer) devuelve
+    BASIS_GONE sin operar; job #37 disparó con +0.34 % y entró a −0.35 %."""
+    plan["perp_book"] = perp_book_stats(perp_cli, perp_sym)
+    try:
+        basis = BasisProbe(perp_cli, perp_sym, leg, side, base, int(plan.get("slices") or 1)).read()["basis_pct"]
+    except Exception as e:
+        log.warning(f"basis previo {perp_sym}: {e}")
+        basis = None
+    plan["first_basis_pct"] = basis
+    if min_basis is None or (basis is not None and basis >= min_basis):
+        return None
+    return {"ok": False, "code": "BASIS_GONE", "basis_pct": basis,
+            "msg": f"El basis ({basis}) cayó bajo {min_basis:g} al ir a operar; sigue en espera"}
 
 
 def basis_probe(creds_by_exchange: dict, exchange: str, symbol: str, spot_leg_factory, side: str,
