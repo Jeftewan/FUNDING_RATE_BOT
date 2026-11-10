@@ -89,13 +89,6 @@ def place_sell(wallet: dict, token: dict, base_qty: float, price: float, ttl: in
     return _place(wallet, token["address"], bsc.USDT, making, taking, ttl)
 
 
-def place_buy(wallet: dict, token: dict, base_qty: float, price: float, ttl: int = ORDER_TTL) -> dict:
-    """Compra límite de `base_qty` token pagando `price` USDT por unidad."""
-    usdt = min(bsc.to_wei(base_qty * price, bsc.USDT_DECIMALS), bsc.erc20_balance(bsc.USDT, wallet["address"]))
-    taking = bsc.to_wei(bsc.from_wei(usdt, bsc.USDT_DECIMALS) / price, int(token["decimals"])) if price else 0
-    return _place(wallet, bsc.USDT, token["address"], usdt, taking, ttl)
-
-
 def _place(wallet: dict, maker_asset: str, taker_asset: str, making: int, taking: int, ttl: int) -> dict:
     maker = wallet["address"]
     if making <= 0 or taking <= 0:
@@ -125,32 +118,6 @@ def get_order(maker: str, order_id: int):
             if int(o.get("id") or 0) == int(order_id):
                 return o
     return None
-
-
-def order_is_final(maker: str, order_id: int) -> bool:
-    """True si la orden ya no puede recibir llenados. Un fallo de lectura cuenta como viva."""
-    try:
-        o = get_order(maker, order_id)
-    except LimitOrderError:
-        return False
-    return bool(o) and str(o.get("status")) not in ACTIVE_STATUSES
-
-
-def finalize(wallet: dict, order_id: int, wait: float, poll: float):
-    """Cancela y espera estado final: tras 'cancelling' aún puede llegar un llenado en vuelo
-    hasta que venza la firma del operador (o el plazo `wait`)."""
-    if order_is_final(wallet["address"], order_id):
-        return
-    cancel(wallet, [order_id])
-    deadline = time.time() + wait
-    while time.time() < deadline:
-        o = get_order(wallet["address"], order_id)
-        if not o or str(o.get("status")) not in ACTIVE_STATUSES:
-            return
-        sig_expiry = float(o.get("operatorSignatureExpiredAt") or 0)
-        if sig_expiry and time.time() > sig_expiry + poll:
-            return
-        time.sleep(poll)
 
 
 def cancel(wallet: dict, order_ids: list):
