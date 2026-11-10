@@ -64,9 +64,10 @@ def _parse_ai_response(text: str, valid_signals: tuple, default_signal: str) -> 
 ENTER_NAPR = 5.0          # ≥ → ENTRAR (debajo es ruido del modelo)
 LEVERAGES = (1, 2, 3)     # tope de leverage del negocio (decisión 2026-10-25)
 LIQ_MMR = 0.01
-# Leverage óptimo con los seguros en la cartera (reports/leverage_study_20261025_{bsc,cex}.md):
-# en Alpha el SL se dispara en 57 % de las entradas a 3x y rinde menos que 1x; 2x es el mejor.
-RECOMMENDED_LEV = {"alpha": 2, "cex": 3}
+# Leverage con los seguros en la cartera. Alpha 1x desde 2026-11-10: leverage_study_20261025 eligió 2x
+# con mmr 1 %, pero la liq real (ARIA #56) implica mmr ≈ 5 %; con eso, margin_topup_study_20261110_bsc da
+# 2x 14.4 % anual (39 SL por 100 posiciones) vs 1x 18.1 % con el mismo capital. CEX sigue en 3x.
+RECOMMENDED_LEV = {"alpha": 1, "cex": 3}
 
 OPP_SYSTEM_PROMPT = (
     "Eres analista cuantitativo de arbitraje de funding rates (long spot + short perp, delta neutral). "

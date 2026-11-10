@@ -31,3 +31,6 @@ cache/real_trades.pkl
 
 # Dataset cross (scripts/cross_dataset.py)
 cache/cross/
+
+# Filas intermedias de estudios locales (regenerables)
+cache/*.pkl

@@ -883,7 +883,7 @@ function renderOpps(data) {
     // recomendado. El APR del modelo es sobre el nocional perp; con leverage L el
     // nocional es C·L/(L+1). Recomendado por backtest con seguros
     // (reports/leverage_study_20261025_*.md): Alpha 2x, spot CEX 3x.
-    const levRec = o.spot_venue === 'bsc' ? 2 : 3;
+    const levRec = o.spot_venue === 'bsc' ? 1 : 3;
     const gain14 = o.model_prediction != null ? (o.model_prediction / 100) * 1000 * levRec / (levRec + 1) * 14 / 365 : null;
     // Confianza (analysis/ml_confidence): P(APR neto realizado ≥ 5 %) del tier y rango p10–p90.
     const g14 = apr => (apr / 100) * 1000 * levRec / (levRec + 1) * 14 / 365;
@@ -1333,7 +1333,7 @@ async function autoExecuteOpen(oppId, idx) {
   // On-chain siempre pasa por la simulación: muestra el costo ida y vuelta antes de confirmar.
   const previewFirst = ans.choice === 'dry' || meta.has_spot === false;
   await runExec('/api/execute_open',
-    { opportunity_id: oppId, capital: cap, leverage: lev, dry_run: previewFirst, twap: ans.twap, execution: ans.execution },
+    { opportunity_id: oppId, capital: cap, leverage: lev, dry_run: previewFirst, twap: ans.twap },
     previewFirst, 'open', `Apertura ${meta.symbol}`);
 }
 
@@ -1347,7 +1347,7 @@ async function autoExecuteClose(posId, symbol) {
   const ans = await showExecConfirm('close', meta);
   if (ans.choice === 'cancel') return;
   await runExec('/api/execute_close',
-    { position_id: posId, dry_run: ans.choice === 'dry', twap: ans.twap, execution: ans.execution },
+    { position_id: posId, dry_run: ans.choice === 'dry', twap: ans.twap },
     ans.choice === 'dry', 'close', `Cierre ${symbol}`);
 }
 
@@ -1391,14 +1391,8 @@ function showExecConfirm(kind, meta) {
         <div class="exec-sub">${head}</div>
         <ul class="exec-legs">${legsHtml}</ul>
         ${sizeNote}
-        ${isBsc ? `
-        <label class="exec-twap" for="exec-mode">Ejecución</label>
-        <select id="exec-mode" class="exec-mode">
-          <option value="patient">Esperar basis favorable (hasta 6 h) · recomendado</option>
-          <option value="now">Ejecutar ahora</option>
-          <option value="limit">Orden límite on-chain (piloto)</option>
-        </select>` : ''}
-        ${isCross ? '' : `
+        ${isBsc ? `<div class="exec-note">On-chain: espera a que el basis ejecutable al tamaño del tramo sea favorable (hasta 6 h para abrir, 24 h para cerrar) y ejecuta por tramos de swap + short pareados cada 15 min, para que el pool se re-arbitre. «Ejecutar ya» en el progreso corta la espera.</div>` : ''}
+        ${isCross || isBsc ? '' : `
         <label class="exec-twap"><input type="checkbox" id="exec-twap-on"> TWAP pareado (montos grandes)</label>
         <div class="exec-twap-cfg" id="exec-twap-cfg" style="display:none">
           <label>Tramos <input type="number" id="exec-twap-slices" min="2" max="96" value="6"></label>
@@ -1415,12 +1409,6 @@ function showExecConfirm(kind, meta) {
     const twapOn = overlay.querySelector('#exec-twap-on');
     if (twapOn) {
       twapOn.onchange = () => { overlay.querySelector('#exec-twap-cfg').style.display = twapOn.checked ? 'flex' : 'none'; };
-      if (meta._twap) {
-        twapOn.checked = true;
-        overlay.querySelector('#exec-twap-cfg').style.display = 'flex';
-        overlay.querySelector('#exec-twap-slices').value = meta._twap.slices;
-        overlay.querySelector('#exec-twap-min').value = Math.max(5, Math.round(meta._twap.duration_s / 60));
-      }
     }
     const readTwap = () => {
       if (!twapOn || !twapOn.checked) return null;
@@ -1430,9 +1418,8 @@ function showExecConfirm(kind, meta) {
     };
     const close = (choice) => {
       const twap = readTwap();
-      const execution = overlay.querySelector('#exec-mode')?.value;
       overlay.remove(); document.removeEventListener('keydown', onEsc);
-      resolve({ choice, twap, execution });
+      resolve({ choice, twap });
     };
     overlay.querySelector('[data-action="cancel"]').onclick = () => close('cancel');
     overlay.querySelector('[data-action="dry"]').onclick = () => close('dry');
@@ -1504,9 +1491,7 @@ function watchJob(jobId, title, kind) {
       if (el) {
         el.innerHTML = j.status === 'armed'
           ? _armedText(j)
-          : pr.phase === 'limit'
-            ? 'Orden límite on-chain activa: el perp se cubre con cada llenado.'
-            : pr.phase === 'close'
+          : pr.phase === 'close'
               ? `Spot vendido: <strong>${_fmtQty(pr.spot_sold)}</strong> · Short recomprado: <strong>${_fmtQty(pr.perp_closed)}</strong>`
               : pr.phase === 'open'
                 ? `Spot neto: <strong>${_fmtQty(pr.spot_net)}</strong> · Short cubierto: <strong>${_fmtQty(pr.perp_hedged)}</strong>${pr.slices_done != null && j.params?.twap ? ` · tramo ${pr.slices_done + 1}/${j.params.twap.slices}` : ''}`
@@ -1542,8 +1527,7 @@ function _armedText(j) {
   const wait = j.params?.wait || {};
   const until = wait.deadline ? new Date(wait.deadline * 1000).toLocaleTimeString() : '—';
   const now = pr.basis_pct != null ? `${(+pr.basis_pct).toFixed(3)}%` : 'midiendo…';
-  const how = wait.mode === 'limit' ? 'orden límite' : 'swap';
-  return `Esperando basis para ${how}: actual <strong>${now}</strong> · umbral <strong>${(+wait.theta).toFixed(2)}%</strong> · vence ${until}`;
+  return `Esperando basis para swap: actual <strong>${now}</strong> · umbral <strong>${(+wait.theta).toFixed(2)}%</strong> · vence ${until}`;
 }
 
 async function fireJob(jobId) {
@@ -1622,7 +1606,7 @@ function showExecResult(title, data, isDry, job) {
   }
   if (liq && liq.liq_price) {
     extra += `<div class="est-row"><span>Liquidación est. del short</span><span class="est-val" style="color:${liq.warning ? 'var(--red)' : 'inherit'}">$${(+liq.liq_price).toPrecision(6)} (+${liq.liq_distance_pct}%)</span></div>`;
-    if (liq.sl_price) extra += `<div class="est-row"><span>Seguros: SL short + venta spot</span><span class="est-val">$${(+liq.sl_price).toPrecision(6)} (75% hacia liq.)</span></div>`;
+    if (liq.sl_price) extra += `<div class="est-row"><span>Seguros: SL short + venta spot</span><span class="est-val">$${(+liq.sl_price).toPrecision(6)} (80% hacia liq.)</span></div>`;
     if (liq.warning) extra += `<div class="exec-warn" style="margin:6px 0">Distancia a liquidación &lt; 33%: un rally moderado puede liquidar el short. Considera menos leverage.</div>`;
   }
   if (ex.basis_pct != null) {

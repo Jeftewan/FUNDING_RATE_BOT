@@ -41,7 +41,6 @@ _CCXT_CLASSES = {}  # lazy-filled name -> ccxt class
 
 # Ventanas maker por slice (s) y polling.
 SPOT_LIMIT_TIMEOUT = 60
-CROSS_LIMIT_TIMEOUT = 90
 POLL_INTERVAL = 2.0
 REPRICE_SECS = 10
 
@@ -85,9 +84,6 @@ class ExecContext:
         n = self._seq.get(leg, 0) + 1
         self._seq[leg] = n
         return f"bsy{self.job_id}-{leg}{n}"
-
-    def prefix(self):
-        return f"bsy{self.job_id}-" if self.job_id else None
 
     def progress(self, data: dict):
         if self._progress:
@@ -836,6 +832,39 @@ def protection_price(entry: float, liq: float, fraction: float = PROTECTION_LIQ_
     return entry + fraction * (liq - entry)
 
 
+# Entre tramos (hasta 75 min con SLICE_GAP de 15 min) la posición aún no tiene seguros o ya se
+# cancelaron: si el mark recorre este tanto del camino a liquidación se deja de esperar.
+SLICE_HOT_FRACTION = 0.70
+SLICE_HOT_CHECK_S = 60
+
+
+def near_liquidation(perp_cli, perp_sym: str, fraction: float = SLICE_HOT_FRACTION) -> bool:
+    """True si el mark del short recorrió `fraction` del camino entrada → liquidación."""
+    try:
+        for p in perp_cli.fetch_positions([perp_sym]):
+            if not p.get("contracts") or p.get("side") not in (None, "short"):
+                continue
+            mark = float(p.get("markPrice") or (p.get("info") or {}).get("markPrice") or 0)
+            entry, liq = float(p.get("entryPrice") or 0), float(p.get("liquidationPrice") or 0)
+            return bool(mark and entry and liq > entry and mark >= entry + fraction * (liq - entry))
+    except Exception as e:
+        log.warning(f"near_liquidation {perp_sym}: {e}")
+    return False
+
+
+def slice_pause(ctx, seconds: float, hot=None) -> bool:
+    """Pausa entre tramos. True = dejar de esperar (hot() avisó que el mark va hacia el SL)."""
+    rest, checked = seconds, None
+    while rest > 0 and not ctx.cancelled():
+        if hot and (checked is None or checked - rest >= SLICE_HOT_CHECK_S):
+            checked = rest
+            if hot():
+                return True
+        time.sleep(min(5, rest))
+        rest -= 5
+    return False
+
+
 def protection_spot_price(sl: float, offset: float = PROTECTION_SPOT_OFFSET) -> float:
     return sl * (1 - offset)
 
@@ -1080,16 +1109,15 @@ def _cancel_bsc_limit(wallet, spot) -> tuple:
     return (alive, *_bsc_filled(spot, o))
 
 
-def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None,
-                               only=None) -> dict:
-    """Cancela las órdenes de seguro vivas (`only`: solo esas piernas). Devuelve
+def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None) -> dict:
+    """Cancela las órdenes de seguro vivas. Devuelve
     fees/qty de lo que ya se había llenado (para sumarlo al cierre)."""
     out = {"perp_filled": 0.0, "perp_cost": 0.0, "tp_filled": 0.0, "spot_filled": 0.0,
            "spot_cost": 0.0, "fee_usd": 0.0}
     alive = []
     for leg, label in (("perp", "SL del short"), ("tp", "take profit del short")):
         perp = prot.get(leg)
-        if not _leg_active(perp) or (only and leg not in only):
+        if not _leg_active(perp):
             continue
         o = None
         for attempt in range(3):
@@ -1115,7 +1143,7 @@ def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wal
             if leg == "tp":
                 out["tp_filled"] = f["gross"]
     spot = prot.get("spot")
-    if _leg_active(spot) and (not only or "spot" in only):
+    if _leg_active(spot):
         if spot.get("venue") == "bsc":
             if wallet:
                 bsc_alive, filled, cost = _cancel_bsc_limit(wallet, spot)
@@ -1227,7 +1255,6 @@ class CexSpotLeg:
     que el caller cubra el perp de inmediato.
     """
 
-    venue = "cex"
 
     def __init__(self, client, sym, ctx: ExecContext, perp_cli, perp_sym):
         self.c = client
@@ -1470,8 +1497,7 @@ def twap_suggestion(spot_cli, spot_sym, notional_usd: float, threshold_usd=5000.
 
 
 def execute_open(creds_by_exchange: dict, opp: dict, capital: float,
-                 leverage: int = 1, dry_run: bool = False,
-                 allow_market_fallback: bool = True, ctx: ExecContext = None,
+                 leverage: int = 1, dry_run: bool = False, ctx: ExecContext = None,
                  twap: dict = None, spot_leg_factory=None) -> dict:
     """Place the real orders for an opportunity. Returns a result dict.
 
@@ -1489,17 +1515,15 @@ def execute_open(creds_by_exchange: dict, opp: dict, capital: float,
     try:
         if mode == "spot_perp":
             return _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage,
-                                   dry_run, allow_market_fallback, ctx, twap or {},
+                                   dry_run, ctx, twap or {},
                                    spot_leg_factory)
-        if mode == "cross_exchange":
-            return _open_cross(creds_by_exchange, opp, symbol, capital, leverage, dry_run, ctx)
     except ExecError as e:
         return {"ok": False, "msg": str(e), "code": e.code}
     return {"ok": False, "msg": f"Modo '{mode}' no soportado en auto (usa flujo manual)"}
 
 
 def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
-                    allow_market_fallback, ctx, twap, spot_leg_factory):
+                    ctx, twap, spot_leg_factory):
     exchange = opp.get("exchange", "")
     if not is_cex(exchange):
         return {"ok": False, "msg": f"{exchange} no es CEX soportado"}
@@ -1606,12 +1630,9 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
             raise ExecError(f"Falló la cobertura perp: {err}", code="HEDGE_FAILED")
 
     def taker_ok(spot_ask, perp_bid):
-        if not allow_market_fallback:
-            return False
         return bool(spot_ask and perp_bid and spot_ask <= perp_bid * (1 + MAX_NEG_BASIS))
 
-    if onchain and not (twap or {}).get("slices") and hasattr(leg, "suggest_slices") \
-            and not hasattr(leg, "limit_window"):
+    if onchain and not (twap or {}).get("slices"):
         twap = leg.suggest_slices(plan["base_target"], "buy", ref_px=plan.get("perp_bid") or plan["perp_mid"])
     slices = max(1, int((twap or {}).get("slices") or 1))
     duration = float((twap or {}).get("duration_s") or 0)
@@ -1630,11 +1651,10 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
             need = slice_target - state["spot_net"]
             if need > 0:
                 leg.trade("buy", need, on_fill, window, taker_ok)
-            if i < slices - 1:
-                rest = interval - (time.time() - t0)
-                while rest > 0 and not ctx.cancelled():
-                    time.sleep(min(5, rest))
-                    rest -= 5
+            if i < slices - 1 and slice_pause(ctx, interval - (time.time() - t0),
+                                              lambda: near_liquidation(perp_cli, perp_sym)):
+                state["partial_reason"] = "el precio se acercó a la liquidación entre tramos"
+                break
     except ExecError as e:
         error = e
     except Exception as e:
@@ -1669,14 +1689,14 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
         if state["spot_net"] > 0:
             unwound = _unwind_spot(leg, state["spot_net"])
             msg += f" (spot residual {'vendido' if unwound else 'NO vendido — revisa'})"
-        return {"ok": False, "msg": msg, "unwound": True,
-                "limit_unfilled": bool(getattr(leg, "unfilled", False) and not error and not ctx.cancelled())}
+        return {"ok": False, "msg": msg, "unwound": True}
 
     res = _open_result(exchange, spot_sym, perp_sym, leg, hedger, state, leverage, onchain)
     res["ok"] = True
-    if error or ctx.cancelled():
+    if error or ctx.cancelled() or state.get("partial_reason"):
         res["partial_note"] = (f"Ejecución parcial: {error}" if error
-                               else "Cancelado por el usuario: se guardó lo ejecutado")
+                               else "Cancelado por el usuario: se guardó lo ejecutado" if ctx.cancelled()
+                               else f"Ejecución parcial: {state['partial_reason']}")
     res["filled_ratio"] = round(min(1.0, state["spot_net"] / base_target), 4) if base_target else None
     res["liquidation"] = liq
     return res
@@ -1723,7 +1743,7 @@ def _open_result(exchange, spot_sym, perp_sym, leg, hedger, state, leverage, onc
         "capital_used": state["spot_cost"] + hedger.hedged * perp_px / max(1, leverage),
         "order_ids": spot_ids + hedger.order_ids,
         "entry_mode": getattr(leg, "entry_mode", "onchain_swap") if onchain else "maker_paired",
-        "swaps": list(getattr(leg, "swaps", [])), "limit_log": list(getattr(leg, "limit_log", [])),
+        "swaps": list(getattr(leg, "swaps", [])),
         "basis_pct": basis,
         "spot_venue": "bsc" if onchain else exchange.lower(),
         "legs": [
@@ -1737,151 +1757,6 @@ def _open_result(exchange, spot_sym, perp_sym, leg, hedger, state, leverage, onc
     }
 
 
-def _open_cross(creds_by_exchange, opp, symbol, capital, leverage, dry_run, ctx):
-    long_ex = opp.get("long_exchange", "")
-    short_ex = opp.get("short_exchange", "")
-    if not is_cex(long_ex) or not is_cex(short_ex):
-        return {"ok": False, "msg": "Auto solo soporta cross entre CEX (una pierna no es CEX)"}
-    long_creds = creds_by_exchange.get(long_ex.lower())
-    short_creds = creds_by_exchange.get(short_ex.lower())
-    if not long_creds or not short_creds:
-        missing = long_ex if not long_creds else short_ex
-        return {"ok": False, "msg": f"Sin API keys para {missing}"}
-
-    margin_side = capital / 2
-    exposure = margin_side * leverage
-    sym = to_ccxt_symbol(symbol, "swap")
-
-    try:
-        long_cli = _build_client(long_ex, long_creds, default_type="swap")
-        short_cli = _build_client(short_ex, short_creds, default_type="swap")
-        _ensure_markets(long_cli)
-        _ensure_markets(short_cli)
-    except Exception as e:
-        return {"ok": False, "msg": f"No se pudo conectar: {e}"}
-
-    long_px = _mid_price(long_cli, sym, opp.get("long_price", 0))
-    short_px = _mid_price(short_cli, sym, opp.get("short_price", 0))
-    if long_px <= 0 or short_px <= 0:
-        return {"ok": False, "msg": "No se pudo obtener precio de mercado"}
-
-    long_amt = _norm_amount(long_cli, sym, exposure / long_px)
-    short_amt = _norm_amount(short_cli, sym, exposure / short_px)
-
-    err = _check_min_notional(long_cli, sym, long_amt, long_px) \
-        or _check_min_notional(short_cli, sym, short_amt, short_px)
-    if err:
-        return {"ok": False, "msg": f"Orden bajo el mínimo: {err}"}
-
-    if dry_run:
-        return {
-            "ok": True, "dry_run": True,
-            "entry_price": short_px,
-            "entry_fees_usd": round(exposure * 2 * 0.0006, 4),
-            "order_ids": [], "leverage": leverage,
-            "liquidation": liquidation_estimate(short_px, leverage),
-            "legs": [
-                {"side": "buy", "kind": "perp", "exchange": long_ex, "symbol": sym,
-                 "amount": long_amt, "price": long_px, "type": "limit"},
-                {"side": "sell", "kind": "perp", "exchange": short_ex, "symbol": sym,
-                 "amount": short_amt, "price": short_px, "type": "limit"},
-            ],
-        }
-
-    for cli in (long_cli, short_cli):
-        if getattr(cli, "id", "") == "binance":
-            binance_preflight(cli, sym, leverage)
-    mode_err = _ensure_one_way_or_abort(long_cli, sym) or _ensure_one_way_or_abort(short_cli, sym)
-    if mode_err:
-        return {"ok": False, "msg": mode_err}
-    cfg_err = (_ensure_margin_and_leverage(long_cli, sym, leverage, side="long")
-               or _ensure_margin_and_leverage(short_cli, sym, leverage, side="short"))
-    if cfg_err:
-        return {"ok": False, "msg": cfg_err}
-
-    try:
-        long_order = long_cli.create_order(sym, "limit", "buy", long_amt, long_px,
-                                           _with_coid(_perp_open_params(long_cli, sym), ctx.coid("l")))
-    except Exception as e:
-        return {"ok": False, "msg": f"No se pudo colocar límite long en {long_ex}: {e}"}
-    try:
-        short_order = short_cli.create_order(sym, "limit", "sell", short_amt, short_px,
-                                             _with_coid(_perp_open_params(short_cli, sym), ctx.coid("h")))
-    except Exception as e:
-        _safe_cancel(long_cli, long_order["id"], sym)
-        fin = _final_order(long_cli, long_order["id"], sym) or {}
-        if float(fin.get("filled") or 0) > 0:
-            _reduce(long_cli, sym, "sell", float(fin["filled"]), ctx)
-        return {"ok": False, "msg": f"No se pudo colocar límite short en {short_ex}: {e}",
-                "unwound": True}
-
-    # Polling CONJUNTO de ambas piernas dentro de la misma ventana.
-    deadline = time.time() + CROSS_LIMIT_TIMEOUT
-    lst = {"l": None, "s": None}
-    while time.time() < deadline and not ctx.cancelled():
-        for k, cli, o in (("l", long_cli, long_order), ("s", short_cli, short_order)):
-            try:
-                lst[k] = cli.fetch_order(o["id"], sym)
-            except Exception as e:
-                log.warning(f"fetch_order cross {o['id']}: {e}")
-        if all((lst[k] or {}).get("status") == "closed" for k in ("l", "s")):
-            break
-        time.sleep(POLL_INTERVAL)
-
-    for k, cli, o in (("l", long_cli, long_order), ("s", short_cli, short_order)):
-        if (lst[k] or {}).get("status") != "closed":
-            _safe_cancel(cli, o["id"], sym)
-    lf = order_fills(long_cli, sym, long_order["id"])
-    sf = order_fills(short_cli, sym, short_order["id"])
-    matched = min(lf["gross"], sf["gross"])
-
-    # Igualar piernas: deshacer el exceso de la pierna más llena.
-    unwind_ok = True
-    if lf["gross"] - matched > 0:
-        unwind_ok &= _reduce(long_cli, sym, "sell", lf["gross"] - matched, ctx)
-    if sf["gross"] - matched > 0:
-        unwind_ok &= _reduce(short_cli, sym, "buy", sf["gross"] - matched, ctx)
-
-    if matched <= 0:
-        note = "deshecha" if unwind_ok else "NO deshecha — REVISA MANUALMENTE"
-        return {"ok": False, "unwound": unwind_ok,
-                "msg": f"Abortado en {CROSS_LIMIT_TIMEOUT}s: no se llenaron ambas piernas. Pierna {note}."}
-
-    return {
-        "ok": True, "dry_run": False,
-        "entry_price": sf["avg"] or short_px,
-        "entry_fees_usd": round(lf["fee_usd"] + sf["fee_usd"], 6),
-        "perp_qty": matched, "spot_qty": None,
-        "exposure": matched * (sf["avg"] or short_px),
-        "order_ids": [long_order.get("id"), short_order.get("id")],
-        "entry_mode": "limit_both",
-        "partial_note": None if matched >= min(long_amt, short_amt) * 0.999 else
-        f"Llenado parcial: {matched} de {min(long_amt, short_amt)}",
-        "legs": [
-            {"side": "buy", "kind": "perp", "exchange": long_ex, "symbol": sym,
-             "amount": matched, "price": lf["avg"] or long_px,
-             "order_id": long_order.get("id"), "fee_usd": lf["fee_usd"]},
-            {"side": "sell", "kind": "perp", "exchange": short_ex, "symbol": sym,
-             "amount": matched, "price": sf["avg"] or short_px,
-             "order_id": short_order.get("id"), "fee_usd": sf["fee_usd"]},
-        ],
-    }
-
-
-def _reduce(cli, sym, side, base_amt, ctx) -> bool:
-    amt = _norm_amount(cli, sym, base_amt)
-    if amt <= 0:
-        return True
-    try:
-        cli.create_order(sym, "market", side, amt, None,
-                         _with_coid(_perp_close_params(cli, sym), ctx.coid("u")))
-        return True
-    except Exception as e:
-        log.error(f"UNWIND {side} {sym} failed: {e}")
-        return False
-
-
-# ── Public: close ───────────────────────────────────────────────────────────
 def _legacy_qtys(position: dict):
     """Cantidades de posiciones auto antiguas (sin spot_qty/perp_qty) desde el
     audit `auto_open` de payments_json."""
@@ -1910,8 +1785,6 @@ def execute_close(creds_by_exchange: dict, position: dict, dry_run: bool = False
         if mode == "spot_perp":
             return _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap or {},
                                     spot_leg_factory)
-        if mode == "cross_exchange":
-            return _close_cross(creds_by_exchange, position, dry_run, ctx)
     except ExecError as e:
         return {"ok": False, "msg": str(e), "code": e.code}
     return {"ok": False, "msg": f"Modo '{mode}' no soportado en auto"}
@@ -1953,19 +1826,16 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     # Seguros primero: la venta límite bloquea la base (saldo libre) y el SL no
     # debe dispararse a mitad del cierre. Lo que ya llenaron cuenta como salida.
     prot_fill = {}
-    # Venta límite de cierre: comparte saldo con el seguro spot; el SL sigue vivo durante la espera.
-    keep_sl = bool(getattr(leg, "keep_perp_sl", False))
     if position.get("protection") and not dry_run:
         prot_fill = _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym,
                                                position["protection"],
-                                               getattr(leg, "wallet", None),
-                                               only=("spot",) if keep_sl else None)
+                                               getattr(leg, "wallet", None))
     actual_short = _open_perp_size(perp_cli, perp_sym, "short")
     if actual_short is None:
         raise ExecError("No se pudo leer la posición perp tras cancelar los seguros; cierre "
                         "abortado sin operar (los seguros se re-colocan).", code="POSITION_READ")
     perp_to_close = min(perp_qty, actual_short) if actual_short else 0.0
-    if onchain and not actual_short and hasattr(leg, "naked_exit"):
+    if onchain and not actual_short:
         # Spot desnudo (SL o liquidación ya cerraron el short): vender pesa más que el
         # precio, en tramos y con slippage corto (AIN #51).
         leg.naked_exit()
@@ -1985,8 +1855,7 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     if dry_run:
         _, _, pmid = _top_of_book(perp_cli, perp_sym, position.get("entry_price", 0))
         return {"ok": True, "dry_run": True, "drift": drift,
-                "twap": leg.suggest_slices(spot_to_sell, "sell") if onchain and spot_to_sell
-                and hasattr(leg, "suggest_slices") else None,
+                "twap": leg.suggest_slices(spot_to_sell, "sell") if onchain and spot_to_sell else None,
                 "exit_fees_usd": round(spot_to_sell * pmid * 2 * 0.0006, 4), "order_ids": [],
                 "legs": [
                     {"side": "sell", "kind": "spot", "symbol": spot_sym, "amount": spot_to_sell,
@@ -2027,8 +1896,7 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         if err:
             raise ExecError(f"Falló la recompra del perp: {err}", code="HEDGE_FAILED")
 
-    if onchain and actual_short and spot_to_sell and not twap.get("slices") \
-            and hasattr(leg, "suggest_slices") and not hasattr(leg, "limit_window"):
+    if onchain and actual_short and spot_to_sell and not twap.get("slices"):
         twap = leg.suggest_slices(spot_to_sell, "sell")
     slices = max(1, int(twap.get("slices") or 1))
     duration = float(twap.get("duration_s") or 0)
@@ -2037,7 +1905,6 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     if spot_to_sell and not actual_short:
         window = 0       # spot desnudo (el SL ya cerró el short): taker ya, sin esperar maker
     error = None
-    short_gone = False
     try:
         for i in range(slices):
             if ctx.cancelled():
@@ -2047,15 +1914,12 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
             if need > 0:
                 # Cerrar tiene prioridad: taker incondicional tras la ventana maker.
                 leg.trade("sell", need, on_fill, window, lambda *_: True)
-            if i < slices - 1:
-                rest = interval - (time.time() - t0)
-                while rest > 0 and not ctx.cancelled():
-                    time.sleep(min(5, rest))
-                    rest -= 5
+            if i < slices - 1 and interval and slice_pause(ctx, interval - (time.time() - t0),
+                                                           lambda: near_liquidation(perp_cli, perp_sym)):
+                interval = 0     # sin seguros y cerca de liquidación: el resto sale ya
     except ExecError as e:
         error = e
     except Exception as e:
-        short_gone = type(e).__name__ == "ShortGone"
         error = ExecError(f"Error vendiendo el spot: {e}")
 
     # Cobertura final: el perp se cierra en proporción a lo vendido; si se vendió
@@ -2065,7 +1929,7 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     remaining = max(0.0, spot_to_sell - state["sold"])
     fully_sold = (spot_to_sell <= 0 or state["sold"] >= spot_to_sell * 0.999
                   or (not error and not ctx.cancelled() and _is_dust(leg, remaining, ref)))
-    if hedger.failed is None and not short_gone:
+    if hedger.failed is None:
         target = perp_to_close if fully_sold else state["sold"] * ratio
         hedger.target(target, force_all=fully_sold)
     if hedger.failed is not None:
@@ -2102,22 +1966,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         res["exec"]["exit_swaps"] = leg.exit_log
     if getattr(leg, "swaps", None):
         res["exec"]["swaps"] = leg.swaps
-    if getattr(leg, "limit_log", None):
-        res["exec"]["limit_log"] = leg.limit_log
     if error or ctx.cancelled():
         res["partial_note"] = str(error) if error else "Cancelado por el usuario"
-    if keep_sl:
-        res["kept_legs"] = ["perp", "tp"]
-        res["short_gone"] = short_gone
-        res["limit_unfilled"] = bool(getattr(leg, "unfilled", False) and not state["sold"]
-                                     and not error and not ctx.cancelled())
-        if res["complete"] and position.get("protection"):
-            # Ya no hay short: un closePosition vivo cerraría una posición futura del símbolo.
-            try:
-                _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, position["protection"],
-                                           None, only=("perp", "tp"))
-            except ExecError as e:
-                res["sl_cancel_error"] = str(e)
     return res
 
 
@@ -2216,66 +2066,6 @@ def _close_pnl(position, state, hedger, prot_fill, ref, ext=None) -> dict:
             "exit_ref_mids": ref, "exit_slippage": slip, "perp_external": ext,
         },
     }
-
-
-def _close_cross(creds_by_exchange, position, dry_run, ctx):
-    symbol = position.get("symbol", "")
-    exposure = position.get("exposure", 0) or 0
-    long_ex = position.get("long_exchange", "")
-    short_ex = position.get("short_exchange", "")
-    long_creds = creds_by_exchange.get(long_ex.lower())
-    short_creds = creds_by_exchange.get(short_ex.lower())
-    if not long_creds or not short_creds:
-        return {"ok": False, "msg": "Sin API keys para una de las piernas"}
-    sym = to_ccxt_symbol(symbol, "swap")
-    try:
-        long_cli = _build_client(long_ex, long_creds, default_type="swap")
-        short_cli = _build_client(short_ex, short_creds, default_type="swap")
-        _ensure_markets(long_cli)
-        _ensure_markets(short_cli)
-    except Exception as e:
-        return {"ok": False, "msg": f"No se pudo conectar: {e}"}
-
-    qty = position.get("perp_qty")
-    long_real = _open_perp_size(long_cli, sym, "long")
-    short_real = _open_perp_size(short_cli, sym, "short")
-    if long_real is None or short_real is None:
-        return {"ok": False, "msg": "No se pudieron leer las posiciones perp; cierre abortado sin operar"}
-    if qty:
-        long_amt, short_amt = min(qty, long_real), min(qty, short_real)
-    else:
-        long_px = _mid_price(long_cli, sym, position.get("entry_price", 0))
-        short_px = _mid_price(short_cli, sym, position.get("entry_price", 0))
-        long_amt = min(long_real, exposure / long_px) if long_px else long_real
-        short_amt = min(short_real, exposure / short_px) if short_px else short_real
-
-    if dry_run:
-        return {"ok": True, "dry_run": True,
-                "exit_fees_usd": round(exposure * 2 * 0.0006, 4), "order_ids": [],
-                "legs": [
-                    {"side": "sell", "kind": "perp", "exchange": long_ex, "symbol": sym, "amount": long_amt},
-                    {"side": "buy", "kind": "perp", "exchange": short_ex, "symbol": sym, "amount": short_amt},
-                ]}
-
-    legs, fees, ids = [], 0.0, []
-    for cli, ex, side, amt in ((long_cli, long_ex, "sell", long_amt),
-                               (short_cli, short_ex, "buy", short_amt)):
-        n = _norm_amount(cli, sym, amt)
-        if n <= 0:
-            continue
-        try:
-            o = cli.create_order(sym, "market", side, n, None,
-                                 _with_coid(_perp_close_params(cli, sym), ctx.coid("c")))
-        except Exception as e:
-            done = "Long cerrado pero " if legs else ""
-            return {"ok": False, "msg": f"{done}no se pudo cerrar en {ex}: {e} — REVISA MANUALMENTE"}
-        f = order_fills(cli, sym, o["id"])
-        fees += f["fee_usd"]
-        ids.append(o.get("id"))
-        legs.append({"side": side, "kind": "perp", "exchange": ex, "order_id": o.get("id"),
-                     "amount": f["gross"], "price": f["avg"]})
-    return {"ok": True, "dry_run": False, "exit_fees_usd": round(fees, 6),
-            "order_ids": ids, "legs": legs, "complete": True}
 
 
 # ── Reconciliation (job interrumpido por reinicio) ──────────────────────────

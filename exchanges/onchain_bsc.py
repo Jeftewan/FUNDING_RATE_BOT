@@ -33,27 +33,22 @@ NAKED_RETRY_SLIPPAGE = 0.005      # reintento de un tramo revertido del spot des
 SWAP_RETRIES = 2                  # recotizaciones tras un swap revertido (el perp aún no se tocó)
 SWAP_RETRY_WAIT = 3
 PRIVATE_RPC_RETRIES = 3
-SLICE_IMPACT = 0.0015             # troceo normal: cada tramo mueve ≤ 0.15 % vs mid
+# Troceo (reports/exec_study_20261110.md): cada tramo mueve ≤ 0.15 % vs mid y entre tramos se
+# espera a que el pool se re-arbitre. 15 min (con salida de hasta 24 h) vs 45 s: +0.15 a +0.35 pp
+# por ida y vuelta de 1,600 a 4,200 USD, 5/5 trimestres; si el pool no se recuperara nunca (ρ = 1)
+# costaría ≈ 0.01 pp.
+SLICE_IMPACT = 0.0015
 SLICE_MAX = 6
-SLICE_GAP = 45                    # s entre tramos: el pool se re-arbitra
-LIMIT_THETA = 0.002               # orden límite: precio a 0.2 % a favor del perp
-LIMIT_CROSS = 0.001               # nunca paga más de 0.1 % sobre el mid on-chain
-LIMIT_WINDOW = 600                # s por intento límite; expira sola en Kyber al mismo plazo
-LIMIT_POLL = 3
-LIMIT_REPEG = 60
-LIMIT_REPEG_MOVE = 0.001
-LIMIT_CANCEL_WAIT = 90
-LIMIT_SHORT_CHECK = 15
-LIMIT_MAX_USD = 3000              # tope del piloto por orden
+SLICE_GAP = 15 * 60
 MAX_PRICE_IMPACT = 0.01           # 1%
 PERP_ROUND_TRIP_FEE = 0.10        # %: perp taker a la entrada y a la salida
 MAX_PRICE_IMPACT_EXIT = 0.05      # vender spot desnudo (short ya cerrado): peor es quedarse sin cobertura
-# Spot desnudo (AIN #51, 2026-10-31): un solo swap de 1690 tokens salió 1.46 % bajo el
-# mid, con sándwich. Se trocea si el total mueve > EXIT_SPLIT_IMPACT y cada tramo va con
-# slippage corto (menos botín para el sándwich); un tramo revertido reintenta con el normal.
-EXIT_SPLIT_IMPACT = 0.005
-EXIT_MAX_SLICES = 4
-EXIT_SLICE_GAP = 10               # s entre tramos: el pool se re-arbitra
+# Spot desnudo (el SL ya recompró el short): siempre 4 tramos cada 10 min con slippage corto
+# (AIN #51: un solo swap salió 1.46 % bajo el mid, con sándwich). exec_study_20261110: +0.05 a
+# +0.07 pp sobre 4 tramos seguidos a 1x y 2x, también en estrés y con ρ = 1; un tramo
+# revertido reintenta con NAKED_RETRY_SLIPPAGE.
+EXIT_SLICES = 4
+EXIT_SLICE_GAP = 10 * 60
 EXIT_SLIPPAGE = 0.003
 ONCHAIN_MAX_BASIS = 0.005         # compra on-chain hasta 0.5% sobre el perp bid (incluye fee del DEX)
 MIN_LIQUIDITY_USD = 200_000       # liquidez mínima del token (lista Alpha)
@@ -62,7 +57,7 @@ GAS_BUFFER = 1.3                  # margen sobre eth_estimateGas (el estado camb
 ALPHA_LIST_URL = ("https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/"
                   "wallet/cex/alpha/all/token/list")
 _ALPHA_TTL = 3600
-_alpha_cache = {"ts": 0.0, "by_symbol": {}}
+_alpha_cache = {"ts": 0.0, "by_symbol": {}, "any_by_symbol": {}}
 
 _SEL_BALANCE_OF = "0x70a08231"
 _SEL_ALLOWANCE = "0xdd62ed3e"
@@ -178,26 +173,38 @@ def _load_alpha():
     except Exception as e:
         log.warning(f"alpha token list failed: {e}")
         return _alpha_cache["by_symbol"]
-    by = {}
+    by, any_by = {}, {}
     for t in rows:
-        if str(t.get("chainId")) != str(CHAIN_ID) or t.get("offline") or t.get("fullyDelisted"):
+        if str(t.get("chainId")) != str(CHAIN_ID):
             continue
         sym = (t.get("symbol") or "").upper()
         liq = float(t.get("liquidity") or 0)
+        row = {"symbol": sym, "address": t.get("contractAddress"),
+               "decimals": int(t.get("decimals") or 18), "liquidity": liq,
+               "alpha_id": t.get("alphaId"), "name": t.get("name")}
+        if sym and (sym not in any_by or liq > any_by[sym]["liquidity"]):
+            any_by[sym] = row
+        if t.get("offline") or t.get("fullyDelisted"):
+            continue
         if sym and (sym not in by or liq > by[sym]["liquidity"]):
-            by[sym] = {"symbol": sym, "address": t.get("contractAddress"),
-                       "decimals": int(t.get("decimals") or 18), "liquidity": liq,
-                       "alpha_id": t.get("alphaId"), "name": t.get("name")}
-    _alpha_cache.update(ts=time.time(), by_symbol=by)
+            by[sym] = row
+    _alpha_cache.update(ts=time.time(), by_symbol=by, any_by_symbol=any_by)
     return by
 
 
-def alpha_token(symbol: str):
+def alpha_token(symbol: str, for_exit: bool = False):
     """Token Alpha en BSC para el símbolo base del perp, o None.
 
     Exige liquidez mínima. Símbolos con multiplicador (1000PEPE…) no se mapean.
+    `for_exit`: para vender/vigilar lo que ya se tiene. Acepta tokens que Binance pasó
+    a offline (el contrato y el pool siguen) y sin mínimo de liquidez: ARIA #56 quedó
+    offline con la posición abierta y el cierre tras el SL abortó sin token.
     """
-    t = _load_alpha().get((symbol or "").upper())
+    by = _load_alpha()
+    if for_exit:
+        t = _alpha_cache["any_by_symbol"].get((symbol or "").upper())
+        return dict(t) if t and t.get("address") else None
+    t = by.get((symbol or "").upper())
     if not t or not t.get("address") or t["liquidity"] < MIN_LIQUIDITY_USD:
         return None
     return dict(t)
@@ -207,7 +214,7 @@ def wallet_snapshot(address: str, symbols: list) -> dict:
     out = {"address": address, "usdt": from_wei(erc20_balance(USDT, address), USDT_DECIMALS),
            "bnb": from_wei(bnb_balance(address), 18), "tokens": {}}
     for s in symbols or []:
-        t = alpha_token(s)
+        t = alpha_token(s, for_exit=True)
         if t:
             out["tokens"][s] = from_wei(erc20_balance(t["address"], address), t["decimals"])
     return out
@@ -220,10 +227,6 @@ class SwapReverted(RuntimeError):
 
 class BroadcastError(RuntimeError):
     pass
-
-
-class ShortGone(RuntimeError):
-    """El short desapareció mientras una venta límite de cierre estaba viva."""
 
 
 def _sign_and_send(wallet: dict, tx: dict, aggregator=None, allow_public: bool = True,
@@ -310,11 +313,10 @@ class BscSpotLeg:
     atómico (sin maker) y llama on_fill(tx_hash, fills, net_base).
     """
 
-    venue = "bsc"
     entry_mode = "onchain_swap"
 
     def __init__(self, wallet: dict, token: dict, ctx, perp_cli, perp_sym,
-                 max_slippage: float = DEFAULT_SLIPPAGE, aggregator=None):
+                 aggregator=None):
         if not token or not token.get("address"):
             raise ValueError("token Alpha BSC no disponible")
         self.wallet = wallet
@@ -323,7 +325,7 @@ class BscSpotLeg:
         self.ctx = ctx
         self.perp_cli = perp_cli
         self.perp_sym = perp_sym
-        self.max_slippage = max_slippage
+        self.max_slippage = DEFAULT_SLIPPAGE
         self.max_impact = MAX_PRICE_IMPACT
         self.agg = aggregator or get_aggregator()
         self.order_ids = []   # tx hashes
@@ -332,6 +334,7 @@ class BscSpotLeg:
         self.exit_log = []    # tramos de la venta del spot desnudo (auditoría)
         self.swaps = []       # cada swap: cotizado, mínimo, impacto y canal (auditoría)
         self._last_impact = None
+        self._perp_ref = None  # perp bid/ask justo antes del swap: basis por tramo (auditoría)
 
     def naked_exit(self):
         """El SL (o una liquidación) ya cerró el short: vender pesa más que el precio
@@ -418,7 +421,7 @@ class BscSpotLeg:
         self.swaps.append({"tx": txh, "in": spent, "out": got, "impact": impact, "via": meta.get("via"),
                            "quoted_out": from_wei(int(q["to_amount"]), dst_dec) if q.get("to_amount") else None,
                            "min_out": from_wei(int(q["min_out"]), dst_dec) if q.get("min_out") else None,
-                           "slippage": self.max_slippage})
+                           "slippage": self.max_slippage, "perp_ref": self._perp_ref, "ts": time.time()})
         return spent, got, txh
 
     def _impact_vs_mid(self, src, src_dec, dst, dst_dec, amt_wei, q):
@@ -483,6 +486,7 @@ class BscSpotLeg:
             usdt_in = min(usdt_in, have)
             if usdt_in <= 0:
                 raise RuntimeError("Sin USDT en la wallet BSC")
+            self._perp_ref = pb or None
             spent, got, txh = self._swap_retry(USDT, USDT_DECIMALS, tok, dec, usdt_in)
             on_fill(txh, {"gross": got, "cost": spent, "avg": spent / got if got else 0,
                           "fee_usd": 0.0, "fee_base": 0.0}, got)
@@ -491,11 +495,15 @@ class BscSpotLeg:
         if amt <= 0:
             return 0.0
         if not self.naked:
+            try:
+                self._perp_ref = float(self.perp_cli.fetch_ticker(self.perp_sym).get("ask") or 0) or None
+            except Exception:
+                self._perp_ref = None
             spent, got, txh = self._swap_retry(tok, dec, USDT, USDT_DECIMALS, amt)
             on_fill(txh, {"gross": spent, "cost": got, "avg": got / spent if spent else 0,
                           "fee_usd": 0.0, "fee_base": 0.0}, spent)
             return spent
-        n = self._exit_slices(amt)
+        n = EXIT_SLICES
         sold = 0.0
         for i in range(n):
             if i:
@@ -519,14 +527,6 @@ class BscSpotLeg:
                           "fee_usd": 0.0, "fee_base": 0.0}, spent)
             sold += spent
         return sold
-
-    def _exit_slices(self, amt: float) -> int:
-        """Tramos para vender `amt` desnudo: ceil(impacto del total vs mid / EXIT_SPLIT_IMPACT),
-        entre 1 y EXIT_MAX_SLICES. Sin medición → 1 (no demorar la salida)."""
-        imp = self._size_impact(amt, "sell")
-        if not imp:
-            return 1
-        return max(1, min(EXIT_MAX_SLICES, math.ceil(imp / EXIT_SPLIT_IMPACT)))
 
     def _size_impact(self, base_amt: float, side: str, ref_px: float = 0.0):
         """Impacto (fracción) de operar base_amt completo vs mid. None si no se pudo medir."""
@@ -566,130 +566,6 @@ class BscSpotLeg:
         self._swap(self.token["address"], self.token["decimals"], USDT, USDT_DECIMALS, amt,
                    allow_public=True)
         return True
-
-
-class BscLimitLeg(BscSpotLeg):
-    """Spot on-chain por orden límite Kyber (piloto), con el perp a mercado por cada llenado.
-
-    La compra límite se llena cuando el precio baja y una venta límite del perp cuando sube:
-    no son atómicas, así que solo la pierna on-chain queda en espera y el perp se cubre con
-    cada llenado (PerpHedger, acumulado). El saldo del token es la fuente de verdad del fill.
-    """
-
-    entry_mode = "onchain_limit"
-    keep_perp_sl = True
-
-    def __init__(self, *args, theta: float = LIMIT_THETA, limit_window: float = LIMIT_WINDOW, **kw):
-        super().__init__(*args, **kw)
-        self.theta = theta
-        self.limit_window = limit_window
-        self.unfilled = False
-        self.limit_log = []
-
-    def _limit_price(self, side: str):
-        t = self.perp_cli.fetch_ticker(self.perp_sym)
-        bid, ask = float(t.get("bid") or 0), float(t.get("ask") or 0)
-        ref = bid if side == "buy" else ask
-        if not ref:
-            return None
-        mid = self.mid_price(ref)
-        if side == "buy":
-            px = ref * (1 - self.theta)
-            return min(px, mid * (1 + LIMIT_CROSS)) if mid else px
-        px = ref * (1 + self.theta)
-        return max(px, mid * (1 - LIMIT_CROSS)) if mid else px
-
-    def _token_wei(self) -> int:
-        return erc20_balance(self.token["address"], self.address)
-
-    def _save_state(self, state: dict):
-        self.ctx.progress({"phase": "limit", "limit": dict(state), "_force": True})
-
-    def _short_gone(self) -> bool:
-        from exchanges.trade_executor import _open_perp_size
-        size = _open_perp_size(self.perp_cli, self.perp_sym, "short")
-        return size is not None and size <= 0
-
-    def trade(self, side, target_base, on_fill, window, taker_ok):
-        from exchanges import kyber_limit_order as klo
-        if target_base <= 0 or self.ctx.cancelled():
-            return 0.0
-        start_wei = self._token_wei()
-        state = {"side": side, "token": self.token, "start_wei": str(start_wei), "prior_base": 0.0,
-                 "prior_cost": 0.0, "order_id": None, "order_px": None}
-        deadline = time.time() + self.limit_window
-        filled = 0.0
-        cost = 0.0
-        while filled < target_base * 0.999 and time.time() < deadline and not self.ctx.cancelled():
-            px = self._limit_price(side)
-            if not px:
-                time.sleep(LIMIT_POLL)
-                continue
-            try:
-                ttl = int(max(30, deadline - time.time()))
-                order = klo.place_buy(self.wallet, self.token, target_base - filled, px, ttl=ttl) \
-                    if side == "buy" else klo.place_sell(self.wallet, self.token, target_base - filled, px, ttl=ttl)
-            except Exception as e:
-                if filled > 0:
-                    log.warning(f"límite {self.token['symbol']}: no se pudo re-colocar: {e}")
-                    break
-                log.warning(f"límite {self.token['symbol']}: Kyber LO no disponible ({e}); swap")
-                return super().trade(side, target_base, on_fill, window, taker_ok)
-            state.update(order_id=order["id"], order_px=px)
-            self._save_state(state)
-            self.order_ids.append(f"lo:{order['id']}")
-            got = self._watch(order["id"], side, px, start_wei, filled, cost, deadline, on_fill, state)
-            filled, cost = got
-            state.update(prior_base=filled, prior_cost=cost, order_id=None, order_px=None)
-            self._save_state(state)
-        self.unfilled = filled <= 0
-        self.limit_log.append({"side": side, "filled": filled, "cost": cost, "target": target_base,
-                               "avg": cost / filled if filled else None})
-        return filled
-
-    def _filled_now(self, side, start_wei) -> float:
-        dec = self.token["decimals"]
-        delta = self._token_wei() - start_wei if side == "buy" else start_wei - self._token_wei()
-        return from_wei(max(0, delta), dec)
-
-    def _watch(self, oid, side, px, start_wei, prior, prior_cost, deadline, on_fill, state):
-        """Vigila una orden hasta llenarse o re-anclar; siempre la deja cerrada. (filled, cost)."""
-        from exchanges import kyber_limit_order as klo
-        placed_at = last_short = time.time()
-        reported = prior
-
-        def report():
-            nonlocal reported
-            total = self._filled_now(side, start_wei)
-            if total > reported + 1e-12:
-                q = total - prior
-                c = q * px
-                on_fill(f"lo:{oid}", {"gross": q, "cost": c, "avg": px, "fee_usd": 0.0, "fee_base": 0.0}, q)
-                reported = total
-            return total
-
-        try:
-            while time.time() < deadline and not self.ctx.cancelled():
-                report()
-                if klo.order_is_final(self.wallet["address"], oid):
-                    break
-                if side == "sell" and time.time() - last_short >= LIMIT_SHORT_CHECK:
-                    last_short = time.time()
-                    if self._short_gone():
-                        raise ShortGone("El SL cerró el short durante la venta límite")
-                if time.time() - placed_at >= LIMIT_REPEG:
-                    new_px = self._limit_price(side)
-                    if new_px and abs(new_px / px - 1) >= LIMIT_REPEG_MOVE:
-                        break
-                    placed_at = time.time()
-                time.sleep(LIMIT_POLL)
-        finally:
-            try:
-                klo.finalize(self.wallet, oid, LIMIT_CANCEL_WAIT, LIMIT_POLL)
-            except Exception as e:
-                log.error(f"límite {self.token['symbol']} orden {oid}: no se pudo cerrar: {e}")
-            report()
-        return reported, prior_cost + (reported - prior) * px
 
 
 # ── Agregador DEX ───────────────────────────────────────────────────────────

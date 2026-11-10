@@ -825,25 +825,17 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         from exchanges import onchain_bsc
         return lambda pc, ps, ctx: onchain_bsc.BscSpotLeg(wallet, token, ctx, pc, ps)
 
-    def _execution_wait(execution, spot_venue, side, notional):
-        """(wait, error). On-chain espera basis por defecto; 'now' ejecuta ya; 'limit' es el piloto."""
-        from exchanges import onchain_bsc
+    def _execution_wait(spot_venue, side):
+        """On-chain siempre espera basis ejecutable (reports/exec_study_*); «Ejecutar ya» la corta."""
         from execution.jobs import wait_params
-        if spot_venue != "bsc" or execution == "now":
-            return None, None
-        if execution == "limit":
-            if notional > onchain_bsc.LIMIT_MAX_USD:
-                return None, f"El piloto de orden límite admite hasta ${onchain_bsc.LIMIT_MAX_USD} por orden."
-            return wait_params("limit", side), None
-        return wait_params("basis", side), None
+        return wait_params(side) if spot_venue == "bsc" else None
 
     @app.route("/api/execute_open", methods=["POST"])
     @auth_required
     def api_execute_open():
         """Open a position by placing real orders (CEX perp + spot CEX/BSC).
 
-        Body: {opportunity_id, capital, leverage, dry_run?, twap?:{slices,duration_s},
-               allow_market_fallback?}.
+        Body: {opportunity_id, capital, leverage, dry_run?, twap?:{slices,duration_s}}.
         dry_run → simulación síncrona (rápida). Real → crea un ExecutionJob y
         devuelve {job_id}; el frontend hace polling de /api/exec/jobs/<id>.
         """
@@ -931,9 +923,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
 
         if not job_runner:
             return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
-        wait, err = _execution_wait(data.get("execution"), spot_venue, "buy", capital - capital / (leverage + 1))
-        if err:
-            return jsonify({"ok": False, "msg": err})
+        wait = _execution_wait(spot_venue, "buy")
         if not wait and job_runner.active_job(uid):
             return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
         if job_runner.armed_open_for_symbol(uid, opp.get("symbol")):
@@ -949,7 +939,6 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         params = {
             "symbol": opp.get("symbol"), "opportunity": opp, "capital": capital,
             "leverage": leverage, "twap": twap,
-            "allow_market_fallback": bool(data.get("allow_market_fallback", True)),
             "spot_venue": "bsc" if spot_venue == "bsc" else "", "token": token or {},
         }
         if wait:
@@ -1053,8 +1042,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
 
         token = {}
         if pos.get("spot_venue") == "bsc":
-            from exchanges import onchain_bsc
-            token = onchain_bsc.alpha_token(pos.get("symbol", "")) or {}
+            from execution.jobs import position_token
+            token = position_token(pos) or {}
             if not token or not dbp.load_user_wallet(uid, "bsc"):
                 return jsonify({"ok": False, "msg": "Wallet BSC o token no disponible"})
 
@@ -1069,11 +1058,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
 
         if not job_runner:
             return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
-        notional = float(pos.get("spot_qty") or 0) * float(pos.get("entry_price") or 0)
-        wait, err = _execution_wait(data.get("execution"), "bsc" if pos.get("spot_venue") == "bsc" else "",
-                                    "sell", notional)
-        if err:
-            return jsonify({"ok": False, "msg": err})
+        wait = _execution_wait(pos.get("spot_venue"), "sell")
         if job_runner.active_job_for_position(uid, db_pos_id, include_armed=True):
             return jsonify({"ok": False, "msg": "Esta posición ya tiene un cierre en curso o en espera."})
         if not wait and job_runner.active_job(uid):

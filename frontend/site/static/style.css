@@ -346,8 +346,6 @@ body {
 .pos-real strong { color: var(--text-primary); }
 .pos-drift { background: rgba(245,158,11,0.15); color: var(--orange); }
 .exec-twap { display: flex; align-items: center; gap: 6px; font-family: var(--font-ui); font-size: 12px; color: var(--text-primary); margin: 6px 0; cursor: pointer; }
-.exec-mode { width: 100%; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; color: var(--text-white); padding: 6px 8px; margin-bottom: 8px; font-family: var(--font-ui); font-size: 12px; }
-.exec-mode option { color: #111; }
 .armed-job { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 12px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; font-family: var(--font-ui); font-size: 12px; color: var(--text-primary); }
 .armed-actions { display: flex; gap: 6px; }
 .exec-twap-cfg { gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
