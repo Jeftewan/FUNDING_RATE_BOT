@@ -24,17 +24,20 @@ log = logging.getLogger("bot.jobs")
 _ACTIVE = ("queued", "running")
 _ARMED = "armed"
 ARMED_POLL = 60
-# Basis ejecutable al tamaño de cada tramo, en %. Equivale a basis a mid ≥ 0.4 para entrar y ≤ 0
-# para salir menos ~0.15 % de impacto por tramo (reports/execution_study_20261108.md).
-PATIENT_WINDOW_S = 6 * 3600
+# Basis ejecutable al tamaño de cada tramo, en % (reports/exec_study_20261110.md): entrar con
+# ≥ 0.25 en hasta 6 h y salir con ≥ −0.15 en hasta 24 h. Umbrales fijos: los relativos al
+# propio token, otras ventanas de entrada y "ejecutar ya" no pasan el criterio.
+PATIENT_ENTRY_WINDOW_S = 6 * 3600
+PATIENT_EXIT_WINDOW_S = 24 * 3600
 PATIENT_ENTRY_BASIS = 0.25
 PATIENT_EXIT_BASIS = -0.15
 
 
 def wait_params(side: str) -> dict:
     """Espera de basis ejecutable antes del swap: lado, vencimiento y umbral."""
-    return {"side": side, "deadline": time.time() + PATIENT_WINDOW_S,
-            "theta": PATIENT_ENTRY_BASIS if side == "buy" else PATIENT_EXIT_BASIS}
+    buying = side == "buy"
+    return {"side": side, "deadline": time.time() + (PATIENT_ENTRY_WINDOW_S if buying else PATIENT_EXIT_WINDOW_S),
+            "theta": PATIENT_ENTRY_BASIS if buying else PATIENT_EXIT_BASIS}
 
 
 def position_token(pos):

@@ -832,6 +832,39 @@ def protection_price(entry: float, liq: float, fraction: float = PROTECTION_LIQ_
     return entry + fraction * (liq - entry)
 
 
+# Entre tramos (hasta 75 min con SLICE_GAP de 15 min) la posición aún no tiene seguros o ya se
+# cancelaron: si el mark recorre este tanto del camino a liquidación se deja de esperar.
+SLICE_HOT_FRACTION = 0.70
+SLICE_HOT_CHECK_S = 60
+
+
+def near_liquidation(perp_cli, perp_sym: str, fraction: float = SLICE_HOT_FRACTION) -> bool:
+    """True si el mark del short recorrió `fraction` del camino entrada → liquidación."""
+    try:
+        for p in perp_cli.fetch_positions([perp_sym]):
+            if not p.get("contracts") or p.get("side") not in (None, "short"):
+                continue
+            mark = float(p.get("markPrice") or (p.get("info") or {}).get("markPrice") or 0)
+            entry, liq = float(p.get("entryPrice") or 0), float(p.get("liquidationPrice") or 0)
+            return bool(mark and entry and liq > entry and mark >= entry + fraction * (liq - entry))
+    except Exception as e:
+        log.warning(f"near_liquidation {perp_sym}: {e}")
+    return False
+
+
+def slice_pause(ctx, seconds: float, hot=None) -> bool:
+    """Pausa entre tramos. True = dejar de esperar (hot() avisó que el mark va hacia el SL)."""
+    rest, checked = seconds, None
+    while rest > 0 and not ctx.cancelled():
+        if hot and (checked is None or checked - rest >= SLICE_HOT_CHECK_S):
+            checked = rest
+            if hot():
+                return True
+        time.sleep(min(5, rest))
+        rest -= 5
+    return False
+
+
 def protection_spot_price(sl: float, offset: float = PROTECTION_SPOT_OFFSET) -> float:
     return sl * (1 - offset)
 
@@ -1618,11 +1651,10 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
             need = slice_target - state["spot_net"]
             if need > 0:
                 leg.trade("buy", need, on_fill, window, taker_ok)
-            if i < slices - 1:
-                rest = interval - (time.time() - t0)
-                while rest > 0 and not ctx.cancelled():
-                    time.sleep(min(5, rest))
-                    rest -= 5
+            if i < slices - 1 and slice_pause(ctx, interval - (time.time() - t0),
+                                              lambda: near_liquidation(perp_cli, perp_sym)):
+                state["partial_reason"] = "el precio se acercó a la liquidación entre tramos"
+                break
     except ExecError as e:
         error = e
     except Exception as e:
@@ -1661,9 +1693,10 @@ def _open_spot_perp(creds_by_exchange, opp, symbol, capital, leverage, dry_run,
 
     res = _open_result(exchange, spot_sym, perp_sym, leg, hedger, state, leverage, onchain)
     res["ok"] = True
-    if error or ctx.cancelled():
+    if error or ctx.cancelled() or state.get("partial_reason"):
         res["partial_note"] = (f"Ejecución parcial: {error}" if error
-                               else "Cancelado por el usuario: se guardó lo ejecutado")
+                               else "Cancelado por el usuario: se guardó lo ejecutado" if ctx.cancelled()
+                               else f"Ejecución parcial: {state['partial_reason']}")
     res["filled_ratio"] = round(min(1.0, state["spot_net"] / base_target), 4) if base_target else None
     res["liquidation"] = liq
     return res
@@ -1881,11 +1914,9 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
             if need > 0:
                 # Cerrar tiene prioridad: taker incondicional tras la ventana maker.
                 leg.trade("sell", need, on_fill, window, lambda *_: True)
-            if i < slices - 1:
-                rest = interval - (time.time() - t0)
-                while rest > 0 and not ctx.cancelled():
-                    time.sleep(min(5, rest))
-                    rest -= 5
+            if i < slices - 1 and interval and slice_pause(ctx, interval - (time.time() - t0),
+                                                           lambda: near_liquidation(perp_cli, perp_sym)):
+                interval = 0     # sin seguros y cerca de liquidación: el resto sale ya
     except ExecError as e:
         error = e
     except Exception as e:

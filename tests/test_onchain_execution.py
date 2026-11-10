@@ -1,4 +1,4 @@
-"""Ejecución on-chain: anti-sándwich, troceo, espera de basis y orden límite (sin red)."""
+"""Ejecución on-chain: anti-sándwich, troceo y espera de basis (sin red)."""
 import threading
 import time
 from unittest.mock import MagicMock
@@ -133,6 +133,17 @@ def test_open_splits_automatically_and_logs_swaps(chain, perp, monkeypatch):
     assert res["ok"], res
     assert len(res["swaps"]) == 3 and res["entry_mode"] == "onchain_swap"
     assert all(s["perp_ref"] for s in res["swaps"])
+    assert perp.short == pytest.approx(res["perp_qty"])
+
+
+def test_open_stops_slicing_when_price_nears_liquidation(chain, perp, monkeypatch):
+    """Entre tramos de 20 min aún no hay seguros: cerca de liquidación se guarda lo cubierto."""
+    monkeypatch.setattr(te.time, "sleep", lambda s: None)
+    monkeypatch.setattr(te, "near_liquidation", lambda cli, sym: True)
+    fac = lambda pc, ps, ctx: _leg(chain, pc, ctx=ctx)      # noqa: E731
+    res = te.execute_open(CREDS, OPP, capital=200, leverage=1, spot_leg_factory=fac)
+    assert res["ok"] and len(res["swaps"]) == 1, res
+    assert "liquidación" in res["partial_note"]
     assert perp.short == pytest.approx(res["perp_qty"])
 
 

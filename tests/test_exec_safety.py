@@ -426,12 +426,13 @@ def test_naked_bsc_close_accepts_real_impact_but_hedged_close_does_not(bsc_env):
 
 def test_naked_bsc_close_sells_in_slices_with_tight_slippage(bsc_env):
     # AIN #51: un solo swap de todo el spot desnudo salió 1.46 % bajo el mid (con sándwich).
+    # Siempre EXIT_SLICES tramos (exec_study_20261110).
     from exchanges import onchain_bsc as ob
     close, ex = bsc_env
     res = close(real_impact=0.012, oracle_impact=None, short=0)
     assert res["ok"] and res["spot_sold"] == pytest.approx(500), res
     swaps = res["exec"]["exit_swaps"]
-    assert 2 <= len(swaps) <= ob.EXIT_MAX_SLICES
+    assert len(swaps) == ob.EXIT_SLICES
     assert sum(s["qty"] for s in swaps) == pytest.approx(500)
     assert set(close.box["last"].slippages) == {ob.EXIT_SLIPPAGE}
 

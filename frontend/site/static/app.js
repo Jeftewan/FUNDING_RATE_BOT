@@ -1391,7 +1391,7 @@ function showExecConfirm(kind, meta) {
         <div class="exec-sub">${head}</div>
         <ul class="exec-legs">${legsHtml}</ul>
         ${sizeNote}
-        ${isBsc ? `<div class="exec-note">On-chain: espera hasta 6 h a que el basis ejecutable al tamaño de cada tramo sea favorable y ejecuta por tramos (swap + short pareados). «Ejecutar ya» en el progreso corta la espera.</div>` : ''}
+        ${isBsc ? `<div class="exec-note">On-chain: espera a que el basis ejecutable al tamaño del tramo sea favorable (hasta 6 h para abrir, 24 h para cerrar) y ejecuta por tramos de swap + short pareados cada 15 min, para que el pool se re-arbitre. «Ejecutar ya» en el progreso corta la espera.</div>` : ''}
         ${isCross || isBsc ? '' : `
         <label class="exec-twap"><input type="checkbox" id="exec-twap-on"> TWAP pareado (montos grandes)</label>
         <div class="exec-twap-cfg" id="exec-twap-cfg" style="display:none">

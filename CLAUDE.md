@@ -1,78 +1,70 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-11-10** (ARIA #56: cierre con token offline y leverage Alpha 1x, rama `fix/onchain-exit-offline-token`).
+Estado del proyecto al **2026-11-10** (metodología única de ejecución y seguros on-chain + ARIA #56, rama `fix/onchain-exit-offline-token`, PR #120).
 
 ---
 
-## ARIA #56: token Alpha offline y leverage Alpha 1x (2026-11-10, rama `fix/onchain-exit-offline-token`)
+## Metodología de ejecución y seguros on-chain (vigente desde 2026-11-10, PR #120)
 
-ARIA #56 (user 5, 2x, 4,173 USD, BSC).
-- **Qué pasó**: el 2026-11-10 a las 11:15 UTC el mark tocó el SL (trigger 0.21011, +34 % en 3 d) y el SL llenó a 0.210804
-  (+0.33 % sobre el trigger). A las 11:17 la venta límite Kyber vendió todo el spot: 17,814.25 → 3,724.24 USDT
-  (0.209059, 13 llenados). Pero el cierre del vigilante (job #36) falló con `token Alpha BSC no disponible`: ARIA
-  pasó a `offline` en la lista Alpha y `alpha_token` la descartaba.
-- **Resultado real**: `user_history` #52, liquidada con `scripts/settle_position.py`.
-  - Funding +22.84 (17 pagos).
-  - Precio −24.68 (spot +944.38, perp −969.06; basis de salida −0.83 %).
-  - Fees 3.32.
-  - **Neto −5.16 USD**.
-- Sin el SL la posición habría sobrevivido: mark máximo 0.21737 vs liq 0.22354.
-- **Fix**: `onchain_bsc.alpha_token(sym, for_exit=True)` acepta tokens offline y sin mínimo de liquidez (abrir sigue
-  exigiéndolos); `jobs.position_token(pos)` cae al token del job de apertura. Lo usan el cierre del vigilante
-  (`_run_close`), el cierre manual, `_bsc_args` y el snapshot de la wallet.
-- **`scripts/settle_position.py --pos N --railway [--apply]`**: liquida una posición que los seguros ya cerraron en el
-  exchange.
-  - Lee el fill del SL (`actualOrderId`), la venta Kyber o la venta spot CEX y el `FUNDING_FEE` real.
-  - Persiste por `JobRunner._finalize_close`. Toma `FERNET_KEY` de Railway sin imprimirla.
-  - Aborta si el short sigue abierto o si las piernas no se llenaron completas.
-- **Leverage Alpha 1x** (`RECOMMENDED_LEV`, por defecto en el modal):
-  - La liq real de ARIA implica mmr ≈ 5 %; `leverage_study_20261025` usaba 1 %.
-  - `scripts/margin_topup_study.py` → `reports/margin_topup_study_20261110_bsc.md`, mismo capital: 2x 14.4 % anual
-    (39 SL por cada 100 posiciones en 14 d) vs 1x 18.1 % vs 1.5x 18.6 %.
-  - **La recarga de margen (2x + reserva 30 % = 23.2 %) se descartó**: el capital está 100 % invertido, no hay reserva.
-  - Vender al precio del SL y esperar empeora media y p5 → δ sigue en 0.5 %.
+Única metodología para tokens solo-Alpha (spot en BSC + short perp Binance), elegida con
+`scripts/exec_study.py` → `reports/exec_study_20261110.md`. Motor único `scripts/_exec_engine.py`: velas 1m del perp
+(last y MARK) y on-chain Alpha **sin velas planas**, costo por token a + b·USD (comisión del pool + impacto,
+`cache/binance/alpha_cost.csv`, cotizaciones Kyber de 400 a 4,200 USD), empuje propio que decae ρ = 0.8/min,
+mmr 5 %, funding liquidado. 25 tokens, 2025-10 → 2026-10. Reproduce la base previa ("Esperar" +0.19 % vs +0.18 %
+publicado) y el costo spot de 17 swaps reales (error mediano 0.05 pp).
 
-## Límites pareados on-chain + perp: descartados (2026-11-10, rama `feat/paired-limit-execution`)
+**Criterio** (fijado antes de correr, en los 4 tamaños 1,600/2,100/3,000/4,200 USD): Δ media con IC 95 % por bloques
+símbolo × semana sobre cero, Δp5 ≥ −0.25 pp, mejor en ≥ 80 % de los trimestres. Entre las que pasan, mayor Δ media;
+a < 0.02 pp se prefiere la pausa más corta.
 
-Idea del usuario: entrar y salir con una límite Kyber y una límite perp al mismo precio (o con margen a favor θ)
-y esperar a que llenen. `scripts/paired_limit_study.py` → `reports/paired_limit_study_20261110.md`.
-- **Método**: mismo motor que `tranche_study` (sin velas planas, comisión + impacto por token, funding), 2,100 USD, 183
-  políticas:
-  - ancla mid/perp, θ 0–0.6 %, re-anclaje 15/60 min, ventana 6/24 h;
-  - con una pierna sola: now / keep / chase, T 5–120 min, x 0.5–2 %;
-  - gate por swap y edge 0.1–0.7 %.
-- **Resultado**: todas −1.47 a −1.66 % por ida y vuelta vs **prod "Esperar" +0.18 %** (p5 −2.8 vs −0.91), 0/5 trimestres.
-- **Por qué**:
-  - Ambas llenan juntas solo en el 1–6 % de los intentos (ahí +1.1 %). En el resto llena primero una pierna.
-  - La límite Kyber tiene **selección adversa**: la llena un arbitrajista cuando el pool ya la atravesó (JCT +0.10 %,
-    ARIA +0.68 % sobre el precio de la orden).
-  - Al salir, el perp suele estar +0.29 % sobre el spot, así que el empate casi nunca llega.
-- **Se mantiene "Esperar"** (basis ejecutable al tamaño del tramo, ambas piernas a la vez): ya es la política
-  "según libro".
-- **Piloto `BscLimitLeg`**: −0.01 %, p5 −2.57, 0/5 trimestres → recomendado apagarlo sin esperar las 10 órdenes.
-- **Fees**: trocear swaps no sube la comisión del pool (es % del nocional), solo suma gas y baja el impacto.
+**Entrada y salida** (`execution/jobs.py`, `exchanges/onchain_bsc.py`):
+- Siempre en espera (`armed`): basis ejecutable al tamaño del tramo ≥ 0.25 % para abrir (hasta 6 h,
+  `PATIENT_ENTRY_*`) y ≥ −0.15 % para cerrar (hasta 24 h, `PATIENT_EXIT_*`). Vence → `expired` + Telegram.
+  «Ejecutar ya» (`/api/exec/jobs/<id>/fire`) corta la espera. Sin parámetro `execution`.
+- Tramos de ≤ 0.15 % de impacto (máx. 6) **cada 15 min** (`SLICE_GAP`; antes 45 s), swap y short pareados.
+- Resultado a 2,100 USD: media +0.32 % por ida y vuelta vs +0.12 % con 45 s (fuga del funding 49 % vs 80 %);
+  Δ +0.16/+0.20/+0.28/+0.36 pp de 1,600 a 4,200 USD, p5 mejor, 5/5 trimestres. Con ρ 0.9 gana más; con ρ = 1
+  (el pool no se recupera nunca) ≈ −0.01 pp.
+- **Guarda**: entre tramos no hay seguros (hasta 75 min). `trade_executor.near_liquidation` (cada 60 s): si el mark
+  recorre el 70 % del camino a liquidación, la apertura se detiene y guarda lo cubierto, y el cierre vende el resto ya.
+- No pasan: ejecutar ya (pierde 0.09–0.31 pp), umbrales fijos distintos, umbral relativo al percentil del propio
+  token, ventanas de entrada 2/24 h.
 
----
+**Seguros** (sin cambios salvo el spot desnudo): SL `STOP_MARKET` sobre MARK al 80 % del camino a liquidación, venta
+límite Kyber a sl·(1 − 0.5 %), caso B con short suelto (TP −20 % / 1 h).
+- Spot desnudo tras el SL: **siempre 4 tramos cada 10 min** (`EXIT_SLICES`, `EXIT_SLICE_GAP`; antes 4 seguidos con
+  10 s): +0.05/+0.07 pp a 1x y 2x, también en estrés (SL llena 1.5 % sobre el trigger y el swap paga 1 % extra).
+- No pasan: sin límite Kyber (−0.23 pp), SL sobre LAST (−0.24 pp), recomprar ya en caso B, δ 0/0.25/1/2 %, F 0.7/0.75.
+- F 0.85/0.9 pasan en algunos escenarios pero **no se adoptan**: acercan el SL a la liquidación y el motor de 1 min
+  no ve una liquidación dentro del minuto (≈ 9.5 % del nocional). Re-evaluar con aggTrades de 1 s en las ventanas de
+  disparo.
 
-## Ejecución on-chain: costo de entrada y salida (2026-11-08, rama `feat/onchain-execution`)
+**Descartado y eliminado del código**: piloto de orden límite on-chain (`BscLimitLeg`), límites pareados
+(`reports/paired_limit_study_20261110.md`), salida anticipada antes del SL (`reports/sl_exit_study_20261110_bsc.md`),
+recarga de margen (`reports/margin_topup_study_20261110_bsc.md`), ejecución automática `cross_exchange`. Sus scripts
+(`execution_study`, `tranche_study`, `paired_limit_study`, `sl_exit_study`, `margin_topup_study`, `protection_study`,
+`leverage_study`) se retiraron; los reportes quedan como historia.
 
-Caso **ZEST #52** (1,601 USD, 9 d): funding +12.20, comisiones −1.55, basis a mid +2.22, slippage −18.72, neto −5.86. El swap de entrada pagó 0.93 %: sándwich en el bloque 130479149 (idx 2 y 4 compran y revenden 13,355.5 ZEST en el pool `0x238a3588`, ≈ 6.3 USD) más impacto real. `scripts/swap_audit.py`: 4 de 15 swaps con sándwich (0.78 % vs 0.22 % de slippage medio); 4/11 antes de `BSC_PRIVATE_RPC_URL`, 0/4 después. Balance de las 5 cerradas: slippage = 180 % del funding.
-- **Volumen 24 h on-chain y `liquidity` de la lista Alpha predicen poco** (ρ −0.24 a −0.45); lo que decide es la cotización a tamaño completo. Impacto casi lineal en tamaño.
-- `reports/execution_study_20261108.md` (`scripts/execution_study.py`, walk-forward, funding ≥ 0.05 %/día): ida y vuelta swap inmediato −0.79 % mediana; **swap paciente troceado 6 h basis ≥ 0.4 %: +0.30 %, p5 −0.54 %**, 5/5 trimestres → espera activa por defecto. Límite con gate +0.22 % con p5 −1.03 %. Dos límites al mismo precio: nunca > 0 (no atómicas; compra límite llena al bajar, venta límite al subir).
-- **Fase 1**: `DEFAULT_SLIPPAGE` 0.2 % (recotiza 2 veces si revierte); `_sign_and_send(allow_public=False)` en swaps normales: sin canal protegido aborta, nunca mempool pública (solo `naked_exit` y `unwind`). `exec.swaps` guarda cotizado, mínimo, impacto y canal. Kyber con backoff ante 403/429.
-- **Fase 2**: `dry_run` on-chain devuelve `execution_cost` (`rt_cost_pct`, `payback_days`) y el modal siempre simula primero. Auto-troceo apertura y cierre (`suggest_slices`: tramos ≤ 0.15 % de impacto, máx 6, 45 s); los cierres del vigilante pasan `twap` de 1 tramo.
-- **Fase 3**: job `armed` (no ocupa el cupo de `_ACTIVE`; `execution: patient|now|limit` en `/api/execute_open|close`, default patient en BSC). Basis ejecutable al tamaño del tramo: entrada ≥ 0.25, salida ≥ −0.15 (`PATIENT_*`), 6 h. Vence → `expired` + Telegram (la posición sigue). `entry_time` = `fired_at`. Vigilante cancela el `armed` (`cancel_armed_for_position`) y nunca espera. Rutas `/api/exec/jobs/armed`, `/<id>/fire`.
-- **Fase 4 (piloto, opt-in, ≤ 3,000 USD)**: `BscLimitLeg` una sola límite on-chain anclada al perp (θ 0.2 %, tope 0.1 % sobre mid, TTL ≤ 10 min, re-ancla si se mueve ≥ 0.1 %); perp taker por cada llenado medido por `balanceOf`. Sin llenar: entrada `expired`, salida re-arma swap paciente. El SL sigue vivo durante la venta (`keep_perp_sl`, solo se cancela el seguro spot y se repone si no vende). Reinicio con orden viva: `_recover_limit` cierra la orden, mide saldo y cubre contra el short real. **Evaluar tras ≥ 10 órdenes contra swap paciente; si no gana, se apaga.**
-- **Revisión 2026-11-09** (`scripts/tranche_study.py`, `scripts/execution_decomp.py`, `reports/tranche_study_20261109*.md`), motivada por #57 (disparó ≥ +0.25 %, basis realizado −0.19 %). El +0.30 % de `execution_study` estaba inflado: **no cobraba la comisión del pool** (`alpha_depth` es impacto puro; `cache/binance/alpha_cost.csv`, de 0 a 0.3 % según el token) y el **84 % de las velas con basis ≥ 0.4 son planas** (la API Alpha repite el cierre sin trades; el caché no guarda volumen). Con ambas correcciones: −0.29 mediana (inmediato −0.43). Simulador por tramos, 2,100 USD, ρ 0.8: "Esperar" media +0.18 %, fuga 73 % del funding; "Ahora" −0.77 %, fuga 195 % → **la espera se mantiene**.
-  - **Revalidar el basis por tramo NO se adoptó**: no pasa el criterio a 2,100 ni 3,000 USD (sí a 1,600). No empeora: θ con pausa de 30 min da +0.07 a +0.21 pp de media y mejora el p5 en los 3 tamaños, pero deja llenado 72–81 %. Cuidado al simular: leer y llenar en la misma vela infla el resultado (+0.04 pp en θ/30 min).
-  - Confirmar con 2–3 lecturas no aporta. Tramos cada 5 min da +0.15 pp solo si el pool se recupera (0/5 trimestres con ρ = 1). La palanca más fuerte es el tamaño: fuga 59 % a 1,600, 73 % a 2,100, 99 % a 3,000 USD.
-  - ρ (retención del empuje) = 0.8 sale de un solo job (n = 5). Prod registra `params.fire_read` y `swaps[].perp_ref`/`ts`: re-evaluar con ≥ 10 entradas pacientes corriendo `execution_decomp.py` y `tranche_study.py --refresh-cost`.
+**Re-evaluar** (`python -u scripts/exec_study.py --refresh-cost`, `--fetch`, luego sin flags; `--real` compara con
+`cache/real_exec.pkl`, que se extrae en solo lectura de prod): cuando haya ≥ 10 ejecuciones con tramos de 15 min,
+medir ρ real con `scripts/execution_decomp.py`. Si ρ ≈ 1, volver a 45 s.
 
-### Salida anticipada antes del SL (2026-11-10, PR #120, `scripts/sl_exit_study.py`)
-Idea del usuario: antes de llegar al SL, cerrar spot y short juntos por tramos. Motor de `margin_topup_study`. Estudio: 294 políticas, 1/1.5/2x. El gatillo va al s del camino a liquidación, se cierra la fracción q, con espera de basis b e histéresis h, y F = 0.8/0.9. Reporte: `reports/sl_exit_study_20261110_bsc.md`.
-- **No mejora la media con el SL vigente (F 0.8) en 1x ni en 1.5x** (0/144). Solo mejora el p5 (+0.3–0.5 pp). Recupera el caso A (−1.71 → −0.78), pero pierde parte del B (+8.02 → +7.43) y tiene ~5 % de falsas alarmas (−0.31 cada una). Sin espera de basis pierde siempre.
-- Con F 0.9 la media sube +0.10 pp (ROC 1x 16.9 vs 14.7 %), pero la cota de minutos que tocan la liquidación pasa de 12 a 56 eventos. Una liquidación cuesta ≈ 9.5 % del nocional → no se adopta sin datos más finos que velas de 1 minuto.
-- `--check` reproduce `margin_topup_study` (6,213 filas, mismos casos).
+### ARIA #56: token Alpha offline y leverage Alpha 1x (2026-11-10)
+- SL disparado (trigger 0.21011, llenó +0.33 %) y venta Kyber llenada; el cierre del vigilante falló porque ARIA pasó a
+  `offline`. Liquidada con `scripts/settle_position.py --pos N --railway [--apply]` → `user_history` #52: funding
+  +22.84, precio −24.68, fees 3.32, **neto −5.16 USD**. Sin el SL habría sobrevivido (mark máx. 0.21737 vs liq 0.22354).
+- Fix: `onchain_bsc.alpha_token(sym, for_exit=True)` acepta tokens offline; `jobs.position_token(pos)` cae al token del
+  job de apertura.
+- **Leverage Alpha 1x** (`RECOMMENDED_LEV`): la liq real implica mmr ≈ 5 %. A 14 d, mismo capital: 2x 14.4 % anual vs
+  1x 18.1 % vs 1.5x 18.6 %. La recarga de margen se descartó: el capital está 100 % invertido.
+
+### Costo on-chain: antecedentes (2026-11-08)
+- ZEST #52: el swap de entrada pagó 0.93 % (sándwich + impacto). `scripts/swap_audit.py`: 4/11 swaps con sándwich antes
+  de `BSC_PRIVATE_RPC_URL`, 0/4 después. `DEFAULT_SLIPPAGE` 0.2 %; `_sign_and_send(allow_public=False)` en swaps
+  normales (solo `naked_exit`/`unwind` pueden salir por la mempool pública).
+- `dry_run` on-chain devuelve `execution_cost` (`rt_cost_pct`, `payback_days`); el modal siempre simula primero.
+- El volumen 24 h on-chain y la `liquidity` de la lista Alpha predicen poco el costo; decide la cotización a tamaño
+  completo (impacto casi lineal). La palanca más fuerte sigue siendo el tamaño.
 
 ---
 
@@ -165,7 +157,7 @@ tasa cae a ~la mitad desde el día 1 (reversión a la media). `scripts/confidenc
 - **Modelo** (`scripts/ml_v2.py`, `reports/ml_v2_20261025.md`): en ese universo el vigente rinde 33.2 %
   WF / 14.9 % hold-out; 7 variantes (ventanas, régimen, q25, P(ganancia), E×P) no lo superan de forma
   consistente → no se exportó. Rankear por probabilidad empeora. Mensual a 1x: 1.7–6.7 %, típico ~3 %.
-- **Leverage** (`scripts/leverage_study.py`, seguros simulados con velas 1m): Alpha 1x 33 %, **2x
+- **Leverage** (`scripts/leverage_study.py`, retirado el 2026-11-10; seguros simulados con velas 1m): Alpha 1x 33 %, **2x
   36–44 %**, 3x 24–28 % (SL en 57 % de entradas); CEX mejor a 3x pero 3–5 %. → `RECOMMENDED_LEV`.
 - **Rotación**: ver `rotation_gain_ok` en switch_analyzer (margen 2 % → +18 % vs no rotar).
 - **Cross perp** (`scripts/cross_dataset.py` + `scripts/cross_backtest.py`, `reports/cross_vs_spotperp_20261025.md`,
@@ -646,18 +638,18 @@ Al abrir por API (`jobs._run_open` → `trade_executor.place_protection`), solo 
   - (b) Un remanente spot de polvo se descarta ANTES de vender: el perp se recompra igual.
   - Corrección de filas viejas: `python scripts/fix_external_buyback.py --hist 46 [--apply]` (dry-run por defecto).
 - **Lecciones de AIN #51 (2026-10-31)**: SL a 0.24639 (1x) disparado en una mecha (02:17 UTC); el vigilante cerró a los 45 s vendiendo el spot BSC con un solo swap. `price_pnl` −16.64 (neto −13.0): basis de entrada +1.71, fill del SL sobre el trigger −5.80 (+1.39 %), trigger vs mid on-chain al vender −6.57, swap vs mid −6.00 (−1.46 %, **sándwich**: bloque 130775700, tx idx 1 vende y idx 3 recompra alrededor del nuestro; con el bot en Amsterdam el fallback Kyber transmite por el RPC público). El SL era necesario (el mark llegó a 0.2876 > liq 0.2722 a las 04:41). Cambios:
-  - (a) Spot desnudo (`BscSpotLeg.naked_exit`): venta en hasta `EXIT_MAX_SLICES`=4 tramos si el total mueve > `EXIT_SPLIT_IMPACT`=0.5 % vs mid (10 s entre tramos), slippage `EXIT_SLIPPAGE`=0.3 % (un tramo revertido reintenta con 0.5 %); el 5 % de impacto queda como tope. Tramos en `exec_json.exit_swaps`.
+  - (a) Spot desnudo (`BscSpotLeg.naked_exit`): venta en 4 tramos (`EXIT_SLICES`; desde exec_study_20261110 siempre 4 y cada 5 min), slippage `EXIT_SLIPPAGE`=0.3 % (un tramo revertido reintenta con 0.5 %); el 5 % de impacto queda como tope. Tramos en `exec_json.exit_swaps`.
   - (b) `BSC_PRIVATE_RPC_URL`: sin broadcast protegido del agregador la tx va por ese RPC anti-MEV (fallback al público).
   - (c) **Esperar en vez de vender ya NO se adoptó** (`reports/naked_spot_exit_20261031_bsc.md`, 20 tokens Alpha, 12 meses): venta límite a `sp` o al precio de recompra del perp con stop/tiempo máximo mejora la media del caso A ~1.5–2.5 pp de la entrada pero empeora el p5 de ≈ −7 % a −9/−15 % (ninguna de 60 políticas cumple media ≥ y p5 ≥ −0.5 pp en 1/2/3x). En AIN habría ganado (on-chain ≥ 0.24982 a las 02:40 y a 0.30 después), pero es un evento en tendencia. El fill del SL vs trigger en BSC: mediana 0–0.5 %, p90 hasta ~1.8 % (AIN en la cola); con velas 1m no se puede evaluar `priceProtect`/`CONTRACT_PRICE`.
 - **Vigilante** (`execution/protection.py`, cada 60 s, lo arranca `JobRunner.start`): si se llenó el SL o la venta → lanza un job de cierre normal (`trigger:"protection"`) que cierra la otra pierna; orden BSC a <12 h de expirar → la renueva + Telegram `PROTECTION_RENEWED`; seguro cancelado fuera de basyo → `PROTECTION_CANCELED`. Con el mark a < 2 % del SL (`HOT_PCT`) el loop baja a 10 s.
-- **Llenados asimétricos (2026-10-25, `scripts/protection_study.py`)** — velas 1m, 12 meses: CEX = 20 alts con spot Binance (`reports/protection_study_20261025.md`); BSC = 20 tokens solo-Alpha con el precio on-chain de la API pública de Binance Alpha (`/bapi/defi/v1/public/alpha-trade/klines`, `--venue bsc`, `reports/protection_study_20261025_bsc.md`):
+- **Llenados asimétricos (2026-10-25, `scripts/protection_study.py`, retirado; su motor vive en `scripts/_exec_engine.py`)** — velas 1m, 12 meses: CEX = 20 alts con spot Binance (`reports/protection_study_20261025.md`); BSC = 20 tokens solo-Alpha con el precio on-chain de la API pública de Binance Alpha (`/bapi/defi/v1/public/alpha-trade/klines`, `--venue bsc`, `reports/protection_study_20261025_bsc.md`):
   - **Caso A** (dispara el SL, el spot no se vende → spot desnudo): es la cola peligrosa y **on-chain es frecuente** (2x: 1117 eventos en 6022 entradas vs 25 en CEX; el precio on-chain va detrás del perp). δ = 0.5 % la reduce (BSC 1117 → 408, CEX 25 → 7) y es el mejor esperado en ambos. En BSC el esperado neto por evento de seguro es negativo (≈ −0.25 % de la entrada a 2–3x) vs positivo en CEX. El cierre vende el spot **taker directo** (sin ventana maker) cuando el short ya no existe.
   - **Caso B** (se vende el spot, el SL no): en media se gana (el spot hace mecha sobre el perp). **Short suelto** (`protection_json.status = "runner"`): si la venta spot se llenó **completa**, el vigilante registra la venta (`_apply_partial_close`, spot_qty → 0, `realized_price_pnl`) y deja el short con el SL duro + `TAKE_PROFIT_MARKET` closePosition a −caída del precio de venta (`place_runner_tp`, pierna `tp`); si no toca en el tiempo máximo → cierre normal (`triggered_by: runner_timeout`). Regla por venue (`RUNNER_RULES`): **CEX −5 % / 15 min**, **BSC −20 % / 1 h** (2x: +2.56 vs +1.89 recomprar ya; en CEX esa regla rinde peor). Verificado sin enviar órdenes: ccxt manda el TP a `/fapi/v1/algoOrder` (`TAKE_PROFIT_MARKET`, `closePosition`, `CONDITIONAL`) igual que el SL. Llenado parcial o fallo al poner el TP → cierre inmediato como antes. Alerta `SPOT_TP_RUNNER`; badge "SHORT SUELTO".
   - Descartado: trailing stop (peor en CEX, neutro en BSC). En CEX la mejora del runner es marginal (+0.1–0.2 pp por evento B).
 - Solo posiciones nuevas (las previas al cambio no tienen seguros).
 
 ### Rutas
-`/api/execute_open` (`{opportunity_id, capital, leverage, dry_run?, twap?, allow_market_fallback?}`), `/api/execute_close` (`{position_id, dry_run?, twap?}`, solo `auto`/`imported`), `/api/exec/jobs/<id>`, `/api/exec/jobs/active`, `/api/exec/jobs/<id>/cancel`, `/api/account/binance` (snapshot), `/api/account/binance/sync`, `/api/account/binance/multi_assets_off` (`{confirm:true}`), `/api/account/binance/import` (`{symbol}`), `/api/account/settings` (`{auto_transfer}`), `/api/account/wallet` (GET/POST `{private_key, accept_risk:true}`/DELETE).
+`/api/execute_open` (`{opportunity_id, capital, leverage, dry_run?, twap?}`; en BSC siempre espera basis), `/api/execute_close` (`{position_id, dry_run?, twap?}`, solo `auto`/`imported`), `/api/exec/jobs/<id>`, `/api/exec/jobs/active`, `/api/exec/jobs/<id>/cancel`, `/api/account/binance` (snapshot), `/api/account/binance/sync`, `/api/account/binance/multi_assets_off` (`{confirm:true}`), `/api/account/binance/import` (`{symbol}`), `/api/account/settings` (`{auto_transfer}`), `/api/account/wallet` (GET/POST `{private_key, accept_risk:true}`/DELETE).
 
 ### Frontend
 Modal de ejecución con TWAP, simulación con leverage/liquidación/basis/fondos por wallet/sugerencia TWAP, progreso del job en vivo (reanuda al recargar). Posiciones: badges AUTO/IMPORTADA/BSC/FUNDING REAL, short/liq real, drift. Cuenta: panel Binance (saldos, modo, desactivar Multi-Assets, importar, transfer automático, sincronizar) y wallet BSC.
@@ -909,7 +901,7 @@ El repo [`Jeftewan/basyo`](https://github.com/Jeftewan/basyo) en GitHub está **
 
 ### Mejoras identificadas
 
-- **Binance en vivo — pendientes**: (1) Web3 API bloquea regiones US/NL/GB → hoy el bot está en Amsterdam (NL) por el geobloqueo de Singapur: on-chain requiere volver a SG cuando Railway corrija `152.55.188.0/22` o usar 0x (validar con un swap mínimo); (2) actualizar Términos/Privacidad (custodia de la wallet dedicada) en el source React de la landing; (3) reconciliación automática de jobs on-chain interrumpidos; (4) Portfolio Margin (`papi`) no soportado; (5) IP fija de salida → resuelta con el VPS proxy (`EXCHANGE_PROXY_URL`); (6) `cross_exchange` sigue con límites simples (sin TWAP).
+- **Binance en vivo — pendientes**: (1) Web3 API bloquea regiones US/NL/GB → hoy el bot está en Amsterdam (NL) por el geobloqueo de Singapur: on-chain requiere volver a SG cuando Railway corrija `152.55.188.0/22` o usar 0x (validar con un swap mínimo); (2) actualizar Términos/Privacidad (custodia de la wallet dedicada) en el source React de la landing; (3) reconciliación automática de jobs on-chain interrumpidos; (4) Portfolio Margin (`papi`) no soportado; (5) IP fija de salida → resuelta con el VPS proxy (`EXCHANGE_PROXY_URL`); (6) la ejecución automática `cross_exchange` se eliminó (2026-11-10): solo flujo manual.
 
 - **DeFi history fiabilidad**: `fetch_funding_history` en `defi_manager.py` depende de que los snapshots existan en DB. En deploys nuevos o símbolos nuevos, thin-history (<5 muestras) da scoring neutro — correcto pero subóptimo para toma de decisiones. Nota: GMX, Aster, Lighter y Extended reportan `volume_24h=0`; el gate de volumen del scan trata ese `0` (desconocido) como **pasa**, así que estos pares ya no quedan excluidos (el filtro de volumen real es de display, client-side).
 - **Scoring DeFi bajo (pendiente)**: los modos `cross_exchange`/`defi` puntúan bajo de forma estructural — consistency (46) + stability (21) = 67% del score se calculan sobre el *diferencial* (`period_diffs`), que cambia de signo mucho más que una tasa única → streak/consistencia bajos, CV alto. A esto se suma thin-history y `volume_24h=0`. **Pendiente** (otro plan): `defi_opportunity_score()` separado con umbrales heurísticos, tras verificar cuántos snapshots/muestras hay acumulados.

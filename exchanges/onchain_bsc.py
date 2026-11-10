@@ -33,18 +33,22 @@ NAKED_RETRY_SLIPPAGE = 0.005      # reintento de un tramo revertido del spot des
 SWAP_RETRIES = 2                  # recotizaciones tras un swap revertido (el perp aún no se tocó)
 SWAP_RETRY_WAIT = 3
 PRIVATE_RPC_RETRIES = 3
-SLICE_IMPACT = 0.0015             # troceo normal: cada tramo mueve ≤ 0.15 % vs mid
+# Troceo (reports/exec_study_20261110.md): cada tramo mueve ≤ 0.15 % vs mid y entre tramos se
+# espera a que el pool se re-arbitre. 15 min (con salida de hasta 24 h) vs 45 s: +0.15 a +0.35 pp
+# por ida y vuelta de 1,600 a 4,200 USD, 5/5 trimestres; si el pool no se recuperara nunca (ρ = 1)
+# costaría ≈ 0.01 pp.
+SLICE_IMPACT = 0.0015
 SLICE_MAX = 6
-SLICE_GAP = 45                    # s entre tramos: el pool se re-arbitra
+SLICE_GAP = 15 * 60
 MAX_PRICE_IMPACT = 0.01           # 1%
 PERP_ROUND_TRIP_FEE = 0.10        # %: perp taker a la entrada y a la salida
 MAX_PRICE_IMPACT_EXIT = 0.05      # vender spot desnudo (short ya cerrado): peor es quedarse sin cobertura
-# Spot desnudo (AIN #51, 2026-10-31): un solo swap de 1690 tokens salió 1.46 % bajo el
-# mid, con sándwich. Se trocea si el total mueve > EXIT_SPLIT_IMPACT y cada tramo va con
-# slippage corto (menos botín para el sándwich); un tramo revertido reintenta con el normal.
-EXIT_SPLIT_IMPACT = 0.005
-EXIT_MAX_SLICES = 4
-EXIT_SLICE_GAP = 10               # s entre tramos: el pool se re-arbitra
+# Spot desnudo (el SL ya recompró el short): siempre 4 tramos cada 10 min con slippage corto
+# (AIN #51: un solo swap salió 1.46 % bajo el mid, con sándwich). exec_study_20261110: +0.05 a
+# +0.07 pp sobre 4 tramos seguidos a 1x y 2x, también en estrés y con ρ = 1; un tramo
+# revertido reintenta con NAKED_RETRY_SLIPPAGE.
+EXIT_SLICES = 4
+EXIT_SLICE_GAP = 10 * 60
 EXIT_SLIPPAGE = 0.003
 ONCHAIN_MAX_BASIS = 0.005         # compra on-chain hasta 0.5% sobre el perp bid (incluye fee del DEX)
 MIN_LIQUIDITY_USD = 200_000       # liquidez mínima del token (lista Alpha)
@@ -499,7 +503,7 @@ class BscSpotLeg:
             on_fill(txh, {"gross": spent, "cost": got, "avg": got / spent if spent else 0,
                           "fee_usd": 0.0, "fee_base": 0.0}, spent)
             return spent
-        n = self._exit_slices(amt)
+        n = EXIT_SLICES
         sold = 0.0
         for i in range(n):
             if i:
@@ -523,14 +527,6 @@ class BscSpotLeg:
                           "fee_usd": 0.0, "fee_base": 0.0}, spent)
             sold += spent
         return sold
-
-    def _exit_slices(self, amt: float) -> int:
-        """Tramos para vender `amt` desnudo: ceil(impacto del total vs mid / EXIT_SPLIT_IMPACT),
-        entre 1 y EXIT_MAX_SLICES. Sin medición → 1 (no demorar la salida)."""
-        imp = self._size_impact(amt, "sell")
-        if not imp:
-            return 1
-        return max(1, min(EXIT_MAX_SLICES, math.ceil(imp / EXIT_SPLIT_IMPACT)))
 
     def _size_impact(self, base_amt: float, side: str, ref_px: float = 0.0):
         """Impacto (fracción) de operar base_amt completo vs mid. None si no se pudo medir."""
