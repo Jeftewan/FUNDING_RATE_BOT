@@ -68,6 +68,12 @@ Caso **ZEST #52** (1,601 USD, 9 d): funding +12.20, comisiones −1.55, basis a 
   - Confirmar con 2–3 lecturas no aporta. Tramos cada 5 min da +0.15 pp solo si el pool se recupera (0/5 trimestres con ρ = 1). La palanca más fuerte es el tamaño: fuga 59 % a 1,600, 73 % a 2,100, 99 % a 3,000 USD.
   - ρ (retención del empuje) = 0.8 sale de un solo job (n = 5). Prod registra `params.fire_read` y `swaps[].perp_ref`/`ts`: re-evaluar con ≥ 10 entradas pacientes corriendo `execution_decomp.py` y `tranche_study.py --refresh-cost`.
 
+### Salida anticipada antes del SL (2026-11-10, PR #120, `scripts/sl_exit_study.py`)
+Idea del usuario: antes de llegar al SL, cerrar spot y short juntos por tramos. Motor de `margin_topup_study`. Estudio: 294 políticas, 1/1.5/2x. El gatillo va al s del camino a liquidación, se cierra la fracción q, con espera de basis b e histéresis h, y F = 0.8/0.9. Reporte: `reports/sl_exit_study_20261110_bsc.md`.
+- **No mejora la media con el SL vigente (F 0.8) en 1x ni en 1.5x** (0/144). Solo mejora el p5 (+0.3–0.5 pp). Recupera el caso A (−1.71 → −0.78), pero pierde parte del B (+8.02 → +7.43) y tiene ~5 % de falsas alarmas (−0.31 cada una). Sin espera de basis pierde siempre.
+- Con F 0.9 la media sube +0.10 pp (ROC 1x 16.9 vs 14.7 %), pero la cota de minutos que tocan la liquidación pasa de 12 a 56 eventos. Una liquidación cuesta ≈ 9.5 % del nocional → no se adopta sin datos más finos que velas de 1 minuto.
+- `--check` reproduce `margin_topup_study` (6,213 filas, mismos casos).
+
 ---
 
 ## Stack
