@@ -31,6 +31,9 @@ PATIENT_ENTRY_WINDOW_S = 6 * 3600
 PATIENT_EXIT_WINDOW_S = 24 * 3600
 PATIENT_ENTRY_BASIS = 0.25
 PATIENT_EXIT_BASIS = -0.15
+# Guarda al ir a operar tras una espera: θ − margen. Con pausa de 15 min, θ entre 0 y 0.25 rinde
+# casi igual, así que solo se aborta si el basis cayó claramente por debajo de lo evaluado.
+FIRE_BASIS_MARGIN = 0.25
 
 
 def wait_params(side: str) -> dict:
@@ -195,6 +198,28 @@ class JobRunner:
         threading.Thread(target=self._run, args=(jid,), daemon=True, name=f"job-{jid}").start()
         return True
 
+    @staticmethod
+    def _exec_plan(p):
+        """twap para el executor. Tras una espera: los tramos con que se evaluó el basis son el
+        mínimo a ejecutar, y el basis debe seguir cerca del umbral al ir a operar."""
+        read = p.get("fire_read")
+        if not read:
+            return p.get("twap") or None
+        return {**(p.get("twap") or {}), "min_slices": int(read.get("slices") or 1),
+                "min_basis": float(p["wait"]["theta"]) - FIRE_BASIS_MARGIN}
+
+    def _rearm(self, job, res):
+        """El basis se fue entre el disparo y el primer tramo: nada se operó, sigue la espera."""
+        jid = job["id"]
+        params = {k: v for k, v in job["params"].items() if k not in ("fired_at", "fire_read")}
+        log.info(f"job {jid}: vuelve a esperar ({res.get('msg')})")
+        self._update(jid, status=_ARMED, params_json=params,
+                     progress_json={"phase": "armed", "basis_pct": res.get("basis_pct"),
+                                    "theta": params["wait"]["theta"], "deadline": params["wait"]["deadline"]})
+        timer = threading.Timer(ARMED_POLL, self._watch_armed, args=(jid,))
+        timer.daemon = True
+        timer.start()
+
     def _expire(self, job):
         sym = job["params"].get("symbol", "")
         msg = (f"{sym}: el basis no llegó al umbral en la ventana; no se abrió la posición."
@@ -334,8 +359,10 @@ class JobRunner:
         ctx = self._ctx(jid)
         res = texec.execute_open(creds, opp, float(p["capital"]), int(p["leverage"]),
                                  dry_run=False,
-                                 ctx=ctx, twap=p.get("twap") or None,
+                                 ctx=ctx, twap=self._exec_plan(p),
                                  spot_leg_factory=self._spot_leg_factory(uid, p))
+        if res.get("code") == "BASIS_GONE":
+            return self._rearm(job, res)
         fill = res if res.get("ok") else res.get("partial")
         pos_id = None
         if fill and (fill.get("perp_qty") or 0) > 0:
@@ -497,9 +524,11 @@ class JobRunner:
             token = p.get("token") or (position_token(pos) if pos.get("spot_venue") == "bsc" else None) or {}
         creds = self._creds(uid, [pos.get("exchange", "")])
         res = texec.execute_close(creds, pos, dry_run=False, ctx=self._ctx(jid),
-                                  twap=p.get("twap") or None,
+                                  twap=self._exec_plan(p),
                                   spot_leg_factory=self._spot_leg_factory(
                                       uid, {**p, "spot_venue": pos.get("spot_venue"), "token": token}))
+        if res.get("code") == "BASIS_GONE":
+            return self._rearm(job, res)
         sym = pos.get("symbol", "")
         if res.get("price_pnl_unknown"):
             self._alert(uid, sym, f"{sym}: el short se cerró fuera de basyo y su recompra no se pudo "

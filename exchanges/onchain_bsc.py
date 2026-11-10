@@ -40,6 +40,12 @@ PRIVATE_RPC_RETRIES = 3
 SLICE_IMPACT = 0.0015
 SLICE_MAX = 6
 SLICE_GAP = 15 * 60
+# Medición del impacto para trocear: con el precio en movimiento un mid viejo da impacto 0 y el
+# job #37 compró 2,082 USD de un golpe con 0.57 % de impacto. Sin medición válida → SLICE_MAX.
+SLICE_MEASURE_TRIES = 3
+SLICE_MEASURE_WAIT = 2
+SLICE_MEASURE_DRIFT = 0.001       # la cotización completa no puede moverse más que esto al medir
+RECOVERY_MARKS = (0, 60, 300, 600)  # s tras un tramo: mid y perp para medir la recuperación del pool
 MAX_PRICE_IMPACT = 0.01           # 1%
 PERP_ROUND_TRIP_FEE = 0.10        # %: perp taker a la entrada y a la salida
 MAX_PRICE_IMPACT_EXIT = 0.05      # vender spot desnudo (short ya cerrado): peor es quedarse sin cobertura
@@ -418,7 +424,8 @@ class BscSpotLeg:
             raise SwapReverted(f"swap revertido ({txh})")
         spent = from_wei(before_in - erc20_balance(src, self.address), src_dec)
         got = from_wei(erc20_balance(dst, self.address) - before_out, dst_dec)
-        self.swaps.append({"tx": txh, "in": spent, "out": got, "impact": impact, "via": meta.get("via"),
+        self.swaps.append({"tx": txh, "side": "sell" if dst.lower() == USDT.lower() else "buy",
+                           "in": spent, "out": got, "impact": impact, "via": meta.get("via"),
                            "quoted_out": from_wei(int(q["to_amount"]), dst_dec) if q.get("to_amount") else None,
                            "min_out": from_wei(int(q["min_out"]), dst_dec) if q.get("min_out") else None,
                            "slippage": self.max_slippage, "perp_ref": self._perp_ref, "ts": time.time()})
@@ -543,12 +550,53 @@ class BscSpotLeg:
             log.warning(f"impacto {side} {self.token.get('symbol')}: {e}")
             return None
 
-    def suggest_slices(self, base_amt: float, side: str, ref_px: float = 0.0) -> dict:
-        """TWAP para que cada tramo mueva ≤ SLICE_IMPACT. Sin medición → sin trocear."""
-        imp = self._size_impact(base_amt, side, ref_px)
-        n = max(1, min(SLICE_MAX, math.ceil(imp / SLICE_IMPACT))) if imp else 1
-        return {"slices": n, "duration_s": n * SLICE_GAP if n > 1 else 0,
-                "suggest": n > 1, "impact_pct": round(imp * 100, 4) if imp is not None else None}
+    def _stable_impact(self, base_amt: float, side: str, ref_px: float = 0.0):
+        """Impacto a tamaño completo con el precio quieto: dos cotizaciones completas alrededor
+        del mid. Un impacto ≤ 0 no es una medición (todo swap paga algo). None si no se logra."""
+        for attempt in range(SLICE_MEASURE_TRIES):
+            if attempt:
+                time.sleep(SLICE_MEASURE_WAIT)
+            try:
+                first = self.quote_price(base_amt, side, ref_px=ref_px)
+                mid = self.mid_price(first)
+                last = self.quote_price(base_amt, side, ref_px=ref_px)
+            except Exception as e:
+                log.warning(f"impacto {side} {self.token.get('symbol')}: {e}")
+                continue
+            if not (first and last and mid) or abs(last / first - 1) > SLICE_MEASURE_DRIFT:
+                continue
+            px = (first + last) / 2
+            imp = px / mid - 1 if side == "buy" else 1 - px / mid
+            if imp > 0:
+                return imp
+        return None
+
+    def suggest_slices(self, base_amt: float, side: str, ref_px: float = 0.0, min_slices: int = 1) -> dict:
+        """TWAP para que cada tramo mueva ≤ SLICE_IMPACT. Sin medición → SLICE_MAX: operar de
+        golpe por no haber podido medir es el peor resultado posible."""
+        imp = self._stable_impact(base_amt, side, ref_px)
+        n = SLICE_MAX if imp is None else max(1, min(SLICE_MAX, math.ceil(imp / SLICE_IMPACT)))
+        n = max(n, min_slices)
+        return {"slices": n, "duration_s": n * SLICE_GAP if n > 1 else 0, "suggest": n > 1,
+                "measured": imp is not None, "impact_pct": round(imp * 100, 4) if imp is not None else None}
+
+    def recovery_tick(self, elapsed: float):
+        """Durante la pausa entre tramos: mid y perp en RECOVERY_MARKS tras el último swap, para
+        medir cuánto se recupera el pool (ρ). Solo auditoría: un fallo deja None y no interrumpe."""
+        if not self.swaps:
+            return
+        swap = self.swaps[-1]
+        marks = swap.setdefault("recovery", [])
+        if len(marks) >= len(RECOVERY_MARKS) or elapsed < RECOVERY_MARKS[len(marks)]:
+            return
+        mid = perp = None
+        try:
+            ticker = self.perp_cli.fetch_ticker(self.perp_sym)
+            perp = float(ticker.get("bid" if swap["side"] == "buy" else "ask") or 0) or None
+            mid = self.mid_price(perp or swap.get("perp_ref"))
+        except Exception as e:
+            log.info(f"recuperación {self.token.get('symbol')}: {e}")
+        marks.append({"t": round(elapsed), "mid": mid, "perp": perp})
 
     def cost_estimate(self, base_amt: float, ref_px: float) -> dict:
         """Costo ida y vuelta a tamaño completo: impacto de compra y venta + perp taker."""
