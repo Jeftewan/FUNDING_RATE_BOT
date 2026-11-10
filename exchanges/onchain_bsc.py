@@ -62,7 +62,7 @@ GAS_BUFFER = 1.3                  # margen sobre eth_estimateGas (el estado camb
 ALPHA_LIST_URL = ("https://www.binance.com/bapi/defi/v1/public/wallet-direct/buw/"
                   "wallet/cex/alpha/all/token/list")
 _ALPHA_TTL = 3600
-_alpha_cache = {"ts": 0.0, "by_symbol": {}}
+_alpha_cache = {"ts": 0.0, "by_symbol": {}, "any_by_symbol": {}}
 
 _SEL_BALANCE_OF = "0x70a08231"
 _SEL_ALLOWANCE = "0xdd62ed3e"
@@ -178,26 +178,38 @@ def _load_alpha():
     except Exception as e:
         log.warning(f"alpha token list failed: {e}")
         return _alpha_cache["by_symbol"]
-    by = {}
+    by, any_by = {}, {}
     for t in rows:
-        if str(t.get("chainId")) != str(CHAIN_ID) or t.get("offline") or t.get("fullyDelisted"):
+        if str(t.get("chainId")) != str(CHAIN_ID):
             continue
         sym = (t.get("symbol") or "").upper()
         liq = float(t.get("liquidity") or 0)
+        row = {"symbol": sym, "address": t.get("contractAddress"),
+               "decimals": int(t.get("decimals") or 18), "liquidity": liq,
+               "alpha_id": t.get("alphaId"), "name": t.get("name")}
+        if sym and (sym not in any_by or liq > any_by[sym]["liquidity"]):
+            any_by[sym] = row
+        if t.get("offline") or t.get("fullyDelisted"):
+            continue
         if sym and (sym not in by or liq > by[sym]["liquidity"]):
-            by[sym] = {"symbol": sym, "address": t.get("contractAddress"),
-                       "decimals": int(t.get("decimals") or 18), "liquidity": liq,
-                       "alpha_id": t.get("alphaId"), "name": t.get("name")}
-    _alpha_cache.update(ts=time.time(), by_symbol=by)
+            by[sym] = row
+    _alpha_cache.update(ts=time.time(), by_symbol=by, any_by_symbol=any_by)
     return by
 
 
-def alpha_token(symbol: str):
+def alpha_token(symbol: str, for_exit: bool = False):
     """Token Alpha en BSC para el símbolo base del perp, o None.
 
     Exige liquidez mínima. Símbolos con multiplicador (1000PEPE…) no se mapean.
+    `for_exit`: para vender/vigilar lo que ya se tiene. Acepta tokens que Binance pasó
+    a offline (el contrato y el pool siguen) y sin mínimo de liquidez: ARIA #56 quedó
+    offline con la posición abierta y el cierre tras el SL abortó sin token.
     """
-    t = _load_alpha().get((symbol or "").upper())
+    by = _load_alpha()
+    if for_exit:
+        t = _alpha_cache["any_by_symbol"].get((symbol or "").upper())
+        return dict(t) if t and t.get("address") else None
+    t = by.get((symbol or "").upper())
     if not t or not t.get("address") or t["liquidity"] < MIN_LIQUIDITY_USD:
         return None
     return dict(t)
@@ -207,7 +219,7 @@ def wallet_snapshot(address: str, symbols: list) -> dict:
     out = {"address": address, "usdt": from_wei(erc20_balance(USDT, address), USDT_DECIMALS),
            "bnb": from_wei(bnb_balance(address), 18), "tokens": {}}
     for s in symbols or []:
-        t = alpha_token(s)
+        t = alpha_token(s, for_exit=True)
         if t:
             out["tokens"][s] = from_wei(erc20_balance(t["address"], address), t["decimals"])
     return out
@@ -332,6 +344,7 @@ class BscSpotLeg:
         self.exit_log = []    # tramos de la venta del spot desnudo (auditoría)
         self.swaps = []       # cada swap: cotizado, mínimo, impacto y canal (auditoría)
         self._last_impact = None
+        self._perp_ref = None  # perp bid/ask justo antes del swap: basis por tramo (auditoría)
 
     def naked_exit(self):
         """El SL (o una liquidación) ya cerró el short: vender pesa más que el precio
@@ -418,7 +431,7 @@ class BscSpotLeg:
         self.swaps.append({"tx": txh, "in": spent, "out": got, "impact": impact, "via": meta.get("via"),
                            "quoted_out": from_wei(int(q["to_amount"]), dst_dec) if q.get("to_amount") else None,
                            "min_out": from_wei(int(q["min_out"]), dst_dec) if q.get("min_out") else None,
-                           "slippage": self.max_slippage})
+                           "slippage": self.max_slippage, "perp_ref": self._perp_ref, "ts": time.time()})
         return spent, got, txh
 
     def _impact_vs_mid(self, src, src_dec, dst, dst_dec, amt_wei, q):
@@ -483,6 +496,7 @@ class BscSpotLeg:
             usdt_in = min(usdt_in, have)
             if usdt_in <= 0:
                 raise RuntimeError("Sin USDT en la wallet BSC")
+            self._perp_ref = pb or None
             spent, got, txh = self._swap_retry(USDT, USDT_DECIMALS, tok, dec, usdt_in)
             on_fill(txh, {"gross": got, "cost": spent, "avg": spent / got if got else 0,
                           "fee_usd": 0.0, "fee_base": 0.0}, got)
@@ -491,6 +505,10 @@ class BscSpotLeg:
         if amt <= 0:
             return 0.0
         if not self.naked:
+            try:
+                self._perp_ref = float(self.perp_cli.fetch_ticker(self.perp_sym).get("ask") or 0) or None
+            except Exception:
+                self._perp_ref = None
             spent, got, txh = self._swap_retry(tok, dec, USDT, USDT_DECIMALS, amt)
             on_fill(txh, {"gross": spent, "cost": got, "avg": got / spent if spent else 0,
                           "fee_usd": 0.0, "fee_base": 0.0}, spent)

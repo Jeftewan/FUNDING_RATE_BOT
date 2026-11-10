@@ -133,6 +133,7 @@ def test_open_splits_automatically_and_logs_swaps(chain, perp, monkeypatch):
     res = te.execute_open(CREDS, OPP, capital=200, leverage=1, spot_leg_factory=fac)
     assert res["ok"], res
     assert len(res["swaps"]) == 3 and res["entry_mode"] == "onchain_swap"
+    assert all(s["perp_ref"] for s in res["swaps"])
     assert perp.short == pytest.approx(res["perp_qty"])
 
 
@@ -201,6 +202,7 @@ def test_armed_fires_only_when_basis_reaches_threshold(env, monkeypatch):  # noq
     runner._watch_armed(jid)
     status, params, _ = _status(app, jid)
     assert status == "queued" and params.get("fired_at")
+    assert params["fire_read"]["basis_pct"] == 0.3
 
 
 def test_armed_expires_without_entering(env, monkeypatch):  # noqa: F811
@@ -509,3 +511,59 @@ def test_restart_with_live_sell_buys_back_sold_part(restart):
     with app.app_context():
         row = UserPosition.query.get(pid)
         assert row.spot_qty == pytest.approx(60) and row.perp_qty == pytest.approx(60)
+
+
+# ── ARIA #56: token Alpha que pasa a offline con la posición abierta ────
+ARIA = {"symbol": "ARIA", "chainId": "56", "contractAddress": "0x5d3a12c42e5372b2cc3264ab3cdcf660a1555238",
+        "decimals": 18, "liquidity": "2054366.5", "offline": True, "fullyDelisted": False,
+        "alphaId": "ALPHA_332", "name": "AriaAI"}
+
+
+def _alpha_list(monkeypatch, rows):
+    class R:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": rows}
+    monkeypatch.setattr(ob, "_alpha_cache", {"ts": 0.0, "by_symbol": {}, "any_by_symbol": {}})
+    monkeypatch.setattr(ob.requests, "get", lambda *a, **k: R())
+
+
+def test_offline_alpha_token_only_for_exit(monkeypatch):
+    _alpha_list(monkeypatch, [ARIA])
+    assert ob.alpha_token("ARIA") is None                     # abrir: no
+    t = ob.alpha_token("ARIA", for_exit=True)                 # cerrar/vigilar: sí
+    assert t["address"] == ARIA["contractAddress"] and t["decimals"] == 18
+
+
+def test_position_token_falls_back_to_open_job(env, monkeypatch):  # noqa: F811
+    from core.db_models import ExecutionJob
+    app, runner, ex, uid = env
+    _alpha_list(monkeypatch, [])                              # ya ni sale en la lista
+    with app.app_context():
+        job = ExecutionJob(user_id=uid, kind="open", status="done", params_json={"token": TOKEN})
+        db.session.add(job)
+        db.session.commit()
+        assert J.position_token({"symbol": "XYZ", "job_id": job.id})["address"] == TOKEN["address"]
+        assert J.position_token({"symbol": "XYZ"}) is None
+
+
+def test_close_job_after_sl_resolves_offline_token(env, monkeypatch):  # noqa: F811
+    """El vigilante lanza el cierre con token {}: antes abortaba con 'token Alpha BSC no disponible'."""
+    from tests.test_jobs import _run_sync
+    app, runner, ex, uid = env
+    _alpha_list(monkeypatch, [{**ARIA, "symbol": "XYZ", "contractAddress": TOKEN["address"]}])
+    pos_id = _pos(app, uid)
+    seen = {}
+
+    def factory(uid_, token, max_slippage=None, limit=False):
+        seen["token"] = token
+        return lambda *a: None
+    monkeypatch.setattr(runner, "_swap_leg_factory", factory)
+    monkeypatch.setattr(runner, "_alert", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_restore_protection", lambda *a, **k: None)
+    monkeypatch.setattr(te, "execute_close", lambda *a, **k: {"ok": False, "msg": "stop"})
+    _run_sync(runner, app, uid, "close", {"position_id": pos_id, "symbol": "XYZ", "token": {},
+                                          "twap": {"slices": 1, "duration_s": 0}, "trigger": "protection"})
+    assert seen["token"]["address"] == TOKEN["address"]

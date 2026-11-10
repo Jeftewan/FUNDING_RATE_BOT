@@ -37,6 +37,25 @@ def wait_params(mode: str, side: str) -> dict:
             "theta": PATIENT_ENTRY_BASIS if side == "buy" else PATIENT_EXIT_BASIS}
 
 
+def position_token(pos):
+    """Token BSC de una posición abierta, para cerrarla o vigilarla. Acepta tokens que
+    Binance pasó a offline en Alpha y, si ya no salen en la lista, usa el token guardado
+    en el job de apertura (ARIA #56: el cierre tras el SL abortó sin token). Requiere
+    app context."""
+    from exchanges import onchain_bsc
+    t = onchain_bsc.alpha_token(pos.get("symbol", ""), for_exit=True)
+    if t:
+        return t
+    jid = pos.get("job_id")
+    if jid:
+        from core.db_models import ExecutionJob
+        row = ExecutionJob.query.get(int(jid))
+        t = dict(((row.params_json or {}).get("token") or {}) if row else {})
+        if t.get("address"):
+            return t
+    return None
+
+
 class JobRunner:
     def __init__(self, app, scanner_worker, syncer=None):
         self.app = app
@@ -137,7 +156,7 @@ class JobRunner:
                     read = probe.read()
                     self._update(jid, progress_json={"phase": "armed", **read, "theta": wait["theta"],
                                                      "deadline": wait["deadline"]})
-                    if read["basis_pct"] is not None and read["basis_pct"] >= wait["theta"] and self._fire(job):
+                    if read["basis_pct"] is not None and read["basis_pct"] >= wait["theta"] and self._fire(job, read):
                         return
             except Exception as e:
                 log.warning(f"armed job {jid}: {e}")
@@ -158,14 +177,17 @@ class JobRunner:
         return texec.basis_probe(creds, pos["exchange"], pos["symbol"], factory, "sell",
                                  base=float(pos["spot_qty"]))
 
-    def _fire(self, job) -> bool:
-        """Pasa a ejecución si el usuario no tiene otro job corriendo. False → sigue en espera."""
+    def _fire(self, job, read=None) -> bool:
+        """Pasa a ejecución si el usuario no tiene otro job corriendo. False → sigue en espera.
+        `read`: lectura que disparó; queda en params para auditar contra lo ejecutado."""
         jid = job["id"]
         with self._submit_lock:
             with self.app.app_context():
                 if self.active_job(job["user_id"]):
                     return False
             params = {**job["params"], "fired_at": time.time()}
+            if read:
+                params["fire_read"] = read
             if params["wait"].get("force"):
                 params["wait"] = {**params["wait"], "mode": "basis"}
             self._update(jid, status="queued", params_json=params)
@@ -380,8 +402,10 @@ class JobRunner:
     def _bsc_args(self, uid, pos, token=None):
         if pos.get("spot_venue") != "bsc":
             return None, None
-        from exchanges import onchain_bsc
-        return self._load_wallet(uid), (token or onchain_bsc.alpha_token(pos.get("symbol", "")))
+        if not token:
+            with self.app.app_context():
+                token = position_token(pos)
+        return self._load_wallet(uid), token
 
     def _protect(self, uid, pos_id, creds, ctx=None, token=None):
         """Coloca los seguros de una posición spot_perp recién abierta y los
@@ -527,6 +551,7 @@ class JobRunner:
                 self._update(jid, status="failed", error="Posición no encontrada")
                 return
             pos = DBPersistence()._pos_to_dict(row)
+            token = p.get("token") or (position_token(pos) if pos.get("spot_venue") == "bsc" else None) or {}
         mode = pos.get("mode", "spot_perp")
         needed = [pos.get("exchange", "")] if mode == "spot_perp" \
             else [pos.get("long_exchange", ""), pos.get("short_exchange", "")]
@@ -534,8 +559,7 @@ class JobRunner:
         res = texec.execute_close(creds, pos, dry_run=False, ctx=self._ctx(jid),
                                   twap=p.get("twap") or None,
                                   spot_leg_factory=self._spot_leg_factory(
-                                      uid, {**p, "spot_venue": pos.get("spot_venue"),
-                                            "token": p.get("token") or {}}))
+                                      uid, {**p, "spot_venue": pos.get("spot_venue"), "token": token}))
         sym = pos.get("symbol", "")
         if res.get("sl_cancel_error"):
             self._alert(uid, sym, f"{sym}: cierre completo pero el SL sigue vivo ({res['sl_cancel_error']}). "

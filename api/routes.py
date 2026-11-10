@@ -1053,8 +1053,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
 
         token = {}
         if pos.get("spot_venue") == "bsc":
-            from exchanges import onchain_bsc
-            token = onchain_bsc.alpha_token(pos.get("symbol", "")) or {}
+            from execution.jobs import position_token
+            token = position_token(pos) or {}
             if not token or not dbp.load_user_wallet(uid, "bsc"):
                 return jsonify({"ok": False, "msg": "Wallet BSC o token no disponible"})
 
