@@ -883,7 +883,7 @@ function renderOpps(data) {
     // recomendado. El APR del modelo es sobre el nocional perp; con leverage L el
     // nocional es C·L/(L+1). Recomendado por backtest con seguros
     // (reports/leverage_study_20261025_*.md): Alpha 2x, spot CEX 3x.
-    const levRec = o.spot_venue === 'bsc' ? 2 : 3;
+    const levRec = o.spot_venue === 'bsc' ? 1 : 3;
     const gain14 = o.model_prediction != null ? (o.model_prediction / 100) * 1000 * levRec / (levRec + 1) * 14 / 365 : null;
     // Confianza (analysis/ml_confidence): P(APR neto realizado ≥ 5 %) del tier y rango p10–p90.
     const g14 = apr => (apr / 100) * 1000 * levRec / (levRec + 1) * 14 / 365;
@@ -1633,11 +1633,6 @@ function showExecResult(title, data, isDry, job) {
               <div class="est-row"><span>Margen Futuros</span><span class="est-val">$${w.futures_have} / necesita $${w.futures_need}</span></div>`;
     if (!w.ok) extra += `<div class="exec-warn" style="margin:6px 0">${w.msg}</div>`;
     else if ((w.transfers || []).length) extra += `<div class="exec-note">Se transferirá automáticamente: ${w.transfers.map(t => `$${t.amount} → ${t.to === 'future' ? 'Futuros' : 'Spot'}`).join(', ')}</div>`;
-  }
-  if (ex.margin_topup && ex.margin_reserve_usd && w && !w.unchecked) {
-    const free = Math.max(0, (+w.futures_have || 0) - (+w.futures_need || 0));
-    extra += `<div class="est-row"><span>Reserva para recargar margen</span><span class="est-val" style="color:${free >= ex.margin_reserve_usd ? 'inherit' : 'var(--red)'}">$${free.toFixed(0)} / sugerida $${Math.round(ex.margin_reserve_usd)}</span></div>`;
-    if (free < ex.margin_reserve_usd) extra += `<div class="exec-note">Deja ~$${Math.round(ex.margin_reserve_usd)} libres en Futuros: si el precio sube, basyo recarga el margen del short en vez de dejar que el SL cierre la posición.</div>`;
   }
   const cost = ex.execution_cost;
   if (cost && cost.rt_cost_pct != null) {
