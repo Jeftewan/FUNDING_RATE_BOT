@@ -16,6 +16,10 @@ Cada PROTECTION_INTERVAL s, por posición activa con protection_json.status=acti
   - Short desaparecido con spot en manos (liquidación / cierre externo) → alerta
     CRITICAL (cada NAKED_REALERT s) y, solo con AUTO_UNWIND_ON_LIQ=1, cierre del
     spot. Short cerca de liquidación (< LIQ_WARN_PCT) → alerta.
+  - Con MARGIN_TOPUP=1: mark sobre el umbral de recarga (70 % del camino a liquidación)
+    → suma margen aislado desde el USDT libre de Futuros y sube SL + venta límite
+    (texec.move_protection). Sin saldo → alerta MARGIN_LOW (ARIA #56,
+    reports/margin_topup_study_20261110_bsc.md).
 
 Se revisa cada posición aunque el usuario tenga OTRO job en curso (un TWAP de
 horas en otro símbolo no puede dejar sin vigilancia a esta); solo se salta la
@@ -36,6 +40,7 @@ RENEW_BEFORE = 12 * 3600
 LIQ_WARN_PCT = 20.0          # distancia mark→liquidación del short que dispara aviso
 LIQ_REALERT = 6 * 3600
 NAKED_REALERT = 3600
+MARGIN_LOW_REALERT = 3600
 
 
 def _auto_unwind() -> bool:
@@ -48,6 +53,7 @@ class ProtectionWatcher:
         self.app = runner.app
         self._started = False
         self._alerted = {}       # (pos_id, kind) → ts del último aviso (dedup en memoria)
+        self._health = {}        # pos_id → última lectura de short_health (mark/liq)
         self._hot = False
 
     def start(self):
@@ -133,6 +139,9 @@ class ProtectionWatcher:
             return
         if prot.get("status") not in ("active", "runner"):
             return
+        if prot.get("status") == "active" and st["perp"] == "open" and st["spot"] in ("open", "missing") \
+                and self._maybe_topup(uid, pos, prot, creds, wallet, token):
+            return
 
         changed = False
         spot = dict(prot.get("spot") or {})
@@ -212,6 +221,7 @@ class ProtectionWatcher:
             return False
         h = texec.short_health(creds, pos)
         now = time.time()
+        self._health[pos["id"]] = h
         if h["short"] is None:
             return False                       # lectura fallida: no concluir nada
         sl = float((pos.get("protection") or {}).get("sl_price") or 0)
@@ -242,6 +252,55 @@ class ProtectionWatcher:
                                f"liq {h['liq']:g}). Agrega margen aislado o reduce la posición.",
                      severity="WARNING", typ="LIQUIDATION_RISK")
         return False
+
+    def _maybe_topup(self, uid, pos, prot, creds, wallet, token) -> bool:
+        """Recarga el margen aislado y sube los seguros si el mark pasó el umbral.
+        True si recargó (protection_json ya guardado)."""
+        from exchanges import trade_executor as texec
+        if not texec.margin_topup_enabled():
+            return False
+        h = self._health.get(pos["id"]) or {}
+        entry = float(prot.get("entry_price") or pos.get("entry_price") or 0)
+        mark, liq = h.get("mark"), h.get("liq")
+        if not (mark and liq and entry):
+            return False
+        if mark >= texec.topup_trigger(entry, liq) * (1 - HOT_PCT / 100):
+            self._hot = True
+        need = texec.topup_amount(entry, mark, liq, float(pos.get("perp_qty") or 0))
+        if need <= 0:
+            return False
+        r, sym = self.runner, pos.get("symbol", "")
+        try:
+            res = texec.add_isolated_margin(creds, pos, need)
+        except Exception as e:
+            log.error(f"topup {sym} pos={pos['id']}: {e}")
+            res = {"added": 0.0, "free": None, "error": str(e)}
+        if not res["added"]:
+            now = time.time()
+            if now - self._alerted.get((pos["id"], "margin_low"), 0) >= MARGIN_LOW_REALERT:
+                self._alerted[(pos["id"], "margin_low")] = now
+                why = res.get("error") or f"USDT libre en Futuros {res.get('free') or 0:.2f}"
+                r._alert(uid, sym, f"{sym}: el precio subió hacia el SL (mark {mark:g}, liq {liq:g}) y no se "
+                                   f"pudo recargar margen ({why}). Deposita ~{need:.0f} USDT en Futuros o el "
+                                   f"SL cerrará la posición a {prot.get('sl_price')}.", typ="MARGIN_LOW")
+            return False
+        old_sl = prot.get("sl_price")
+        new = texec.move_protection(creds, {**pos, "protection": prot}, wallet, token)
+        new["topups"] = list(prot.get("topups") or []) + [{
+            "ts": time.time(), "usd": res["added"], "mark": mark, "liq_from": liq, "liq_to": res.get("liq"),
+            "sl_from": old_sl, "sl_to": new.get("sl_price")}]
+        r._save_protection(pos["id"], new)
+        log.info(f"topup {sym} pos={pos['id']}: +{res['added']} USDT, liq {liq:g}->{res.get('liq')}, "
+                 f"SL {old_sl}->{new.get('sl_price')}")
+        if new.get("sl_missing"):
+            r._alert(uid, sym, f"{sym}: se recargó margen pero el SL no se pudo reponer: el short quedó SIN "
+                               f"SL. Ponlo manualmente en Binance.", typ="PROTECTION_CANCELED")
+        else:
+            moved = "" if new.get("sl_price") != old_sl else " (los seguros NO se movieron: revisa)"
+            r._alert(uid, sym, f"{sym}: precio subiendo, +{res['added']:.0f} USDT de margen aislado. "
+                               f"Liquidación {liq:g} → {res.get('liq') or '?'}; SL {old_sl} → "
+                               f"{new.get('sl_price')}{moved}.", severity="WARNING", typ="MARGIN_TOPUP")
+        return True
 
     def _renew_bsc(self, uid, sym, wallet, token, spot, sl, cancel_old=True) -> dict:
         from exchanges import kyber_limit_order as klo

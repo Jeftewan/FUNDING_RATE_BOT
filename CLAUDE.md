@@ -1,6 +1,39 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-11-08** (costo de ejecución on-chain, rama `feat/onchain-execution`).
+Estado del proyecto al **2026-11-10** (recarga de margen + cierre con token offline, rama `fix/onchain-exit-offline-token`).
+
+---
+
+## Recarga de margen y lecciones de ARIA #56 (2026-11-10, rama `fix/onchain-exit-offline-token`)
+
+ARIA #56 (user 5, 2x, 4,173 USD, BSC). El 2026-11-10 a las 11:15 UTC el mark tocó el SL (0.21011, +34 % en 3 d) y el
+STOP_MARKET recompró el short. El cierre del vigilante (job #36) falló con `token Alpha BSC no disponible`: ARIA pasó a
+`offline` en la lista Alpha y `alpha_token` lo descartaba. La venta límite Kyber igual se llenó completa a las 11:17
+(3,724.24 USDT a 0.209059). Neto estimado ≈ +0.2 USD: funding +22.84, precio ≈ −19.3 (basis de salida −25.7 = δ 0.5 %
++ fill del SL), fees ≈ −3.3. Sin el SL habría sobrevivido: mark máx 0.21737 vs liq 0.22354, y el funding siguió en 0.1 %/4 h.
+- **Fix**: `onchain_bsc.alpha_token(sym, for_exit=True)` acepta tokens offline y sin mínimo de liquidez (abrir sigue
+  exigiéndolos); `jobs.position_token(pos)` cae al token del job de apertura. Lo usan el cierre del vigilante
+  (`_run_close`), el cierre manual (`/api/execute_close`), `_bsc_args` y el snapshot de la wallet.
+- **Estudio** `scripts/margin_topup_study.py` → `reports/margin_topup_study_20261110_bsc.md` (21 tokens Alpha, 12 m,
+  velas 1m, **mmr 5 %**: calibrado con la liq real de ARIA; `protection_study` usaba 1 %). Cohortes de 5 tokens/día, hold
+  14 d, capital = spot + margen + reserva. Prod (2x, sin recarga): **14.4 % anual, 39 eventos de seguro por 100
+  posiciones**. **2x + reserva 30 % recargando a f_top 0.7: 23.2 %**, p5 −0.05 vs −0.56, 4/4 trimestres; 20 %: 22.4 %;
+  1.5x: 18.6 %; 1x: 18.1 %.
+  - **Vender al precio del SL y esperar** con stop x % / T no sirve: media y p5 peores en todas las variantes. Tras el
+    SL, el on-chain suele seguir cayendo.
+  - δ = 0 gana solo si el swap cuesta 0.5 % (con 1.5 % pierde) → δ se mantiene en 0.5 %.
+- **Recarga en prod (opt-in `MARGIN_TOPUP=1`)**. El vigilante dispara con el mark ≥ `entry + 0.70·(liq − entry)`
+  (`MARGIN_TOPUP_FTOP`).
+  - `texec.topup_amount` calcula el margen para que el mark quede al 70 % del camino a la nueva liq, en tramos de
+    2.5 % del nocional (Δliq = Δmargen/(qty·1.05)). ARIA: 418 USD.
+  - `add_isolated_margin` usa el USDT libre de Futuros (ccxt `add_margin`).
+  - `move_protection` cancela el SL viejo y pone el nuevo (Binance −4130 no admite dos closePosition); si falla, repone
+    el viejo, y si eso también falla marca `sl_missing` + alerta. La venta límite se mueve solo si no llenó nada.
+  - Telegram `MARGIN_TOPUP`; sin saldo → `MARGIN_LOW` (horaria) con el monto a depositar. Historial en
+    `protection_json.topups`. El modal de apertura muestra la reserva sugerida (30 % del nocional) contra el USDT libre.
+  - **Pendiente**: la ganancia del spot queda en la wallet BSC y la pérdida del perp en Futuros, así que hay que
+    rebalancear a mano. Automatizarlo (depósito BSC → Binance) queda fuera de alcance.
+- Recuperar #56 tras el deploy: "Cerrar (auto)" → el cierre lee los fills reales (SL y venta Kyber) y escribe `user_history`.
 
 ---
 
@@ -626,7 +659,7 @@ Modal de ejecución con TWAP, simulación con leverage/liquidación/basis/fondos
 - `notifications/email.py:build_alert_dedup_key(alert)` — única fuente de verdad para la dedup_key: `f"{type}:{user_id}:{symbol}:{exchange}:{bucket}"` donde `bucket` es `funding_ts` (ms o s) para alertas window-bound, o `_exc_bucket` (`YYYYMMDD`) para broadcasts diarios.
 - `notifications/email.py:valid_telegram_creds(chat_id, token)` — validación de formato barata antes de golpear la API (chat_id numérico ≥5 chars, token con `:` y ≥20 chars). Si falla, log único por usuario y skip.
 
-**Tipos de alerta:** `CLOSE_SUGGESTED` (dos settlements seguidos sin cobrar: último pago ≤0 y el próximo también), `RATE_REVERSAL` (informativa, una vez por posición), `NAKED_SPOT` (crítica: short desaparecido con spot en manos), `LIQUIDATION_RISK` (short a <20% de liquidación), `PRE_PAYMENT_UNFAVORABLE`, `SL_TP_REVIEW`, `EXCEPTIONAL_OPPORTUNITY`, `SWITCH_OPPORTUNITY`, `POSITION_CLOSED`, `SPOT_TP_RUNNER` (venta spot llenada: short suelto con TP; CEX −5 %/15 min, BSC −20 %/1 h), `EXCHANGE_GEOBLOCKED` (crítica, diaria por usuario: el sync de Binance recibe 451 geográfico).
+**Tipos de alerta:** `CLOSE_SUGGESTED` (dos settlements seguidos sin cobrar: último pago ≤0 y el próximo también), `RATE_REVERSAL` (informativa, una vez por posición), `NAKED_SPOT` (crítica: short desaparecido con spot en manos), `LIQUIDATION_RISK` (short a <20% de liquidación), `PRE_PAYMENT_UNFAVORABLE`, `SL_TP_REVIEW`, `EXCEPTIONAL_OPPORTUNITY`, `SWITCH_OPPORTUNITY`, `POSITION_CLOSED`, `SPOT_TP_RUNNER` (venta spot llenada: short suelto con TP; CEX −5 %/15 min, BSC −20 %/1 h), `EXCHANGE_GEOBLOCKED` (crítica, diaria por usuario: el sync de Binance recibe 451 geográfico), `MARGIN_TOPUP` (recarga de margen aislado + seguros subidos), `MARGIN_LOW` (crítica, horaria: no hay USDT libre en Futuros para recargar).
 
 ---
 
@@ -725,6 +758,7 @@ ARBITRAGE_MODES       # Default: spot_perp (cross_exchange por env; su auto-ejec
 DEFI_ENABLED          # =1 → reactiva el scan DeFi (default apagado)
 MAX_LEVERAGE          # tope de leverage de /api/execute_open (default 3; decisión 2026-10-25)
 AUTO_UNWIND_ON_LIQ    # =1 → si el short desaparece (liquidado) el vigilante vende el spot (default: solo alerta CRITICAL)
+MARGIN_TOPUP          # =1 → el vigilante recarga margen aislado y sube los seguros antes del SL (ver "Recarga de margen")
 TRADE_SANDBOX         # =1 → auto-ejecución en test (Binance: demo trading; resto: set_sandbox_mode)
 ONCHAIN_ENABLED       # =1 → habilita la pierna spot on-chain BSC (tokens solo-Alpha)
 DEX_AGGREGATOR        # binance (default, Web3 API, fallback auto a KyberSwap) | 0x | kyber

@@ -1622,7 +1622,7 @@ function showExecResult(title, data, isDry, job) {
   }
   if (liq && liq.liq_price) {
     extra += `<div class="est-row"><span>Liquidación est. del short</span><span class="est-val" style="color:${liq.warning ? 'var(--red)' : 'inherit'}">$${(+liq.liq_price).toPrecision(6)} (+${liq.liq_distance_pct}%)</span></div>`;
-    if (liq.sl_price) extra += `<div class="est-row"><span>Seguros: SL short + venta spot</span><span class="est-val">$${(+liq.sl_price).toPrecision(6)} (75% hacia liq.)</span></div>`;
+    if (liq.sl_price) extra += `<div class="est-row"><span>Seguros: SL short + venta spot</span><span class="est-val">$${(+liq.sl_price).toPrecision(6)} (80% hacia liq.)</span></div>`;
     if (liq.warning) extra += `<div class="exec-warn" style="margin:6px 0">Distancia a liquidación &lt; 33%: un rally moderado puede liquidar el short. Considera menos leverage.</div>`;
   }
   if (ex.basis_pct != null) {
@@ -1633,6 +1633,11 @@ function showExecResult(title, data, isDry, job) {
               <div class="est-row"><span>Margen Futuros</span><span class="est-val">$${w.futures_have} / necesita $${w.futures_need}</span></div>`;
     if (!w.ok) extra += `<div class="exec-warn" style="margin:6px 0">${w.msg}</div>`;
     else if ((w.transfers || []).length) extra += `<div class="exec-note">Se transferirá automáticamente: ${w.transfers.map(t => `$${t.amount} → ${t.to === 'future' ? 'Futuros' : 'Spot'}`).join(', ')}</div>`;
+  }
+  if (ex.margin_topup && ex.margin_reserve_usd && w && !w.unchecked) {
+    const free = Math.max(0, (+w.futures_have || 0) - (+w.futures_need || 0));
+    extra += `<div class="est-row"><span>Reserva para recargar margen</span><span class="est-val" style="color:${free >= ex.margin_reserve_usd ? 'inherit' : 'var(--red)'}">$${free.toFixed(0)} / sugerida $${Math.round(ex.margin_reserve_usd)}</span></div>`;
+    if (free < ex.margin_reserve_usd) extra += `<div class="exec-note">Deja ~$${Math.round(ex.margin_reserve_usd)} libres en Futuros: si el precio sube, basyo recarga el margen del short en vez de dejar que el SL cierre la posición.</div>`;
   }
   const cost = ex.execution_cost;
   if (cost && cost.rt_cost_pct != null) {
