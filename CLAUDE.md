@@ -32,6 +32,26 @@ ARIA #56 (user 5, 2x, 4,173 USD, BSC).
   - **La recarga de margen (2x + reserva 30 % = 23.2 %) se descartó**: el capital está 100 % invertido, no hay reserva.
   - Vender al precio del SL y esperar empeora media y p5 → δ sigue en 0.5 %.
 
+## Límites pareados on-chain + perp: descartados (2026-11-10, rama `feat/paired-limit-execution`)
+
+Idea del usuario: entrar y salir con una límite Kyber y una límite perp al mismo precio (o con margen a favor θ)
+y esperar a que llenen. `scripts/paired_limit_study.py` → `reports/paired_limit_study_20261110.md`.
+- **Método**: mismo motor que `tranche_study` (sin velas planas, comisión + impacto por token, funding), 2,100 USD, 183
+  políticas:
+  - ancla mid/perp, θ 0–0.6 %, re-anclaje 15/60 min, ventana 6/24 h;
+  - con una pierna sola: now / keep / chase, T 5–120 min, x 0.5–2 %;
+  - gate por swap y edge 0.1–0.7 %.
+- **Resultado**: todas −1.47 a −1.66 % por ida y vuelta vs **prod "Esperar" +0.18 %** (p5 −2.8 vs −0.91), 0/5 trimestres.
+- **Por qué**:
+  - Ambas llenan juntas solo en el 1–6 % de los intentos (ahí +1.1 %). En el resto llena primero una pierna.
+  - La límite Kyber tiene **selección adversa**: la llena un arbitrajista cuando el pool ya la atravesó (JCT +0.10 %,
+    ARIA +0.68 % sobre el precio de la orden).
+  - Al salir, el perp suele estar +0.29 % sobre el spot, así que el empate casi nunca llega.
+- **Se mantiene "Esperar"** (basis ejecutable al tamaño del tramo, ambas piernas a la vez): ya es la política
+  "según libro".
+- **Piloto `BscLimitLeg`**: −0.01 %, p5 −2.57, 0/5 trimestres → recomendado apagarlo sin esperar las 10 órdenes.
+- **Fees**: trocear swaps no sube la comisión del pool (es % del nocional), solo suma gas y baja el impacto.
+
 ---
 
 ## Ejecución on-chain: costo de entrada y salida (2026-11-08, rama `feat/onchain-execution`)
