@@ -19,6 +19,11 @@ y `_cartera.md`. Calibrado vs 10 trades reales (|error| basis 0.32 pp entrada, s
 - Pendiente con potencial: **rebalanceo spot → margen** (vender la ganancia del spot, depositar en futuros, recomprar la
   misma fracción del short): SL 22 % → 1–4 %, p5 −1.16 → 0.00, 2x ≈ 2.3 %/mes (2k–10k USD). No pasa el criterio de
   media (IC cruza 0); requiere implementar y validar con montos chicos. Tramos 100 USD / 5 min (+0.05 pp) esperan ρ real.
+  Fricción medida (2x, 60 % del camino): cada rebalanceo vende ~20 % del nocional y cuesta 0.05 % del nocional (pool +
+  perp + gas); el basis perp−spot al rebalancear es +0.33 % mediano (pump: el on-chain va detrás) y bloquea ~0.16 pp
+  por operación. Total ≈ 0.28 pp por operación rebalanceada vs +1.4 pp de SL evitados. **La variable crítica es la
+  latencia del depósito BSC → margen**: 3 min +0.24 pp vs 1x, 15 min +0.10, 45 min −0.23 (peor que 1x). El capital
+  queda en Binance al cerrar: volver a la wallet BSC requiere retiro (las keys no lo permiten → manual).
 - Meta: 2.5 % mensual sostenido no se alcanza a 1x (~2.0 %); 5 % no aparece en ninguna configuración.
 
 ## Rentabilidad real e informes mensuales (2026-11-17, rama `feat/returns-reports-model`)
