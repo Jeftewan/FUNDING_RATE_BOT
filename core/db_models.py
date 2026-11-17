@@ -237,8 +237,33 @@ class UserHistory(db.Model):
     price_pnl = db.Column(db.Float, nullable=True)
     slippage_usd = db.Column(db.Float, nullable=True)   # entrada + salida, vs mid (diagnóstico)
     exec_json = db.Column(db.JSON, nullable=True)       # precios entrada/salida, basis, slippage por pierna
+    # user_positions.id de origen (la fila cerrada conserva payments_json). NULL en filas
+    # anteriores al 2026-11-17: se emparejan por símbolo + closed_at (portfolio/reports.py).
+    position_id = db.Column(db.Integer, nullable=True)
 
     user = db.relationship("User", back_populates="history")
+
+
+class UserCapitalDaily(db.Model):
+    """Capital del usuario (inversor) por día UTC, para los informes mensuales.
+
+    Lo escribe execution/account_sync.py una vez al día (último valor del día gana):
+    total = capital real (USDT libre + capital en posiciones) si hay cuenta conectada,
+    si no el capital manual de user_configs.
+    """
+    __tablename__ = "user_capital_daily"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    date = db.Column(db.String(10), nullable=False)          # YYYY-MM-DD (UTC)
+    total_capital = db.Column(db.Float, nullable=False)
+    deployed_capital = db.Column(db.Float, default=0)
+    source = db.Column(db.String(10), default="config")      # real | config
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        db.UniqueConstraint("user_id", "date", name="uq_capital_daily_user_date"),
+    )
 
 
 class ScanCache(db.Model):

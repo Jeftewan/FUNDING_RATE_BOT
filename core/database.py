@@ -148,6 +148,9 @@ def _run_migrations(db):
         "CREATE INDEX IF NOT EXISTS idx_mfs_ts_hour ON market_feature_snapshots (ts_hour)",
         "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS spot_source VARCHAR(8)",
         "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS alpha_liquidity_usd FLOAT",
+        # Informes mensuales: vínculo historial → posición (funding por fecha de pago).
+        # La tabla user_capital_daily la crea create_all.
+        "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS position_id INTEGER",
     ]
     for sql in migrations:
         try:
