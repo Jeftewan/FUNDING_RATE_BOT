@@ -520,6 +520,7 @@ function loadCurrentOpps() {
 function refresh() {
   if (currentTab === 'opportunities') loadCurrentOpps();
   else if (currentTab === 'positions') loadPositions();
+  else if (currentTab === 'reports') loadReportMonths();
   else if (currentTab === 'config') loadConfig();
   else if (currentTab === 'account') loadAccount();
 }
@@ -847,7 +848,7 @@ function anEpisodesHtml(a) {
       <div><span class="label">Edad de la racha actual</span><span class="value">${e.ep_age_days == null ? '—' : e.ep_age_days.toFixed(1) + ' d'}</span></div>
       <div><span class="label">APR mediano por racha</span><span class="value">${e.apr_med == null ? '—' : e.apr_med.toFixed(1) + '%'}</span></div>
     </div>
-    <div class="an-note">Racha = desde que la tasa supera la base hasta dos pagos seguidos ≤ 0 (la regla de salida de basyo). Si la racha actual ya supera la duración típica, el riesgo de que se apague pronto es mayor.</div>
+    <div class="an-note">Racha = desde que la tasa supera la base hasta dos pagos seguidos ≤ 0 (la salida que usa el modelo; basyo sugiere cerrar al tercer settlement sin cobrar). Si la racha actual ya supera la duración típica, el riesgo de que se apague pronto es mayor.</div>
     ${rows ? `<table class="an-table"><thead><tr><th>Inicio</th><th>Duración</th><th>APR medio</th><th>Estado</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="an-note">Sin rachas en el último año.</div>'}`;
 }
 
@@ -1342,13 +1343,27 @@ async function autoExecuteClose(posId, symbol) {
   const meta = {
     symbol, mode: p.mode, exchange: p.exchange, spot_venue: p.spot_venue,
     long_exchange: p.long_exchange, short_exchange: p.short_exchange, _close: true,
-    spot_qty: p.spot_qty, perp_qty: p.perp_qty,
+    spot_qty: p.spot_qty, perp_qty: p.perp_qty, early_close: earlyCloseWarning(p),
   };
   const ans = await showExecConfirm('close', meta);
   if (ans.choice === 'cancel') return;
   await runExec('/api/execute_close',
     { position_id: posId, dry_run: ans.choice === 'dry', twap: ans.twap },
     ans.choice === 'dry', 'close', `Cierre ${symbol}`);
+}
+
+// Cerrar antes de la regla de salida es la mayor fuente de pérdida (reports/profit_study_20261117.md:
+// salir a los 3 d rinde +0.07 % por operación frente a +1.65 % manteniendo hasta la regla).
+function earlyCloseWarning(p) {
+  if (!p || p.mode === 'cross_exchange') return '';
+  const rates = (p.payments || []).filter(x => !x.kind && x.rate != null).map(x => +x.rate);
+  const ruleMet = rates.length >= 2 && rates.slice(-2).every(r => r <= 0) && (p.current_fr ?? 1) <= 0;
+  if (ruleMet) return '';
+  const days = (p.elapsed_h || 0) / 24;
+  return `<strong>La regla de salida aún no se cumple</strong> (tres settlements seguidos sin cobrar). `
+    + `Lleva ${days.toFixed(1)} días. En el estudio de 12 meses, salir a los 3 días dejó +0.07 % por operación `
+    + `frente a +1.65 % manteniendo hasta la regla: el costo de entrar y salir se paga con días de funding. `
+    + `Cierra antes solo por riesgo (seguros, token offline, liquidación).`;
 }
 
 function _fmtQty(v) { return v == null ? '—' : (+v).toPrecision(5); }
@@ -1391,7 +1406,8 @@ function showExecConfirm(kind, meta) {
         <div class="exec-sub">${head}</div>
         <ul class="exec-legs">${legsHtml}</ul>
         ${sizeNote}
-        ${isBsc ? `<div class="exec-note">On-chain: espera a que el basis ejecutable al tamaño del tramo sea favorable (hasta 6 h para abrir, 24 h para cerrar) y ejecuta por tramos de swap + short pareados cada 15 min, para que el pool se re-arbitre. «Ejecutar ya» en el progreso corta la espera.</div>` : ''}
+        ${meta.early_close ? `<div class="exec-note exec-warn">${meta.early_close}</div>` : ''}
+        ${isBsc ? `<div class="exec-note">On-chain: espera a que el basis ejecutable al tamaño del tramo sea favorable (hasta 6 h para abrir y basis ≥ 0 hasta 48 h para cerrar) y ejecuta por tramos de swap + short pareados cada 15 min, para que el pool se re-arbitre. «Ejecutar ya» en el progreso corta la espera.</div>` : ''}
         ${isCross || isBsc ? '' : `
         <label class="exec-twap"><input type="checkbox" id="exec-twap-on"> TWAP pareado (montos grandes)</label>
         <div class="exec-twap-cfg" id="exec-twap-cfg" style="display:none">
@@ -1876,6 +1892,7 @@ function renderPositions(data) {
         </div>
         ${p.entry_basis_usd != null ? `<div class="pos-field"><span class="label" title="(precio perp − precio spot de entrada) × cantidad, con fills reales. Slippage de entrada vs mid: ${p.entry_slippage_usd != null ? '$' + (+p.entry_slippage_usd).toFixed(2) : '—'} (ya incluido). Se realiza al cerrar, junto con el basis de salida.">Basis entrada</span><span class="value" style="color:${p.entry_basis_usd >= 0 ? 'var(--green)' : 'var(--red)'}">${p.entry_basis_usd >= 0 ? '+' : '−'}$${Math.abs(p.entry_basis_usd).toFixed(2)}${p.entry_basis_pct != null ? ` <span style="font-size:10px;opacity:.7">(${(+p.entry_basis_pct).toFixed(3)}%)</span>` : ''}</span></div>` : ''}
         <div class="pos-field"><span class="label" title="Funding − fees${p.realized_price_pnl ? ' + PnL de precio de cierres parciales' : ''}. El PnL de precio (basis + slippage) se suma al cerrar.">Neto</span><span class="value" style="color:${earnColor};font-weight:700">$${p.net_earned?.toFixed(2)}</span></div>
+        ${realReturnField(p)}
       </div>
 
       ${payTable}
@@ -2328,9 +2345,28 @@ async function editHistEarnings(histId) {
 
 let _lastHistoryData = [];
 
+// Rentabilidad real sobre el capital TOTAL (spot + margen): "+0.52 % · 18.9 % anual".
+function fmtRealReturn(roc, apr) {
+  if (roc == null) return '—';
+  const s = `${roc >= 0 ? '+' : ''}${roc.toFixed(2)}%`;
+  return apr == null ? s : `${s} <span style="font-size:10px;opacity:.75">· ${apr.toFixed(1)}% anual</span>`;
+}
+
+function realReturnField(p) {
+  if (p.real_roc_pct == null) return '';
+  const color = p.real_roc_pct >= 0 ? 'var(--green)' : 'var(--red)';
+  const unreal = p.unrealized_price_pnl;
+  const tip = `Rentabilidad lograda sobre el capital total $${(p.capital_used || 0).toFixed(0)} `
+    + `(spot + margen; solo el nocional cobra funding). Neto a mercado $${(p.net_mtm ?? 0).toFixed(2)}`
+    + (unreal != null ? ` = neto $${(p.net_earned || 0).toFixed(2)} + precio no realizado `
+      + `${unreal >= 0 ? '+' : '−'}$${Math.abs(unreal).toFixed(2)}${p.mtm_approx ? ' (sin basis reciente: spot ≈ perp)' : ''}` : '')
+    + `. Anualizado sobre ${(p.days_held || 0).toFixed(1)} días.`;
+  return `<div class="pos-field" title="${tip}"><span class="label">Rent. real</span><span class="value" style="color:${color};font-weight:700">${fmtRealReturn(p.real_roc_pct, p.real_apr_pct)}</span></div>`;
+}
+
 function exportCSV() {
   if (!_lastHistoryData.length) { showToast('Sin historial para exportar', 'warning'); return; }
-  const headers = ['Simbolo','Exchange','Modo','Capital','Exposicion','Apalancamiento','Horas','Pagos','Ganancia','Fees','PnL Precio','Slippage','Neto','Tasa Promedio','Razon','Fecha Cierre'];
+  const headers = ['Simbolo','Exchange','Modo','Capital','Exposicion','Apalancamiento','Horas','Pagos','Ganancia','Fees','PnL Precio','Slippage','Neto','Rent. real % (capital total)','Rent. real anual %','Tasa Promedio','Razon','Fecha Cierre'];
   const rows = _lastHistoryData.map(h => [
     h.symbol, h.exchange, h.mode || 'spot_perp',
     h.capital_used?.toFixed(2) || '', h.exposure?.toFixed(2) || '', h.leverage || '1',
@@ -2338,6 +2374,7 @@ function exportCSV() {
     h.payment_count || h.intervals || '', h.earned?.toFixed(4) || '',
     h.fees?.toFixed(4) || '', h.price_pnl != null ? h.price_pnl.toFixed(4) : '',
     h.slippage_usd != null ? h.slippage_usd.toFixed(4) : '', (h.net_earned ?? h.earned)?.toFixed(4) || '',
+    h.real_roc_pct != null ? h.real_roc_pct.toFixed(3) : '', h.real_apr_pct != null ? h.real_apr_pct.toFixed(2) : '',
     h.avg_rate ? (h.avg_rate * 100).toFixed(4) + '%' : '',
     h.reason || '', h.closed_at || h.time || '',
   ]);
@@ -2409,7 +2446,7 @@ function _drawHistoryRows(container, ordered, limit) {
         <span>${date}</span>
       </div>
       ${breakdown}
-      <div class="hist-net" style="color:${netColor}">${sign}$${net.toFixed(2)}${editedMark}${editBtn}</div>
+      <div class="hist-net" style="color:${netColor}">${sign}$${net.toFixed(2)}${h.real_roc_pct != null ? ` <span class="hist-roc" title="Rentabilidad real sobre el capital total $${(h.capital_used || 0).toFixed(0)} (spot + margen)">${fmtRealReturn(h.real_roc_pct, h.real_apr_pct)}</span>` : ''}${editedMark}${editBtn}</div>
     </div>`;
   }).join('');
 
@@ -2912,3 +2949,249 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Escape') closeModal();
   });
 });
+
+// ── Informes mensuales (cada usuario = un inversor) ───────────
+// El backend arma los números (/api/reports/monthly); el PDF se genera aquí con
+// jsPDF (cargado bajo demanda) para no sumar dependencias ni RAM al servidor.
+const MONTHS_ES = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto',
+  'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+let _report = null;
+let _reportChart = null;
+
+function monthLabel(m) {
+  const [y, mm] = m.split('-').map(Number);
+  return `${MONTHS_ES[mm - 1]} ${y}`;
+}
+
+async function loadReportMonths() {
+  const sel = document.getElementById('report-month');
+  if (!sel || sel.options.length) return;   // solo la primera vez (refresh cada 30 s)
+  try {
+    const r = await (await fetch('/api/reports/months')).json();
+    const months = r.months || [];
+    sel.innerHTML = months.map(m => `<option value="${m}">${monthLabel(m)}</option>`).join('');
+    if (months.length) loadReport();
+    else document.getElementById('report-preview').innerHTML = '<div class="empty-sub">Sin actividad todavía</div>';
+  } catch (e) {
+    document.getElementById('report-preview').innerHTML = '<div class="empty-sub">Error cargando meses</div>';
+  }
+}
+
+async function loadReport() {
+  const month = document.getElementById('report-month').value;
+  const el = document.getElementById('report-preview');
+  const btn = document.getElementById('report-pdf-btn');
+  btn.disabled = true;
+  el.innerHTML = '<div class="empty-sub">Calculando…</div>';
+  try {
+    const r = await (await fetch('/api/reports/monthly?month=' + encodeURIComponent(month))).json();
+    if (!r.ok) throw new Error(r.msg || 'error');
+    _report = r.report;
+    el.innerHTML = renderReportPreview(_report);
+    btn.disabled = false;
+  } catch (e) {
+    _report = null;
+    el.innerHTML = `<div class="empty-sub">No se pudo generar: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+const usd = (v, sign = false) => v == null ? '—'
+  : `${v < 0 ? '-' : (sign && v > 0 ? '+' : '')}$${Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const pct = (v, d = 2, sign = true) => v == null ? '—' : `${sign && v > 0 ? '+' : ''}${v.toFixed(d)}%`;
+
+function capitalNote(c) {
+  if (c.source === 'deployed') return 'estimado: capital desplegado';
+  const base = `inicio ${usd(c.start)} · fin ${usd(c.end)}`;
+  return c.estimated ? `${base} (${c.filled_days}/${c.days} días estimados)` : base;
+}
+
+function reportSummary(R) {
+  const parts = [`En ${monthLabel(R.month).toLowerCase()}${R.partial_month ? ' (mes en curso, ' + R.days.toFixed(0) + ' días)' : ''} `
+    + `el capital promedio de ${usd(R.capital.avg)} generó ${usd(R.pnl.net, true)} netos`
+    + (R.return_pct != null ? ` (${pct(R.return_pct)}; ${pct(R.return_ann_pct, 1)} anualizado).` : '.')];
+  if (R.n_positions) parts.push(`Se mantuvieron ${R.n_positions} posiciones; ${R.n_closed} se cerraron en el mes`
+    + (R.win_rate_pct != null ? ` (${R.win_rate_pct.toFixed(0)} % con ganancia).` : '.'));
+  if (R.ytd.return_pct != null) parts.push(`Acumulado del año: ${usd(R.ytd.net, true)} (${pct(R.ytd.return_pct)}).`);
+  return parts.join(' ');
+}
+
+function reportExpectationText(R) {
+  const e = R.expectation;
+  let s = 'Expectativa próximos 30 días: ' + (e.next_30d_usd != null
+    ? `${usd(e.next_30d_usd, true)} (${pct(e.next_30d_pct)} del capital) según el modelo para las ${e.positions_with_outlook} posiciones abiertas`
+    : 'sin posiciones abiertas con predicción del modelo');
+  if (e.own_range_pct) s += ` · rango propio de ${e.own_range_pct.months} meses: ${pct(e.own_range_pct.min)} a ${pct(e.own_range_pct.max)} (mediana ${pct(e.own_range_pct.median)})`;
+  return s + '.';
+}
+
+function renderReportPreview(R) {
+  const cls = v => v > 0 ? 'kpi-positive' : (v < 0 ? 'kpi-negative' : '');
+  const rows = R.positions.map(p => `<tr><td>${escapeHtml(p.symbol)}</td><td>${p.opened}</td><td>${p.closed || 'abierta'}</td>
+    <td>${usd(p.capital)}</td><td>${p.days_in_month}</td><td style="color:${p.net >= 0 ? 'var(--green)' : 'var(--red)'}">${usd(p.net, true)}</td>
+    <td>${pct(p.roc_pct)}</td></tr>`).join('');
+  return `
+    <div class="earnings-kpis report-kpis">
+      <div class="kpi-card"><div class="kpi-label">Capital promedio</div><div class="kpi-value">${usd(R.capital.avg)}</div>
+        <div class="kpi-sub">${capitalNote(R.capital)}</div></div>
+      <div class="kpi-card ${cls(R.pnl.net)}"><div class="kpi-label">Ganancia neta</div><div class="kpi-value">${usd(R.pnl.net, true)}</div>
+        <div class="kpi-sub">funding ${usd(R.pnl.funding, true)} · precio ${usd(R.pnl.price, true)} · fees ${usd(R.pnl.fees, true)}</div></div>
+      <div class="kpi-card ${cls(R.return_pct)}"><div class="kpi-label">Rentabilidad del mes</div><div class="kpi-value">${pct(R.return_pct)}</div>
+        <div class="kpi-sub">${pct(R.return_ann_pct, 1)} anualizado</div></div>
+      <div class="kpi-card ${cls(R.ytd.return_pct)}"><div class="kpi-label">Acumulado ${R.month.slice(0, 4)}</div><div class="kpi-value">${pct(R.ytd.return_pct)}</div>
+        <div class="kpi-sub">${usd(R.ytd.net, true)}</div></div>
+    </div>
+    <p class="report-summary">${escapeHtml(reportSummary(R))}</p>
+    ${R.open_now.unrealized_price_pnl != null ? `<p class="report-note">Abiertas ahora: ${R.open_now.count} (${usd(R.open_now.capital)}). No realizado a mercado (precio − fee de salida): ${usd(R.open_now.unrealized_price_pnl, true)}, no incluido arriba.</p>` : ''}
+    <p class="report-note">${escapeHtml(reportExpectationText(R))}</p>
+    ${rows ? `<div class="report-table-wrap"><table class="report-table"><thead><tr><th>Símbolo</th><th>Apertura</th><th>Cierre</th><th>Capital</th><th>Días</th><th>Neto mes</th><th>Rent.</th></tr></thead><tbody>${rows}</tbody></table></div>` : ''}`;
+}
+
+function _loadScript(src) {
+  return new Promise((ok, fail) => {
+    if (document.querySelector(`script[src="${src}"]`)) return ok();
+    const s = document.createElement('script');
+    s.src = src; s.onload = ok; s.onerror = () => fail(new Error('No se pudo cargar ' + src));
+    document.head.appendChild(s);
+  });
+}
+
+// Fuentes estándar de jsPDF = WinAnsi: sin "−", "≈", "…", "—".
+const _pdfTxt = s => String(s).replace(/[−–—]/g, '-').replace(/≈/g, '~').replace(/…/g, '...');
+
+function _reportChartImage(R) {
+  const cv = document.getElementById('report-chart');
+  cv.width = 1000; cv.height = 300;
+  if (_reportChart) _reportChart.destroy();
+  _reportChart = new Chart(cv, {
+    type: 'bar',
+    data: {
+      labels: R.daily.map(d => d.date.slice(8)),
+      datasets: [{ data: R.daily.map(d => d.net), backgroundColor: R.daily.map(d => d.net >= 0 ? '#16a34a' : '#dc2626') }],
+    },
+    options: {
+      animation: false, responsive: false, devicePixelRatio: 2,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#444', font: { size: 14 } }, grid: { display: false } },
+        y: { ticks: { color: '#444', font: { size: 14 }, callback: v => '$' + v }, grid: { color: '#e5e7eb' } },
+      },
+    },
+    plugins: [{ id: 'bg', beforeDraw: c => { const x = c.ctx; x.save(); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.restore(); } }],
+  });
+  return cv.toDataURL('image/png');
+}
+
+async function downloadReportPdf() {
+  if (!_report) return;
+  const btn = document.getElementById('report-pdf-btn');
+  btn.disabled = true;
+  try {
+    await _loadScript('https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js');
+    await _loadScript('https://cdn.jsdelivr.net/npm/jspdf-autotable@3.8.4/dist/jspdf.plugin.autotable.min.js');
+    buildReportPdf(_report).save(`basyo_informe_${_report.month}.pdf`);
+    showToast('Informe descargado', 'success');
+  } catch (e) {
+    showToast('Error generando PDF: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function buildReportPdf(R) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const T = _pdfTxt, W = 210, M = 14;
+  const green = [22, 163, 74], red = [220, 38, 38], ink = [17, 24, 39], mute = [107, 114, 128];
+  const col = v => (v == null || v === 0) ? ink : (v > 0 ? green : red);
+
+  // Encabezado
+  doc.setFillColor(17, 19, 24); doc.rect(0, 0, W, 30, 'F');
+  doc.setTextColor(255); doc.setFont('helvetica', 'bold'); doc.setFontSize(18);
+  doc.text('basyo', M, 13);
+  doc.setFontSize(11); doc.setFont('helvetica', 'normal');
+  doc.text(T('Informe mensual de rentabilidad - ' + monthLabel(R.month) + (R.partial_month ? ' (parcial)' : '')), M, 21);
+  doc.setFontSize(8);
+  doc.text(T(`Inversor: ${R.investor.email}`), W - M, 13, { align: 'right' });
+  doc.text(T(`Generado: ${R.generated_at.slice(0, 16).replace('T', ' ')} UTC`), W - M, 21, { align: 'right' });
+
+  // KPIs
+  const kpis = [
+    ['Capital promedio', usd(R.capital.avg), capitalNote(R.capital).replace(' · ', ' / '), null],
+    ['Ganancia neta', usd(R.pnl.net, true), `${R.n_positions} posiciones`, R.pnl.net],
+    ['Rentabilidad del mes', pct(R.return_pct), `${pct(R.return_ann_pct, 1)} anualizado`, R.return_pct],
+    [`Acumulado ${R.month.slice(0, 4)}`, pct(R.ytd.return_pct), usd(R.ytd.net, true), R.ytd.return_pct],
+  ];
+  const bw = (W - 2 * M - 9) / 4;
+  kpis.forEach(([lab, val, sub, v], i) => {
+    const x = M + i * (bw + 3), y0 = 36;
+    doc.setDrawColor(229, 231, 235); doc.setFillColor(249, 250, 251); doc.roundedRect(x, y0, bw, 24, 2, 2, 'FD');
+    doc.setFontSize(7.5); doc.setTextColor(...mute); doc.text(T(lab), x + 3, y0 + 6);
+    doc.setFontSize(14); doc.setFont('helvetica', 'bold'); doc.setTextColor(...col(v)); doc.text(T(val), x + 3, y0 + 14);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(7); doc.setTextColor(...mute);
+    doc.text(doc.splitTextToSize(T(sub), bw - 6), x + 3, y0 + 19.5);
+  });
+
+  // Resumen
+  let y = 68;
+  doc.setTextColor(...ink); doc.setFontSize(9.5);
+  const sum = doc.splitTextToSize(T(reportSummary(R)), W - 2 * M);
+  doc.text(sum, M, y); y += sum.length * 4.6 + 3;
+
+  // Desglose
+  doc.autoTable({
+    startY: y, margin: { left: M, right: M, bottom: 20 }, theme: 'plain', styles: { fontSize: 8.5, cellPadding: 1.2 },
+    head: [['Desglose del mes', 'USD']], headStyles: { fontStyle: 'bold', textColor: ink },
+    body: [['Funding cobrado', usd(R.pnl.funding, true)], ['PnL de precio (basis y slippage, al cierre)', usd(R.pnl.price, true)],
+      ['Comisiones (entrada y salida)', usd(R.pnl.fees, true)], ['Ganancia neta', usd(R.pnl.net, true)]].map(r => r.map(T)),
+    columnStyles: { 1: { halign: 'right' } },
+    didParseCell: d => { if (d.section === 'body' && d.row.index === 3) d.cell.styles.fontStyle = 'bold'; },
+    tableWidth: 100,
+  });
+  y = doc.lastAutoTable.finalY + 4;
+
+  // Gráfica diaria
+  const ch = (W - 2 * M) * 0.3;
+  doc.setFontSize(9); doc.setFont('helvetica', 'bold'); doc.text(T('Ganancia neta realizada por día (USD)'), M, y);
+  doc.setFont('helvetica', 'normal');
+  doc.addImage(_reportChartImage(R), 'PNG', M, y + 2, W - 2 * M, ch);
+  y += 2 + ch + 5;
+
+  // Posiciones
+  if (R.positions.length) {
+    doc.autoTable({
+      startY: y, margin: { left: M, right: M, bottom: 20 }, styles: { fontSize: 7.5, cellPadding: 1.3 },
+      headStyles: { fillColor: [17, 19, 24] },
+      head: [['Símbolo', 'Apertura', 'Cierre', 'Capital', 'Días', 'Funding', 'Precio', 'Fees', 'Neto mes', 'Rent.'].map(T)],
+      body: R.positions.map(p => [p.symbol, p.opened, p.closed || 'abierta', usd(p.capital), p.days_in_month,
+        usd(p.funding, true), usd(p.price, true), usd(p.fees, true), usd(p.net, true), pct(p.roc_pct)].map(T)),
+      columnStyles: Object.fromEntries([3, 4, 5, 6, 7, 8, 9].map(i => [i, { halign: 'right' }])),
+      didParseCell: d => {
+        if (d.section === 'body' && (d.column.index === 8 || d.column.index === 9)) d.cell.styles.textColor = col(R.positions[d.row.index].net);
+      },
+    });
+    y = doc.lastAutoTable.finalY + 5;
+  }
+
+  // Expectativas
+  const e = R.expectation;
+  const lines = [reportExpectationText(R).replace('Expectativa próximos 30 días: ', 'Próximos 30 días: '), 'Referencia: ' + e.reference];
+  if (R.open_now.unrealized_price_pnl != null) {
+    lines.push(`Posiciones abiertas hoy: ${R.open_now.count} (${usd(R.open_now.capital)}); resultado no realizado a mercado ${usd(R.open_now.unrealized_price_pnl, true)} (no incluido en el mes).`);
+  }
+  if (y > 255) { doc.addPage(); y = 20; }
+  doc.setFontSize(9); doc.setFont('helvetica', 'bold'); doc.setTextColor(...ink); doc.text('Expectativas', M, y);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(8.5); y += 4.5;
+  lines.forEach(l => { const t = doc.splitTextToSize(T('- ' + l), W - 2 * M); doc.text(t, M, y); y += t.length * 4 + 0.8; });
+
+  // Nota metodológica (pie de la primera página)
+  const note = 'Metodología: la rentabilidad se mide sobre el capital total (compra spot + margen del short); '
+    + 'solo el nocional cobra funding, por eso a 1x cerca de la mitad del capital genera el ingreso. '
+    + 'El funding se asigna por fecha de pago, las comisiones a la apertura y al cierre, y el PnL de precio al cierre. '
+    + (R.capital.source === 'deployed' ? 'Sin registro diario de capital: se usa el capital promedio desplegado en posiciones. '
+      : (R.capital.estimated ? `${R.capital.filled_days} de ${R.capital.days} días sin registro de capital se completan con el registro más cercano. ` : ''))
+    + 'Rentabilidades pasadas no garantizan resultados futuros; las expectativas son estimaciones del modelo.';
+  doc.setPage(1);
+  doc.setFontSize(7); doc.setTextColor(...mute);
+  doc.text(doc.splitTextToSize(T(note), W - 2 * M), M, 282);
+  return doc;
+}

@@ -212,10 +212,12 @@ def test_manual_adjust_is_not_a_payment():
     assert pos["payment_count"] == 1 and pos["avg_rate"] == pytest.approx(0.0002)
 
 
-def _alert_pos(last_fr, payment_count=3):
+def _alert_pos(last_fr, payment_count=3, prev_fr=-0.00005):
+    pays = [{"ts": 1, "rate": 0.0003, "earned": 0.3}, {"ts": 2, "rate": prev_fr, "earned": 0.0},
+            {"ts": 3, "rate": last_fr, "earned": 0.0}]
     return {"id": "7", "user_id": 1, "symbol": "AAA", "exchange": "Binance", "mode": "spot_perp",
             "entry_fr": 0.0003, "last_fr_used": last_fr, "payment_count": payment_count,
-            "entry_price": 1.0, "leverage": 1}
+            "entry_price": 1.0, "leverage": 1, "payments": pays}
 
 
 def _cur(fr):
@@ -223,11 +225,18 @@ def _cur(fr):
              "next_funding_ts": 1, "price": 1.0}]
 
 
-def test_close_suggested_after_two_non_positive_settlements():
+def test_close_suggested_after_three_non_positive_settlements():
     w = _worker(_EMSettle({}))
     alerts = w._check_alerts_db([_alert_pos(-0.0001)], _cur(-0.0002), {"AAA_Binance": {"pred": -12.0}})
     assert [a["type"] for a in alerts] == ["CLOSE_SUGGESTED"]
     assert "-12.0%" in alerts[0]["message"]
+
+
+def test_two_non_positive_settlements_do_not_suggest_close_yet():
+    # último liquidado ≤ 0 y próximo ≤ 0, pero el anterior cobró → todavía no (profit_study 20261117)
+    w = _worker(_EMSettle({}))
+    alerts = w._check_alerts_db([_alert_pos(-0.0001, prev_fr=0.0002)], _cur(-0.0002))
+    assert "CLOSE_SUGGESTED" not in [a["type"] for a in alerts]
 
 
 def test_single_negative_rate_is_only_informative_and_deduped_per_position():

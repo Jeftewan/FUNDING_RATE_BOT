@@ -443,6 +443,13 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 fr_reversed = ((pos["entry_fr"] > 0 and cfr < 0) or
                                (pos["entry_fr"] < 0 and cfr > 0))
 
+                # Rentabilidad real sobre el capital total (spot + margen), a mercado.
+                from portfolio import returns as _ret
+                perp_now = cp if (not is_cross and cur) else None
+                basis_now = (_ret.latest_basis(pos["symbol"], pos.get("exchange", ""))
+                             if perp_now and pos.get("spot_qty") else None)
+                real_ret = _ret.active_mark_to_market(pos, perp_now, net_earned, el_h / 24, basis_now)
+
                 ipd = 24 / ih
                 exposure = pos.get("exposure", pos["capital_used"] / 2)
                 daily = exposure * abs(cfr) * ipd
@@ -468,6 +475,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "exit_fees_effective": exit_fee_val,
                     "fees_is_real": fees_is_real,
                     "net_earned": net_earned,
+                    **real_ret,
                     "entry_basis_usd": entry_basis_usd,
                     "current_apr": current_apr,
                     "fr_reversed": fr_reversed,
@@ -1371,6 +1379,52 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 "total_earned": user_state.get("total_earned", 0),
             })
         return jsonify({"history": [], "total_earned": 0})
+
+    # ── Informes mensuales por inversor (cada usuario = un inversor) ──
+    @app.route("/api/reports/months")
+    @auth_required
+    def api_report_months():
+        uid = get_current_user_id()
+        if not (uid and get_db_persist()):
+            return jsonify({"ok": False, "months": []})
+        from portfolio.reports import available_months
+        return jsonify({"ok": True, "months": available_months(uid)})
+
+    @app.route("/api/reports/monthly")
+    @auth_required
+    def api_report_monthly():
+        """?month=YYYY-MM → informe del usuario actual (JSON; el PDF lo arma el cliente)."""
+        uid = get_current_user_id()
+        if not (uid and get_db_persist()):
+            return jsonify({"ok": False, "msg": "Requiere base de datos"}), 400
+        month = (flask_req.args.get("month") or "").strip()
+        from portfolio import reports as _rep
+        from portfolio import returns as _ret
+        from portfolio.manager import position_fees as _pf
+        try:
+            _rep.month_bounds(month)
+        except Exception:  # noqa: BLE001
+            return jsonify({"ok": False, "msg": "Mes inválido (YYYY-MM)"}), 400
+        with state_manager.lock:
+            all_data = list(state_manager.state.get("all_data", []))
+            outlook_raw = dict(state_manager.state.get("position_outlook") or {})
+        price = {(d.get("symbol"), d.get("exchange")): d.get("price") for d in all_data}
+        outlook, unreal = {}, {}
+        for pos in get_db_persist().load_user_state(uid).get("positions", []):
+            pred = (outlook_raw.get(f"{pos.get('symbol')}_{pos.get('exchange')}") or {}).get("pred")
+            if pred is not None:
+                outlook[pos["id"]] = pred
+            perp_now = price.get((pos.get("symbol"), pos.get("exchange")))
+            if perp_now and pos.get("spot_qty") and pos.get("mode") == "spot_perp":
+                b = _ret.latest_basis(pos["symbol"], pos.get("exchange", ""))
+                u = _ret.unrealized_price_pnl(pos, perp_now, _ret.spot_from_basis(perp_now, b or 0.0))
+                if u is not None:      # a mercado: precio no realizado − fee de salida estimada
+                    unreal[pos["id"]] = u - _pf(pos)[1]
+        try:
+            rep = _rep.monthly_report(uid, month, outlook=outlook, unrealized=unreal)
+        except ValueError as e:
+            return jsonify({"ok": False, "msg": str(e)}), 400
+        return jsonify({"ok": True, "report": rep})
 
     @app.route("/api/clear_history", methods=["POST"])
     @auth_required

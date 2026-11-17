@@ -1520,3 +1520,23 @@ body.no-scroll { overflow: hidden; }
 @media (min-width: 900px) { .an-chart-wrap { height: 260px; } }
 .conf-chip.conf-mid { color: var(--orange); background: var(--orange-bg); }
 .conf-chip.conf-neg { color: var(--red); background: var(--red-bg); }
+
+/* ── Informes mensuales ────────────────────────────── */
+.report-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.report-toolbar label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--text-secondary); }
+.report-toolbar select { min-width: 170px; }
+.report-summary { font-size: 13px; line-height: 1.5; margin: 4px 0 8px; }
+.report-note { font-size: 11px; color: var(--text-secondary); margin: 4px 0; line-height: 1.45; }
+.report-table-wrap { overflow-x: auto; margin-top: 10px; }
+.report-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.report-table th, .report-table td { padding: 5px 6px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.report-table th:nth-child(-n+3), .report-table td:nth-child(-n+3) { text-align: left; }
+.report-table th { color: var(--text-secondary); font-weight: 600; }
+.hist-roc { font-size: 11px; font-weight: 600; margin-left: 4px; opacity: .9; }
+.exec-note.exec-warn { color: var(--text-primary); background: rgba(245,158,11,0.12); border: 1px solid rgba(245,158,11,0.35); }

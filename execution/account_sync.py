@@ -18,6 +18,7 @@ from exchanges.net import is_geoblock_error, mark_geoblocked
 log = logging.getLogger("bot.sync")
 
 SYNC_INTERVAL = 300
+CAPITAL_RECORD_SECS = 3600
 
 
 class AccountSyncer:
@@ -60,6 +61,22 @@ class AccountSyncer:
                 self.sync_user(uid)
             except Exception as e:
                 log.warning(f"sync user {uid} failed: {e}")
+        self._record_capital()
+
+    def _record_capital(self):
+        """Capital por usuario y día UTC (informes mensuales). Como mucho 1 vez por hora."""
+        if time.time() - getattr(self, "_capital_ts", 0) < CAPITAL_RECORD_SECS:
+            return
+        self._capital_ts = time.time()
+        from core.db_models import User
+        from core.db_persistence import DBPersistence
+        with self.app.app_context():
+            p = DBPersistence()
+            for (uid,) in User.query.with_entities(User.id).all():
+                try:
+                    p.record_capital_daily(uid)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(f"capital diario user {uid}: {e}")
 
     def _ulock(self, uid):
         with self._lock:

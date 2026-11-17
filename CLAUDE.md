@@ -1,8 +1,59 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-11-10** (troceo a prueba de fallos y estudio de tamaño, rama `feat/adaptive-sizing`).
+Estado del proyecto al **2026-11-17** (rentabilidad real, informes mensuales y revisión del modelo, rama `feat/returns-reports-model`).
 
 ---
+
+## Pérdida por operación y meta mensual (2026-11-17, rama `feat/profit-per-trade`)
+
+`scripts/profit_study.py` (motor `_exec_engine`, entradas = candidatos del modelo con `p_prod > 0` en 25 tokens Alpha,
+salida por regla de funding, gas, rebalanceo spot→margen, cartera por usuario) → `reports/profit_study_20261117.md`
+y `_cartera.md`. Calibrado vs 10 trades reales (|error| basis 0.32 pp entrada, sin sesgo).
+- **La pérdida real vino de cerrar pronto** (mediana 3.6 d) y de entrar con basis negativo (antes del 10-nov):
+  salida a los 3 d = +0.07 % por operación / ~1.1 %/mes; con la regla = +1.65 % / ~2.0 %/mes a 1x.
+- Adoptado: `CLOSE_SUGGESTED` y `position_verdict` al **tercer settlement sin cobrar** (`scanner/worker.py:settled_rates`,
+  `CLOSE_NEG_SETTLED`), salida paciente **basis ≥ 0 hasta 48 h** (`PATIENT_EXIT_*`), aviso de cierre prematuro en el
+  diálogo de cierre (`app.js:earlyCloseWarning`).
+- No pasan / no repetir: toma de ganancia por convergencia (−1.5 pp), θ de entrada 0.5–0.75, un solo swap, 100 USD/min,
+  filtrar por costo esperado (las excluidas ganan +1.1 %), leverage sin rebalanceo (SL 40–51 %).
+- Pendiente con potencial: **rebalanceo spot → margen** (vender la ganancia del spot, depositar en futuros, recomprar la
+  misma fracción del short): SL 22 % → 1–4 %, p5 −1.16 → 0.00, 2x ≈ 2.3 %/mes (2k–10k USD). No pasa el criterio de
+  media (IC cruza 0); requiere implementar y validar con montos chicos. Tramos 100 USD / 5 min (+0.05 pp) esperan ρ real.
+  Fricción medida (2x, 60 % del camino): cada rebalanceo vende ~20 % del nocional y cuesta 0.05 % del nocional (pool +
+  perp + gas); el basis perp−spot al rebalancear es +0.33 % mediano (pump: el on-chain va detrás) y bloquea ~0.16 pp
+  por operación. Total ≈ 0.28 pp por operación rebalanceada vs +1.4 pp de SL evitados. **La variable crítica es la
+  latencia del depósito BSC → margen**: 3 min +0.24 pp vs 1x, 15 min +0.10, 45 min −0.23 (peor que 1x). El capital
+  queda en Binance al cerrar: volver a la wallet BSC requiere retiro (las keys no lo permiten → manual).
+- Meta: 2.5 % mensual sostenido no se alcanza a 1x (~2.0 %); 5 % no aparece en ninguna configuración.
+
+## Rentabilidad real e informes mensuales (2026-11-17, rama `feat/returns-reports-model`)
+
+- **Rentabilidad real sobre capital total** (`portfolio/returns.py`): `capital_used` = spot + margen (a 1x la mitad
+  compra spot; solo `exposure` cobra funding). ROC = neto / capital; anual = ROC × 365 / días. Activas
+  (`/api/positions`): `net_mtm` = funding − fees (entrada + salida est.) + precio realizado + **no realizado a mercado**
+  (`spot_qty·(spot_now − spot_entry) + perp_qty·(perp_entry − perp_now)`, spot = perp / (1 + último `basis_pct` de
+  `market_feature_snapshots` ≤ 3 h); sin basis → spot ≈ perp y `mtm_approx`). Cerradas: `real_roc_pct`/`real_apr_pct`
+  en `_hist_to_dict`. UI: "Rent. real" en la tarjeta, junto al neto del historial y en el CSV.
+- **Informe mensual por inversor** (cada usuario = un inversor): pestaña "Informes" → `GET /api/reports/months`,
+  `GET /api/reports/monthly?month=YYYY-MM` (`portfolio/reports.py`). Funding por fecha de cada pago de
+  `user_positions.payments_json` (las cerradas conservan la fila; residuo vs historial → mes de cierre), fee de
+  entrada al mes de apertura y de salida al de cierre, PnL de precio al cierre. Capital = promedio diario de
+  `user_capital_daily` (lo escribe `account_sync._record_capital` cada hora para todos los usuarios); días sin fila →
+  registro más cercano (`estimated`); sin ningún registro → capital desplegado. Expectativa 30 d = Σ
+  `position_outlook.pred`·`exposure` de las abiertas. `user_history.position_id` nuevo (filas viejas: símbolo +
+  `closed_at` ±10 min). PDF en el cliente: jsPDF 2.5.2 + autotable 3.8.4 (jsDelivr, carga bajo demanda), una A4.
+- Tests: `tests/test_returns.py`.
+
+**¿Re-entrenar? No (2026-11-17).** `reports/ml_health_20261117.md`: el modelo 20261009 sigue sano fuera de muestra
+(IC 0.79 vs 0.67 del heurístico, uplift +0.12, sin degradación semanal, PSI máx 0.18). `scripts/ml_v2.py --refresh`
+(dataset hasta 2026-11-17; variantes nuevas `E_3m` y `E_rw` = peso por recencia, vida media 90 d; gate y
+`--export VARIANTE` añadidos) → `reports/ml_v2_20261117.md`: **ninguna variante pasa** (WF y hold-out > vigente).
+El hold-out (18-oct → 17-nov) rinde 1.7 % anual simulado para el vigente y −6.7 % para "tasa vigente": el último mes
+fue flojo para la estrategia (sesgo: el label H30 del último mes solo incluye salidas ya ocurridas).
+`scripts/live_performance.py` → `reports/live_performance_20261117.md`: en los trades auto **el funding cobrado (46 %
+APR sobre nocional) supera lo predicho (40.8 %)**; la brecha es de ejecución: PnL de precio −40 pp (KOMA, AIN, ARIA,
+ZEST: SL/basis/slippage). Top-decil del funding sin compresión (0.134 → 0.142 %/día); bajan los pares ≥ 0.03 %/día
+(266 → 213). Palanca: ejecución/basis de salida y riesgo de SL en Alpha, no el modelo. Re-correr ambos en ~15 d.
 
 ## ¿Umbrales fijos o adaptativos? (2026-11-10, rama `feat/adaptive-sizing`)
 

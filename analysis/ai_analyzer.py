@@ -89,7 +89,7 @@ OPP_SYSTEM_PROMPT = (
     "cumplio APR >= 5 %, win = fraccion con ganancia, med = APR neto mediano).\n\n"
     "Responde SOLO JSON: {\"analysis\":\"50-80 palabras: que paga, por que el modelo da ese veredicto, "
     "con numeros\",\"risks\":[\"1-3 riesgos concretos y medibles\"],\"watch\":\"que vigilar y cuando salir "
-    "(regla del negocio: cerrar tras dos pagos seguidos <= 0)\",\"leverage\":\"una frase que justifique "
+    "(regla del negocio: cerrar tras tres settlements seguidos <= 0; cerrar antes cuesta)\",\"leverage\":\"una frase que justifique "
     "'lev_rec' (leverage recomendado por backtest con seguros: alpha 2x, cex 3x) con la tabla lev\"}"
 )
 
@@ -253,7 +253,7 @@ POSITION_SYSTEM_PROMPT = (
     "no justifica cerrar.\n"
     "REGLAS de decision:\n"
     "CERRAR:\n"
-    "- rev=true Y el ultimo valor de lr <= 0 — dos settlements seguidos sin cobrar\n"
+    "- los dos ultimos valores de lr <= 0 Y cfr <= 0 — tres settlements seguidos sin cobrar\n"
     "- cfr<=0 y la mayoria de lr <= 0 — la posicion ya no genera\n"
     "- sw.rec=SWITCH y sw.val>0 y sw.beh<24 y sw.alt_napr supera al Net APR actual — alternativa solida y mejor\n\n"
     "VIGILAR:\n"
@@ -372,16 +372,17 @@ def _slim_position(pos: dict) -> dict:
 
 
 def position_verdict(slim: dict) -> dict:
-    """Veredicto determinista con la regla de salida del negocio (reports/exit_policy_20261022.md:
-    salir tras dos pagos seguidos ≤ 0 y mantener hasta ~30 d)."""
+    """Veredicto determinista con la regla de salida del negocio: tres settlements seguidos sin cobrar
+    (los dos últimos liquidados ≤ 0 y el próximo también) y mantener hasta ~30 d
+    (reports/exit_policy_20261022.md, reports/profit_study_20261117.md: cerrar antes es lo que más cuesta)."""
     lr = slim.get("lr") or []
-    if len(lr) >= 2 and lr[-1] <= 0 and lr[-2] <= 0:
-        return {"signal": "CERRAR", "reason": "Dos pagos seguidos sin cobrar."}
+    if len(lr) >= 2 and lr[-1] <= 0 and lr[-2] <= 0 and slim.get("cfr", 1) <= 0:
+        return {"signal": "CERRAR", "reason": "Tres settlements seguidos sin cobrar."}
     sw = slim.get("sw") or {}
     if sw.get("rec") == "SWITCH":           # regla de rotación calibrada (switch_analyzer.rotation_gain_ok)
         return {"signal": "CERRAR", "reason": f"Rotar a {sw.get('alt')}: la mejora paga fee + 2 % del nocional en 14 d."}
     if lr and lr[-1] <= 0:
-        return {"signal": "VIGILAR", "reason": "Último pago ≤ 0: cerrar si el próximo también lo es."}
+        return {"signal": "VIGILAR", "reason": "Pago ≤ 0: cerrar solo si se completan tres settlements seguidos sin cobrar."}
     if slim.get("h", 0) > 30 * 24:
         return {"signal": "VIGILAR", "reason": "Más de 30 días abierta: revisar si sigue rindiendo sobre su promedio."}
     return {"signal": "MANTENER", "reason": "Sigue cobrando funding."}

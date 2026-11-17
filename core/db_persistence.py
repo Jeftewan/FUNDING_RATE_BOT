@@ -224,6 +224,29 @@ class DBPersistence:
                 "free_total": round(spot + fut + wallet, 4),
                 "synced_at": (snap or wsnap or {}).get("synced_at")}
 
+    def record_capital_daily(self, user_id: int, now: datetime = None) -> dict:
+        """Upsert del capital del día UTC (mismo cálculo que load_user_state)."""
+        from core.database import db
+        from core.db_models import UserCapitalDaily, UserConfig, UserPosition
+        now = now or datetime.now(timezone.utc)
+        used = sum(p.capital_used or 0 for p in
+                   UserPosition.query.filter_by(user_id=user_id, status="active").all())
+        real = self.real_free_usdt(user_id)
+        if real is not None:
+            total, source = round(real["free_total"] + used, 2), "real"
+        else:
+            cfg = UserConfig.query.filter_by(user_id=user_id).first()
+            total, source = float(cfg.total_capital if cfg and cfg.total_capital else 0), "config"
+        day = now.strftime("%Y-%m-%d")
+        row = UserCapitalDaily.query.filter_by(user_id=user_id, date=day).first()
+        if row is None:
+            row = UserCapitalDaily(user_id=user_id, date=day)
+            db.session.add(row)
+        row.total_capital, row.deployed_capital, row.source = total, round(used, 2), source
+        row.updated_at = now
+        db.session.commit()
+        return {"date": day, "total_capital": total, "deployed_capital": round(used, 2), "source": source}
+
     def users_with_exchange_keys(self, exchange_name: str) -> list:
         from core.db_models import UserExchangeKey
         rows = UserExchangeKey.query.filter(
@@ -326,6 +349,7 @@ class DBPersistence:
             price_pnl=result.get("price_pnl"),
             slippage_usd=result.get("slippage_usd"),
             exec_json=result.get("exec"),
+            position_id=pos.id,
         )
         db.session.add(hist)
         db.session.commit()
@@ -576,7 +600,8 @@ class DBPersistence:
 
     @staticmethod
     def _hist_to_dict(h) -> dict:
-        return {
+        from portfolio.returns import closed_return
+        d = {
             "id": str(h.id),
             "symbol": h.symbol,
             "exchange": h.exchange,
@@ -596,7 +621,10 @@ class DBPersistence:
             "price_pnl": getattr(h, "price_pnl", None),
             "slippage_usd": getattr(h, "slippage_usd", None),
             "exec": getattr(h, "exec_json", None),
+            "position_id": getattr(h, "position_id", None),
         }
+        d.update(closed_return(d))
+        return d
 
     def get_score_trend(self, symbol: str, exchange: str, limit: int = 10) -> dict:
         """Get score trend for a symbol+exchange pair.

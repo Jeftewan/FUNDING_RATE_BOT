@@ -37,7 +37,8 @@ FEE_ALPHA = 0.0041          # mediana real fees/nocional de los trades Binance (
 MAX_HOLD_DAYS = 30
 NEG_NEEDED = 2              # = CLOSE_SUGGESTED
 EXTRA = ["alpha", "regime_median_daily", "regime_frac_premium"]
-WINDOWS = {"all": None, "12m": 365, "6m": 182}
+WINDOWS = {"all": None, "12m": 365, "6m": 182, "3m": 91}
+RECENCY_HALF_LIFE_D = 90    # variante _rw: peso 0.5 cada 90 d (régimen reciente pesa más)
 
 
 # ── Label H30 vectorizado ───────────────────────────────────────────────────
@@ -71,9 +72,21 @@ def h30_labels(fr: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(out, ignore_index=True)
 
 
+def ensure_features():
+    """Re-construye cache/binance/features_v1.pkl si el dataset es más nuevo (mismo código que ml_binance)."""
+    if mb.FEAT_CACHE.exists() and mb.FEAT_CACHE.stat().st_mtime > mb.DATA.stat().st_mtime:
+        return
+    fr = pd.read_csv(mb.DATA)
+    fr["captured_at"] = pd.to_datetime(fr["captured_at"], utc=True)
+    fr = mb.split_on_gaps(fr)
+    print(f"features: {len(fr):,} liquidaciones → {mb.FEAT_CACHE.name}", flush=True)
+    mb.build_rows(fr).to_pickle(mb.FEAT_CACHE)
+
+
 def build(refresh: bool) -> pd.DataFrame:
     if ROWS_CACHE.exists() and not refresh:
         return pd.read_pickle(ROWS_CACHE)
+    ensure_features()
     lst = att.alpha_listing()
     df = mb.dedupe_columns(pd.read_pickle(mb.FEAT_CACHE))
     lt = df["symbol"].map(lst)
@@ -92,7 +105,7 @@ def build(refresh: bool) -> pd.DataFrame:
 
 
 # ── Modelos ─────────────────────────────────────────────────────────────────
-def fit(head: str, X, y):
+def fit(head: str, X, y, w=None):
     from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
     if head == "P":
         m = HistGradientBoostingClassifier(**mb.MODEL_PARAMS)
@@ -100,18 +113,25 @@ def fit(head: str, X, y):
         m = HistGradientBoostingRegressor(loss="quantile", quantile=0.25, **mb.MODEL_PARAMS)
     else:
         m = HistGradientBoostingRegressor(**mb.MODEL_PARAMS)
-    m.fit(X, y)
+    m.fit(X, y, sample_weight=w)
     return m
+
+
+def recency_weights(tr, end):
+    age = (end - tr["t"]).dt.total_seconds().to_numpy() / 86400
+    return 0.5 ** (age / RECENCY_HALF_LIFE_D)
 
 
 def predict(m, head, X):
     return m.predict_proba(X)[:, 1] if head == "P" else m.predict(X)
 
 
-VARIANTS = {   # nombre: (cabeza, ventana, columnas)
+VARIANTS = {   # nombre: (cabeza, ventana, columnas); sufijo _rw = peso por recencia
     "E_all": ("E", "all", FEATURE_NAMES),
     "E_12m": ("E", "12m", FEATURE_NAMES),
     "E_6m": ("E", "6m", FEATURE_NAMES),
+    "E_3m": ("E", "3m", FEATURE_NAMES),
+    "E_rw": ("E", "all", FEATURE_NAMES),
     "E_all_x": ("E", "all", FEATURE_NAMES + EXTRA),
     "Q25_all": ("Q25", "all", FEATURE_NAMES),
     "P_all": ("P", "all", FEATURE_NAMES),
@@ -134,7 +154,8 @@ def run(df, name, folds):
         te = df[(df["t"] >= fs) & (df["t"] < fe)]
         if len(tr) < 5000 or len(te) < 300:
             continue
-        m = fit(head, tr[cols].to_numpy(), tr[y].to_numpy())
+        w = recency_weights(tr, fs) if name.endswith("_rw") else None
+        m = fit(head, tr[cols].to_numpy(), tr[y].to_numpy(), w)
         preds.loc[te.index] = predict(m, head, te[cols].to_numpy())
     return preds
 
@@ -167,6 +188,8 @@ def max_drawdown_pct(df, col, gate=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--refresh", action="store_true", help="recalcular filas/labels")
+    ap.add_argument("--export", choices=[n for n, v in VARIANTS.items() if v[0] == "E" and v[2] == FEATURE_NAMES],
+                    help="exporta models/scoring_model.joblib con esa variante SI pasa el gate")
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
     df = build(a.refresh)
@@ -192,7 +215,8 @@ def main():
     for name in VARIANTS:                                   # hold-out: entrenar con todo lo previo
         head, window, cols = VARIANTS[name]
         tr = train_slice(df, holdout_start, window)
-        m = fit(head, tr[cols].to_numpy(), tr["y_win" if head == "P" else "y_rate"].to_numpy())
+        w = recency_weights(tr, holdout_start) if name.endswith("_rw") else None
+        m = fit(head, tr[cols].to_numpy(), tr["y_win" if head == "P" else "y_rate"].to_numpy(), w)
         hold[f"p_{name}"] = predict(m, head, hold[cols].to_numpy())
     hold["p_ExP"] = hold["p_E_all"] * hold["p_P_all"]
 
@@ -214,9 +238,10 @@ def main():
          "| ranking | IC diario WF (y_rate) | WF PnL USD | WF anual % | trades | % gan. | DD % | "
          "hold-out PnL USD | hold-out anual % | hold-out trades |",
          "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
-    res = {}
+    res, ics = {}, {}
     for lbl, col, gate in rankers:
         ic = mb.daily_ic(wf, col, "y_rate")[0]
+        ics[lbl] = ic
         r = mb.portfolio(wf, col, gate=gate)
         dd = max_drawdown_pct(wf, col, gate)
         h = mb.portfolio(hold, col, gate=gate)
@@ -237,9 +262,58 @@ def main():
     L += ["", "Nota: la cartera por mes reinicia slots cada mes (aprox.); a 3x el nocional por slot sube "
               "×1.5 antes del costo de eventos de SL (ver F4).", ""]
 
+    # Gate: mejor que el vigente en cartera WF Y hold-out, IC WF no peor (−0.005).
+    base_lbl = "modelo vigente (pred>0)"
+    bw, bh = res[base_lbl]
+    gates = {}
+    L += ["", "## Gate vs modelo vigente (WF PnL > vigente, hold-out PnL > vigente, IC ≥ vigente − 0.005)", "",
+          "| variante | WF Δ USD | hold-out Δ USD | IC Δ | pasa |", "| --- | --- | --- | --- | --- |"]
+    for n in VARIANTS:
+        lbl = f"{n} (>0)" if not n.startswith("P") else f"{n} (≥0.5)"
+        w_, h_ = res[lbl]
+        ok = (w_["pnl_usd"] > bw["pnl_usd"] and h_["pnl_usd"] > bh["pnl_usd"]
+              and ics[lbl] >= ics[base_lbl] - 0.005)
+        gates[n] = ok
+        L.append(f"| {n} | {w_['pnl_usd'] - bw['pnl_usd']:+.1f} | {h_['pnl_usd'] - bh['pnl_usd']:+.1f} | "
+                 f"{ics[lbl] - ics[base_lbl]:+.3f} | {'sí' if ok else 'no'} |")
+
+    if a.export:
+        if not gates.get(a.export):
+            L += ["", f"**Export `{a.export}` rechazado: no pasa el gate.**"]
+        else:
+            export(df, a.export, wf, hold, res, gates, today)
+            L += ["", f"**Exportado `{a.export}` → models/scoring_model.joblib (`feature_spec` settled_v1).**"]
+
     path = ROOT / "reports" / f"ml_v2_{today}.md"
     path.write_text("\n".join(L), encoding="utf-8")
     print("\n".join(L))
+
+
+def export(df, name, wf, hold, res, gates, today):
+    """Re-entrena la variante con todo el label disponible y escribe el bundle de prod
+    (mismo formato que ml_binance.export: feature_spec settled_v1, calibración por percentiles)."""
+    import joblib
+    import sklearn
+    head, window, cols = VARIANTS[name]
+    end = df["t"].max()
+    tr = train_slice(df, end, window)
+    w = recency_weights(tr, end) if name.endswith("_rw") else None
+    m = fit(head, tr[cols].to_numpy(), tr["y_rate"].to_numpy(), w)
+    oos = pd.concat([wf[f"p_{name}"], hold[f"p_{name}"]]).dropna()
+    t_oos = pd.concat([wf["t"], hold["t"]]).loc[oos.index]
+    recent = oos[t_oos >= end - timedelta(days=90)]
+    calib = [float(v) for v in np.percentile(recent if len(recent) > 1000 else oos, np.arange(0, 101))]
+    lbl = f"{name} (>0)"
+    bundle = {
+        "model": m, "calibration_pcts": calib, "feature_names": list(cols),
+        "feature_spec": "settled_v1", "label": "H30_y_rate", "source": "binance_vision+alpha",
+        "model_version": f"{today}v2",
+        "train_window": {"from": str(tr["t"].min().date()), "to": str(tr["t"].max().date()), "rows": int(len(tr))},
+        "val_metrics": {"wf": res[lbl][0], "holdout": res[lbl][1], "gate": gates[name]},
+        "sklearn_version": sklearn.__version__,
+    }
+    joblib.dump(bundle, ROOT / "models" / "scoring_model.joblib", compress=3)
+    print(f"exportado models/scoring_model.joblib ({name}, {bundle['model_version']})", flush=True)
 
 
 if __name__ == "__main__":
