@@ -340,6 +340,9 @@ class JobRunner:
         try:
             if job["kind"] == "open":
                 self._run_open(job)
+            elif job["kind"] == "rebalance":
+                from execution import rebalance
+                rebalance.run(self, job)
             else:
                 self._run_close(job)
         except Exception as e:
@@ -418,9 +421,10 @@ class JobRunner:
                 token = position_token(pos)
         return self._load_wallet(uid), token
 
-    def _protect(self, uid, pos_id, creds, ctx=None, token=None):
+    def _protect(self, uid, pos_id, creds, ctx=None, token=None, anchor=None):
         """Coloca los seguros de una posición spot_perp recién abierta y los
-        persiste. Un fallo nunca deshace la posición: alerta para ponerlos a mano."""
+        persiste. Un fallo nunca deshace la posición: alerta para ponerlos a mano.
+        `anchor`: precio del último rebalanceo spot→margen (re-ancla el SL)."""
         from exchanges import trade_executor as texec
         pos = self._load_pos(pos_id)
         if not pos:
@@ -428,7 +432,7 @@ class JobRunner:
         sym = pos.get("symbol", "")
         try:
             wallet, token = self._bsc_args(uid, pos, token)
-            prot = texec.place_protection(creds, pos, ctx=ctx, wallet=wallet, token=token)
+            prot = texec.place_protection(creds, pos, ctx=ctx, wallet=wallet, token=token, anchor=anchor)
         except Exception as e:
             log.exception(f"place_protection pos={pos_id}: {e}")
             prot = {"ok": False, "msg": f"{type(e).__name__}: {e}"}
@@ -456,7 +460,7 @@ class JobRunner:
                 return
         except Exception as e:
             log.warning(f"protection status pos={pos.get('id')}: {e}")
-        self._protect(uid, pos["id"], creds, token=token)
+        self._protect(uid, pos["id"], creds, token=token, anchor=prot.get("anchor"))
 
     def _save_open_position(self, uid, jid, opp, p, fill, entry_ms=None) -> int:
         from core.db_persistence import DBPersistence
@@ -669,12 +673,23 @@ class JobRunner:
         from core.db_models import ExecutionJob
         try:
             with self.app.app_context():
-                stale = [(j.id, j.status) for j in
+                stale = [(j.id, j.status, j.kind) for j in
                          ExecutionJob.query.filter(ExecutionJob.status.in_(_ACTIVE + (_ARMED,))).all()]
         except Exception as e:
             log.warning(f"job recovery query failed: {e}")
             return
-        for jid, status in stale:
+        for jid, status, kind in stale:
+            if kind == "rebalance":
+                # Fracción y mark eran del momento del disparo: no se repite a ciegas. Si ya
+                # había operado, el estado de cada etapa está en payments_json de la posición.
+                self._update(jid, status="cancelled" if status == "queued" else "interrupted",
+                             error="Rebalanceo interrumpido por reinicio; el vigilante lo re-evalúa")
+                if status != "queued":
+                    job = self._load(jid)
+                    self._alert(job["user_id"], job["params"].get("symbol", ""),
+                                f"Rebalanceo #{jid} interrumpido por reinicio: revisa cantidades, USDT en "
+                                f"tránsito y margen aislado de la posición.", severity="WARNING")
+                continue
             if status == _ARMED:
                 # Sin órdenes vivas: la espera continúa donde iba.
                 threading.Thread(target=self._watch_armed, args=(jid,), daemon=True).start()

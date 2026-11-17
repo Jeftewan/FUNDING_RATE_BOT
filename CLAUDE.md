@@ -55,6 +55,27 @@ APR sobre nocional) supera lo predicho (40.8 %)**; la brecha es de ejecución: P
 ZEST: SL/basis/slippage). Top-decil del funding sin compresión (0.134 → 0.142 %/día); bajan los pares ≥ 0.03 %/día
 (266 → 213). Palanca: ejecución/basis de salida y riesgo de SL en Alpha, no el modelo. Re-correr ambos en ~15 d.
 
+## Rebalanceo spot → margen (2026-11-17, rama `feat/rebalance-margin`, flag apagado)
+
+Variante R2 de `reports/profit_study_20261117.md` (eventos de SL 22 % → 1–4 %, p5 −1.16 → 0.00; habilita 2x ≈ 2.3 %/mes).
+- **Disparo** (`execution/protection.py:_maybe_rebalance`, solo `REBALANCE_ENABLED=1`): mark ≥ ancla +
+  `REBALANCE_FRACTION` (0.6) · (SL − ancla); ancla = `protection_json.anchor` o la entrada. Cooldown 30 min
+  (`rebalance_at`), venta mínima 10 USD, f ≤ 0.5.
+- **Job `rebalance`** (`execution/rebalance.py`): (1) `execute_close` sobre la fracción f = 1 − ancla/mark (vende spot
+  y recompra el mismo tanto del short, pareado; la recompra ya aleja la liquidación) → `_apply_partial_close`;
+  (2) seguros con ancla = precio de recompra; (3) BSC: USDT de la wallet → dirección de depósito Binance
+  (`BinanceAccount.deposit_address/wait_deposit`, timeout 20 min); (4) spot→futuros (`transfer_usdt`) y
+  `add_isolated_margin`; (5) seguros re-anclados sobre la liquidación final. Agregar TODO lo vendido como margen
+  re-ancla la liquidación exacta del estudio: liq = p·(1 + 1/L)/(1 + mmr).
+- Fallo en (3)/(4): la posición queda más segura (short reducido) y el USDT en wallet/tránsito → alerta
+  `REBALANCE_FAILED` para terminar a mano. Cada intento queda en `payments_json` (`kind: "rebalance"`, tiempos por
+  etapa y `latency_s`). Tras reinicio no se repite (queued → cancelled, running → interrupted + alerta).
+- **No necesita IP fija**: depositar y Universal Transfer funcionan con la key sin IP restrict. La IP fija (Railway Pro,
+  decisión del usuario) solo hace falta para **retirar** de Binance a la wallet BSC (Fase B, pendiente).
+- **Validación antes de habilitar**: `POST /api/positions/<id>/rebalance` `{fraction, confirm:true}` sobre una posición
+  chica → medir latencia venta→margen. Si > 15 min no habilitar (el estudio pierde a 45 min). Alpha sigue en 1x hasta
+  ≥ 5 rebalanceos reales.
+
 ## ¿Umbrales fijos o adaptativos? (2026-11-10, rama `feat/adaptive-sizing`)
 
 Job #37 (JCT, posición #58): disparó con basis +0.34 % a tamaño de tramo y compró **de un golpe** 2,082 USD con 0.57 % de impacto → basis real −0.35 %, slippage 12.79 USD. Causa probable (el valor no se guardaba): `suggest_slices` trataba impacto 0/`None` como 1 tramo y, con el mercado cayendo, el mid leído antes quedó sobre el precio a tamaño completo.
@@ -733,7 +754,8 @@ Modal de ejecución con TWAP, simulación con leverage/liquidación/basis/fondos
 - `notifications/email.py:build_alert_dedup_key(alert)` — única fuente de verdad para la dedup_key: `f"{type}:{user_id}:{symbol}:{exchange}:{bucket}"` donde `bucket` es `funding_ts` (ms o s) para alertas window-bound, o `_exc_bucket` (`YYYYMMDD`) para broadcasts diarios.
 - `notifications/email.py:valid_telegram_creds(chat_id, token)` — validación de formato barata antes de golpear la API (chat_id numérico ≥5 chars, token con `:` y ≥20 chars). Si falla, log único por usuario y skip.
 
-**Tipos de alerta:** `CLOSE_SUGGESTED` (dos settlements seguidos sin cobrar: último pago ≤0 y el próximo también), `RATE_REVERSAL` (informativa, una vez por posición), `NAKED_SPOT` (crítica: short desaparecido con spot en manos), `LIQUIDATION_RISK` (short a <20% de liquidación), `PRE_PAYMENT_UNFAVORABLE`, `SL_TP_REVIEW`, `EXCEPTIONAL_OPPORTUNITY`, `SWITCH_OPPORTUNITY`, `POSITION_CLOSED`, `SPOT_TP_RUNNER` (venta spot llenada: short suelto con TP; CEX −5 %/15 min, BSC −20 %/1 h), `EXCHANGE_GEOBLOCKED` (crítica, diaria por usuario: el sync de Binance recibe 451 geográfico).
+**Tipos de alerta:** `CLOSE_SUGGESTED` (dos settlements seguidos sin cobrar: último pago ≤0 y el próximo también), `RATE_REVERSAL` (informativa, una vez por posición), `NAKED_SPOT` (crítica: short desaparecido con spot en manos), `LIQUIDATION_RISK` (short a <20% de liquidación), `PRE_PAYMENT_UNFAVORABLE`, `SL_TP_REVIEW`, `EXCEPTIONAL_OPPORTUNITY`, `SWITCH_OPPORTUNITY`, `POSITION_CLOSED`, `SPOT_TP_RUNNER` (venta spot llenada: short suelto con TP; CEX −5 %/15 min, BSC −20 %/1 h), `EXCHANGE_GEOBLOCKED` (crítica, diaria por usuario: el sync de Binance recibe 451 geográfico), `REBALANCED` /
+`REBALANCE_FAILED` (rebalanceo spot→margen hecho / incompleto con USDT por mover a mano).
 
 ---
 
@@ -841,6 +863,8 @@ BSC_RPC_URL           # default https://bsc-dataseed.bnbchain.org
 BSC_MEV_PROTECTION    # default 1 (broadcast por mempool privada)
 BSC_PRIVATE_RPC_URL   # RPC anti-MEV de BSC para transmitir cuando el agregador no tiene broadcast (Kyber); vacío = RPC público
 EXCHANGE_PROXY_URL    # socks5h://user:pass@ip:puerto — salida a exchanges vía VPS (geobloqueo); vacío = directo
+REBALANCE_ENABLED     # =1 → el vigilante dispara el rebalanceo spot→margen (default apagado)
+REBALANCE_FRACTION    # fracción del camino ancla→SL que dispara el rebalanceo (default 0.6)
 ```
 
 > Nota: las API keys globales de CEX (arriba) son para datos públicos del scanner. La **auto-ejecución** usa las keys *por usuario* guardadas en `user_exchange_keys` (tab Cuenta), no estas.
