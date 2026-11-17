@@ -31,7 +31,8 @@ def test_analyze_opportunity_without_key_returns_verdict():
 
 
 def test_position_verdict_exit_rule():
-    assert ai.position_verdict({"lr": [0.01, -0.001, 0.0]})["signal"] == "CERRAR"
+    assert ai.position_verdict({"lr": [0.01, -0.001, 0.0], "cfr": -0.001})["signal"] == "CERRAR"
+    assert ai.position_verdict({"lr": [0.01, -0.001, 0.0], "cfr": 0.002})["signal"] == "VIGILAR"
     assert ai.position_verdict({"lr": [0.01, 0.02, -0.001]})["signal"] == "VIGILAR"
     assert ai.position_verdict({"lr": [0.01, 0.02], "h": 800})["signal"] == "VIGILAR"
     assert ai.position_verdict({"lr": [0.01, 0.02], "h": 50})["signal"] == "MANTENER"

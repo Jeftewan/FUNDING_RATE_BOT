@@ -4,6 +4,23 @@ Estado del proyecto al **2026-11-17** (rentabilidad real, informes mensuales y r
 
 ---
 
+## Pérdida por operación y meta mensual (2026-11-17, rama `feat/profit-per-trade`)
+
+`scripts/profit_study.py` (motor `_exec_engine`, entradas = candidatos del modelo con `p_prod > 0` en 25 tokens Alpha,
+salida por regla de funding, gas, rebalanceo spot→margen, cartera por usuario) → `reports/profit_study_20261117.md`
+y `_cartera.md`. Calibrado vs 10 trades reales (|error| basis 0.32 pp entrada, sin sesgo).
+- **La pérdida real vino de cerrar pronto** (mediana 3.6 d) y de entrar con basis negativo (antes del 10-nov):
+  salida a los 3 d = +0.07 % por operación / ~1.1 %/mes; con la regla = +1.65 % / ~2.0 %/mes a 1x.
+- Adoptado: `CLOSE_SUGGESTED` y `position_verdict` al **tercer settlement sin cobrar** (`scanner/worker.py:settled_rates`,
+  `CLOSE_NEG_SETTLED`), salida paciente **basis ≥ 0 hasta 48 h** (`PATIENT_EXIT_*`), aviso de cierre prematuro en el
+  diálogo de cierre (`app.js:earlyCloseWarning`).
+- No pasan / no repetir: toma de ganancia por convergencia (−1.5 pp), θ de entrada 0.5–0.75, un solo swap, 100 USD/min,
+  filtrar por costo esperado (las excluidas ganan +1.1 %), leverage sin rebalanceo (SL 40–51 %).
+- Pendiente con potencial: **rebalanceo spot → margen** (vender la ganancia del spot, depositar en futuros, recomprar la
+  misma fracción del short): SL 22 % → 1–4 %, p5 −1.16 → 0.00, 2x ≈ 2.3 %/mes (2k–10k USD). No pasa el criterio de
+  media (IC cruza 0); requiere implementar y validar con montos chicos. Tramos 100 USD / 5 min (+0.05 pp) esperan ρ real.
+- Meta: 2.5 % mensual sostenido no se alcanza a 1x (~2.0 %); 5 % no aparece en ninguna configuración.
+
 ## Rentabilidad real e informes mensuales (2026-11-17, rama `feat/returns-reports-model`)
 
 - **Rentabilidad real sobre capital total** (`portfolio/returns.py`): `capital_used` = spot + margen (a 1x la mitad

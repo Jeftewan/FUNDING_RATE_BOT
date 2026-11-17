@@ -25,12 +25,13 @@ _ACTIVE = ("queued", "running")
 _ARMED = "armed"
 ARMED_POLL = 60
 # Basis ejecutable al tamaño de cada tramo, en % (reports/exec_study_20261110.md): entrar con
-# ≥ 0.25 en hasta 6 h y salir con ≥ −0.15 en hasta 24 h. Umbrales fijos: los relativos al
-# propio token, otras ventanas de entrada y "ejecutar ya" no pasan el criterio.
+# ≥ 0.25 en hasta 6 h. Umbrales fijos: los relativos al propio token, otras ventanas de entrada y
+# "ejecutar ya" no pasan el criterio. Salida: ≥ 0.00 en hasta 48 h (reports/profit_study_20261117.md:
+# +0.02 pp por operación frente a −0.15/24 h, 5/5 trimestres; vender basis cuesta más que comprarlo).
 PATIENT_ENTRY_WINDOW_S = 6 * 3600
-PATIENT_EXIT_WINDOW_S = 24 * 3600
+PATIENT_EXIT_WINDOW_S = 48 * 3600
 PATIENT_ENTRY_BASIS = 0.25
-PATIENT_EXIT_BASIS = -0.15
+PATIENT_EXIT_BASIS = 0.0
 # Guarda al ir a operar tras una espera: θ − margen. Con pausa de 15 min, θ entre 0 y 0.25 rinde
 # casi igual, así que solo se aborta si el basis cayó claramente por debajo de lo evaluado.
 FIRE_BASIS_MARGIN = 0.25

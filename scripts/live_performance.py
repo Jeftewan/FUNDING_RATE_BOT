@@ -178,6 +178,18 @@ def main():
               f"Brecha predicho − (funding − fees): {wm('pred_napr') - wm('funding_apr_n') - wm('fees_apr_n'):.1f} pp "
               f"(modelo/nivel); brecha de ejecución (PnL de precio): {-wm('price_apr_n'):.1f} pp."]
 
+    # 2b. Antes / después de la espera de basis (PR #120, 2026-11-11) y duración del hold.
+    #     profit_study_20261117: salir a los 3 d deja +0.07 % por operación vs +1.65 % con la regla.
+    cut = pd.Timestamp("2026-11-11", tz="UTC")
+    t["periodo"] = np.where(t["opened"] >= cut, "con espera de basis", "antes (ejecutar ya)")
+    t["hold_band"] = pd.cut(t["days"], [0, 3, 7, 14, 1e9], labels=["< 3 d", "3–7 d", "7–14 d", "≥ 14 d"])
+    L += ["", "## 2b. Método de entrada y duración del hold (sobre capital total)", ""]
+    for col in ("periodo", "hold_band"):
+        gg = t.groupby(col, observed=True).apply(lambda x: pd.Series({
+            "n": len(x), "dias_med": x["days"].median(), "net": x["net"].sum(), "price": x["price"].sum(),
+            "apr_cap": x["net"].sum() / (x["capital"] * x["days"]).sum() * 36500}), include_groups=False).reset_index()
+        L += md(gg, [col, "n", "dias_med", "net", "price", "apr_cap"], {"n": lambda v: f"{int(v)}"}) + [""]
+
     # 3. Nivel de mercado
     weekly, last = market_level(a.days)
     L += ["", f"## 3. Nivel del mercado (Binance USDⓈ-M, tasas liquidadas, últimos {a.days} d; datos hasta {last:%Y-%m-%d})"

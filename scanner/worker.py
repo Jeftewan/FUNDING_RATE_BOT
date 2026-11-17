@@ -41,6 +41,24 @@ PERIODIC_SCAN_OFFSET_SECS = 4 * 60      # :04 de cada hora → tras los settleme
 # liquidación del short está ~1/leverage por encima de la entrada; 0.70 avisa
 # al consumir el 70% de ese recorrido (deja colchón vs. el maintenance-margin).
 LIQ_PROXIMITY_THRESHOLD = 0.70
+# CLOSE_SUGGESTED: liquidados seguidos ≤ 0 (además del próximo ≤ 0) → 3 settlements sin cobrar.
+CLOSE_NEG_SETTLED = 2
+
+
+def settled_rates(pos: dict) -> list:
+    """Tasas de los pagos de funding liquidados (sin entradas de auditoría), en orden.
+    Sin historial de pagos → la última tasa usada si hubo algún pago."""
+    out = []
+    for p in pos.get("payments") or []:
+        if p.get("kind") or "rate" not in p:
+            continue
+        try:
+            out.append(float(p["rate"]))
+        except (TypeError, ValueError):
+            continue
+    if not out and pos.get("payment_count", 0) and pos.get("last_fr_used") is not None:
+        out = [float(pos["last_fr_used"])]
+    return out
 # Low, fixed floor used when scanning the opportunity universe. Per-user
 # volume filtering is done client-side from the Filtros panel, so the scan
 # itself only drops genuinely illiquid noise. DeFi venues that report
@@ -1593,8 +1611,12 @@ class ScannerWorker:
 
             pid = pos.get("id", "")
             last_settled = pos.get("last_fr_used")
+            # Salida: tres settlements seguidos sin cobrar (los dos últimos liquidados ≤ 0 y el
+            # próximo también). reports/profit_study_20261117.md: con el costo de salida, esperar
+            # al tercero rinde +0.04 pp por operación frente a dos (4/5 trimestres).
+            settled = settled_rates(pos)
             if not is_cross and pos["entry_fr"] > 0 and cfr <= 0 \
-                    and last_settled is not None and pos.get("payment_count", 0) > 0 and last_settled <= 0:
+                    and len(settled) >= CLOSE_NEG_SETTLED and all(r <= 0 for r in settled[-CLOSE_NEG_SETTLED:]):
                 key = f"CLOSE_SUGGESTED_{sym}_{display_ex}_{uid}_{pid}"
                 active_keys.add(key)
                 if key not in self._notified_alerts:
@@ -1607,8 +1629,9 @@ class ScannerWorker:
                         "user_id": pos.get("user_id"),
                         "funding_ts": bucket,
                         "dedup_key": key,
-                        "message": (f"Dos settlements seguidos sin cobrar: último pago "
-                                    f"{last_settled*100:.4f}%, próximo {cfr*100:.4f}%. Los fees de "
+                        "message": (f"Tres settlements seguidos sin cobrar: últimos pagos "
+                                    f"{settled[-2]*100:.4f}% y {settled[-1]*100:.4f}%, próximo "
+                                    f"{cfr*100:.4f}%. Los fees de "
                                     f"salida se pagan igual: cerrar ahora evita pagar funding."
                                     + pred_txt),
                     })

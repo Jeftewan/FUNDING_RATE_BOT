@@ -848,7 +848,7 @@ function anEpisodesHtml(a) {
       <div><span class="label">Edad de la racha actual</span><span class="value">${e.ep_age_days == null ? '—' : e.ep_age_days.toFixed(1) + ' d'}</span></div>
       <div><span class="label">APR mediano por racha</span><span class="value">${e.apr_med == null ? '—' : e.apr_med.toFixed(1) + '%'}</span></div>
     </div>
-    <div class="an-note">Racha = desde que la tasa supera la base hasta dos pagos seguidos ≤ 0 (la regla de salida de basyo). Si la racha actual ya supera la duración típica, el riesgo de que se apague pronto es mayor.</div>
+    <div class="an-note">Racha = desde que la tasa supera la base hasta dos pagos seguidos ≤ 0 (la salida que usa el modelo; basyo sugiere cerrar al tercer settlement sin cobrar). Si la racha actual ya supera la duración típica, el riesgo de que se apague pronto es mayor.</div>
     ${rows ? `<table class="an-table"><thead><tr><th>Inicio</th><th>Duración</th><th>APR medio</th><th>Estado</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="an-note">Sin rachas en el último año.</div>'}`;
 }
 
@@ -1343,13 +1343,27 @@ async function autoExecuteClose(posId, symbol) {
   const meta = {
     symbol, mode: p.mode, exchange: p.exchange, spot_venue: p.spot_venue,
     long_exchange: p.long_exchange, short_exchange: p.short_exchange, _close: true,
-    spot_qty: p.spot_qty, perp_qty: p.perp_qty,
+    spot_qty: p.spot_qty, perp_qty: p.perp_qty, early_close: earlyCloseWarning(p),
   };
   const ans = await showExecConfirm('close', meta);
   if (ans.choice === 'cancel') return;
   await runExec('/api/execute_close',
     { position_id: posId, dry_run: ans.choice === 'dry', twap: ans.twap },
     ans.choice === 'dry', 'close', `Cierre ${symbol}`);
+}
+
+// Cerrar antes de la regla de salida es la mayor fuente de pérdida (reports/profit_study_20261117.md:
+// salir a los 3 d rinde +0.07 % por operación frente a +1.65 % manteniendo hasta la regla).
+function earlyCloseWarning(p) {
+  if (!p || p.mode === 'cross_exchange') return '';
+  const rates = (p.payments || []).filter(x => !x.kind && x.rate != null).map(x => +x.rate);
+  const ruleMet = rates.length >= 2 && rates.slice(-2).every(r => r <= 0) && (p.current_fr ?? 1) <= 0;
+  if (ruleMet) return '';
+  const days = (p.elapsed_h || 0) / 24;
+  return `<strong>La regla de salida aún no se cumple</strong> (tres settlements seguidos sin cobrar). `
+    + `Lleva ${days.toFixed(1)} días. En el estudio de 12 meses, salir a los 3 días dejó +0.07 % por operación `
+    + `frente a +1.65 % manteniendo hasta la regla: el costo de entrar y salir se paga con días de funding. `
+    + `Cierra antes solo por riesgo (seguros, token offline, liquidación).`;
 }
 
 function _fmtQty(v) { return v == null ? '—' : (+v).toPrecision(5); }
@@ -1392,7 +1406,8 @@ function showExecConfirm(kind, meta) {
         <div class="exec-sub">${head}</div>
         <ul class="exec-legs">${legsHtml}</ul>
         ${sizeNote}
-        ${isBsc ? `<div class="exec-note">On-chain: espera a que el basis ejecutable al tamaño del tramo sea favorable (hasta 6 h para abrir, 24 h para cerrar) y ejecuta por tramos de swap + short pareados cada 15 min, para que el pool se re-arbitre. «Ejecutar ya» en el progreso corta la espera.</div>` : ''}
+        ${meta.early_close ? `<div class="exec-note exec-warn">${meta.early_close}</div>` : ''}
+        ${isBsc ? `<div class="exec-note">On-chain: espera a que el basis ejecutable al tamaño del tramo sea favorable (hasta 6 h para abrir y basis ≥ 0 hasta 48 h para cerrar) y ejecuta por tramos de swap + short pareados cada 15 min, para que el pool se re-arbitre. «Ejecutar ya» en el progreso corta la espera.</div>` : ''}
         ${isCross || isBsc ? '' : `
         <label class="exec-twap"><input type="checkbox" id="exec-twap-on"> TWAP pareado (montos grandes)</label>
         <div class="exec-twap-cfg" id="exec-twap-cfg" style="display:none">

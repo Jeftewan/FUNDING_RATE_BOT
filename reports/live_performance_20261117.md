@@ -32,6 +32,20 @@ Sin atípicos (JCT), ponderado por nocional × días (n = 8): predicho 40.8 % ·
 Spearman predicho ↔ funding cobrado: 0.03. Mediana por trade: predicho 33.5 % · funding 30.9 % · precio -21.4 % · neto -14.8 %.
 Brecha predicho − (funding − fees): -0.1 pp (modelo/nivel); brecha de ejecución (PnL de precio): 40.0 pp.
 
+## 2b. Método de entrada y duración del hold (sobre capital total)
+
+| periodo | n | dias_med | net | price | apr_cap |
+| --- | --- | --- | --- | --- | --- |
+| antes (ejecutar ya) | 36 | 6.49 | 963.86 | 314.70 | 49.60 |
+
+| hold_band | n | dias_med | net | price | apr_cap |
+| --- | --- | --- | --- | --- | --- |
+| < 3 d | 7 | 0.95 | 426.42 | 411.00 | 782.44 |
+| 3–7 d | 12 | 4.74 | 51.62 | -62.01 | 23.58 |
+| 7–14 d | 8 | 10.72 | 168.24 | -30.08 | 32.70 |
+| ≥ 14 d | 9 | 23.72 | 317.58 | -4.22 | 27.49 |
+
+
 ## 3. Nivel del mercado (Binance USDⓈ-M, tasas liquidadas, últimos 180 d; datos hasta 2026-11-17)
 
 | semana | top_decile_daily_pct | median_daily_pct | n_ge_base |
