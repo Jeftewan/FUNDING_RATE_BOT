@@ -1080,6 +1080,43 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         log.info(f"Exec job #{jid} close pos={db_pos_id} user={uid}")
         return jsonify({"ok": True, "job_id": jid})
 
+    @app.route("/api/positions/<int:pos_id>/rebalance", methods=["POST"])
+    @auth_required
+    def api_position_rebalance(pos_id):
+        """Rebalanceo spot→margen manual (prueba con montos mínimos; mide la latencia real
+        del depósito). Body: {fraction: 0.01–0.5, confirm: true}. No depende de REBALANCE_ENABLED."""
+        from execution.jobs import position_token
+        data = flask_req.json or {}
+        if data.get("confirm") is not True:
+            return jsonify({"ok": False, "msg": "Falta confirm: true (vende spot, recompra short y mueve USDT)"}), 400
+        try:
+            frac = float(data.get("fraction"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "msg": "fraction inválida"}), 400
+        if not 0.01 <= frac <= 0.5:
+            return jsonify({"ok": False, "msg": "fraction debe estar entre 0.01 y 0.5"}), 400
+        uid = get_current_user_id()
+        dbp = get_db_persist()
+        if not uid or not dbp or not job_runner:
+            return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
+        from core.db_models import UserPosition
+        row = UserPosition.query.filter_by(id=pos_id, user_id=uid, status="active").first()
+        if not row:
+            return jsonify({"ok": False, "msg": "Posicion no encontrada"}), 404
+        pos = dbp._pos_to_dict(row)
+        if pos.get("source") not in ("auto", "imported") or (pos.get("protection") or {}).get("status") != "active":
+            return jsonify({"ok": False, "msg": "Solo posiciones auto/importadas con seguros activos"})
+        if job_runner.active_job_for_position(uid, pos_id, include_armed=True):
+            return jsonify({"ok": False, "msg": "La posición ya tiene un job en curso o en espera"})
+        token = (position_token(pos) or {}) if pos.get("spot_venue") == "bsc" else {}
+        jid = job_runner.submit_exclusive(uid, "rebalance", {
+            "position_id": pos_id, "symbol": pos.get("symbol"), "fraction": frac, "token": token,
+            "trigger": "manual"})
+        if jid is None:
+            return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
+        log.info(f"Exec job #{jid} rebalance pos={pos_id} f={frac} user={uid}")
+        return jsonify({"ok": True, "job_id": jid})
+
     # ── Execution jobs ─────────────────────────────────────────
     @app.route("/api/exec/jobs/<int:job_id>")
     @auth_required

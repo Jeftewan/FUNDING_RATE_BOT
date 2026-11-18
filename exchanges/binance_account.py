@@ -66,6 +66,9 @@ class BinanceAccount:
         if not perm.get("ipRestrict"):
             warnings.append("La key no está restringida por IP. Recomendado: restringirla a la IP "
                             "de salida de basyo.")
+        if not perm.get("permitsUniversalTransfer"):
+            warnings.append("Sin 'Permits Universal Transfer': el rebalanceo spot→margen no podrá "
+                            "mover USDT a futuros.")
         if perm.get("enableInternalTransfer"):
             warnings.append("La key permite transferencias internas a otras cuentas; no es necesario.")
         return {"ok": not errors, "errors": errors, "warnings": warnings}
@@ -172,6 +175,44 @@ class BinanceAccount:
             return {"ok": True, "id": r.get("id")}
         except Exception as e:
             return {"ok": False, "msg": f"Transferencia {src}→{dst} falló: {e}"}
+
+    # ── Depósitos (rebalanceo spot BSC → margen) ───────────────────────
+    def deposit_address(self, coin: str = "USDT", network: str = "BSC") -> str:
+        """Dirección de depósito del usuario (permiso de lectura). Sin memo: si la red
+        pide uno, no se usa (un depósito sin memo se pierde)."""
+        r = self.spot.fetch_deposit_address(coin, {"network": network})
+        if r.get("tag"):
+            raise RuntimeError(f"La red {network} de {coin} pide memo; no se deposita automáticamente")
+        if not r.get("address"):
+            raise RuntimeError(f"Binance no devolvió dirección de depósito {coin}/{network}")
+        return r["address"]
+
+    def find_deposit(self, txid: str, since_ms: int, coin: str = "USDT"):
+        want = (txid or "").lower().removeprefix("0x")
+        for d in self.spot.fetch_deposits(coin, since_ms) or []:
+            got = str(d.get("txid") or (d.get("info") or {}).get("txId") or "").lower().removeprefix("0x")
+            if got and got == want:
+                return d
+        return None
+
+    @staticmethod
+    def deposit_credited(d: dict) -> bool:
+        """Binance: status 1 = acreditado, 6 = acreditado sin poder retirar aún (ya opera)."""
+        return str((d.get("info") or {}).get("status")) in ("1", "6") or d.get("status") == "ok"
+
+    def wait_deposit(self, txid: str, since_ms: int, timeout: float, poll: float = 15.0,
+                     coin: str = "USDT") -> dict:
+        deadline = time.time() + timeout
+        while True:
+            try:
+                d = self.find_deposit(txid, since_ms, coin)
+                if d and self.deposit_credited(d):
+                    return d
+            except Exception as e:
+                log.warning(f"deposit history {txid}: {e}")
+            if time.time() >= deadline:
+                raise TimeoutError(f"depósito {txid} sin acreditar en {int(timeout // 60)} min")
+            time.sleep(poll)
 
     # ── Agregados ──────────────────────────────────────────────────────
     def check(self) -> dict:

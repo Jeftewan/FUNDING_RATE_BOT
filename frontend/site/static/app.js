@@ -1593,7 +1593,8 @@ async function resumeActiveJob() {
     const data = await res.json();
     if (data.ok && data.job) {
       const j = data.job;
-      watchJob(j.id, `${j.kind === 'open' ? 'Apertura' : 'Cierre'} ${j.params?.symbol || ''}`, j.kind);
+      const label = { open: 'Apertura', rebalance: 'Rebalanceo' }[j.kind] || 'Cierre';
+      watchJob(j.id, `${label} ${j.params?.symbol || ''}`, j.kind);
     }
   } catch (e) { /* non-fatal */ }
 }
