@@ -26,6 +26,14 @@ y `_cartera.md`. Calibrado vs 10 trades reales (|error| basis 0.32 pp entrada, s
   queda en Binance al cerrar: volver a la wallet BSC requiere retiro (las keys no lo permiten → manual).
 - Meta: 2.5 % mensual sostenido no se alcanza a 1x (~2.0 %); 5 % no aparece en ninguna configuración.
 
+## Piloto Claude como decisor (2026-11-18, `scripts/llm_policy_study.py`, `reports/llm_policy_pilot_20261118.md`)
+
+Opus 5.5 vía `claude -p` (suscripción; `LLM_CLAUDE_BIN` = CLI ≥ 2.1.280; con Kaspersky usar su CA en
+`NODE_EXTRA_CA_CERTS`) decide entradas/tamaño/salidas cada día sobre el mismo motor; cortado en 64 días por límites
+de uso. Sin la mecha on-chain de TA (+348 USD de suerte): LLM +2.06 %/mes vs P0 +1.85 (Δ +0.10, IC [−0.41, +0.57]),
+vs P0d mismo reloj +0.39 (P 85 %); LLM+ML no mejora (p5 −1.06). Ventaja = rota más y sale cuando el basis de venta es
+favorable → **probar esa regla determinista en `profit_study` antes que un LLM en prod** (~0.06 USD/decisión API).
+
 ## Rentabilidad real e informes mensuales (2026-11-17, rama `feat/returns-reports-model`)
 
 - **Rentabilidad real sobre capital total** (`portfolio/returns.py`): `capital_used` = spot + margen (a 1x la mitad
