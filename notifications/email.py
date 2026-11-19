@@ -126,7 +126,9 @@ class EmailNotifier:
         try:
             log.info(f"Sending Telegram: {alert.get('type')} {alert.get('symbol')}...")
             text = self._format_message(alert)
-            self._send_telegram(text, chat_id, token)
+            mid = self._send_telegram(text, chat_id, token, reply_markup=alert.get("reply_markup"))
+            if mid:
+                alert["_tg_message_id"] = mid
             self._sent_cache[alert_key] = now
             if self._dedup_record and user_id:
                 try:
@@ -220,20 +222,20 @@ class EmailNotifier:
 
         return "\n".join(lines)
 
-    def _send_telegram(self, text: str, chat_id: str = None, token: str = None):
-        """Send message via Telegram Bot API (HTTPS POST).
+    def _send_telegram(self, text: str, chat_id: str = None, token: str = None, reply_markup: dict = None):
+        """Send message via Telegram Bot API (HTTPS POST). Returns the message_id.
 
         Uses provided chat_id/token if given, otherwise falls back to the
-        instance attributes synced from state.
+        instance attributes synced from state. reply_markup = botones inline
+        (notifications/tg_actions.py).
         """
         chat_id = chat_id if chat_id is not None else self.tg_chat_id
         token = token if token is not None else self.tg_bot_token
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = json.dumps({
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown",
-        }).encode("utf-8")
+        body = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        if reply_markup:
+            body["reply_markup"] = reply_markup
+        payload = json.dumps(body).encode("utf-8")
         log.debug(f"Telegram: chat_id={chat_id}, token={token[:8]}...")
         req = urllib.request.Request(
             url, data=payload,
@@ -246,6 +248,10 @@ class EmailNotifier:
             log.debug(f"Telegram response: {status} — {body[:100]}")
             if status != 200:
                 raise RuntimeError(f"Telegram API returned {status}: {body}")
+            try:
+                return (json.loads(body).get("result") or {}).get("message_id")
+            except ValueError:
+                return None
 
     def test_connection(self) -> dict:
         """Test Telegram by sending a test message."""

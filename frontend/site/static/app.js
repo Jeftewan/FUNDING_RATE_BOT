@@ -2508,6 +2508,8 @@ async function loadConfig() {
     document.getElementById('cfg-email-on').checked = cfg.email_enabled;
     document.getElementById('cfg-tg-token').value = cfg.tg_bot_token || '';
     document.getElementById('cfg-tg-chatid').value = cfg.tg_chat_id || '';
+    document.getElementById('cfg-tg-actions').checked = !!cfg.tg_actions_enabled;
+    document.getElementById('cfg-reb-paused').checked = !!cfg.rebalance_paused;
   } catch (e) {
     console.error('loadConfig error:', e);
   }
@@ -2520,6 +2522,8 @@ async function saveConfig() {
     email_enabled: document.getElementById('cfg-email-on').checked,
     tg_bot_token: document.getElementById('cfg-tg-token').value,
     tg_chat_id: document.getElementById('cfg-tg-chatid').value,
+    tg_actions_enabled: document.getElementById('cfg-tg-actions').checked,
+    rebalance_paused: document.getElementById('cfg-reb-paused').checked,
   };
   if (document.getElementById('cfg-capital-wrap').style.display !== 'none') {
     data.total_capital = parseFloat(document.getElementById('cfg-capital').value);

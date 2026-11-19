@@ -40,6 +40,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 import _exec_engine as E  # noqa: E402
 from _exec_engine import Pol  # noqa: E402
+from analysis import signals as SIG  # noqa: E402
 
 ROWS = ROOT / "cache" / "binance" / "ml_v2_rows.pkl"
 OUT = ROOT / "cache" / "profit_study.pkl"
@@ -63,6 +64,8 @@ class Var:
     rebal: float = None       # rebalanceo spot→margen al recorrer esta fracción del camino al SL
     slice_usd: float = None   # tramos de tamaño fijo (USD) en vez de por impacto
     cap_days: float = 30      # hold máximo
+    tp_floor: float = None    # salida: basis de venta ≥ tp_floor con el funding en el piso (analysis/signals)
+    floor_n: int = 1          # pagos liquidados desde la entrada que deben estar en el piso
 
 
 BASE_POL = Pol("P0", gap=15, win_x=1440, a_gap=10)
@@ -135,6 +138,36 @@ def leg(S, start, side, usd, v, force=False):
     return E.leg(S, start, side, usd, pol, force=force)
 
 
+def floor_mask(S, n):
+    """Por minuto: los últimos n pagos liquidados (≤ ts) están en el piso (SIG.funding_at_floor)."""
+    key = ("floor", n)
+    if key not in S._cache:
+        weak = (S.daily <= SIG.FUNDING_FLOOR_DAILY + SIG.FLOOR_EPS).astype(int)
+        run = np.convolve(weak, np.ones(n, int), "full")[:len(weak)] >= n
+        i = np.searchsorted(S.f_ts, S.ts, "right") - 1
+        m = np.zeros(S.n, bool)
+        ok = i >= 0
+        m[ok] = run[i[ok]]
+        S._cache[key] = m
+    return S._cache[key]
+
+
+def fill_shares(S, t, usd, pol):
+    """Fracción de las 24 h previas con basis ejecutable de compra ≥ θ: (velas 1m, muestreo horario).
+    El horario imita market_feature_snapshots (VWAP de las 5 velas que cierran en cada hora UTC)."""
+    c = S.a + S.b * usd / E.n_slices(S, usd, pol)
+    ex = S.ex("buy", c)
+    w = ex[t - 1440:t]
+    ok = ~np.isnan(w)
+    f1 = float((w[ok] >= pol.th_e).mean()) if ok.any() else None
+    hours = [k for k in range(t - 1440, t) if int(S.ts[k]) % 3_600_000 == 0]
+    vals = []
+    for h in hours:
+        seg = ex[max(0, h - 5):h]
+        vals.append(float(np.nanmean(seg)) if np.isfinite(seg).any() else None)
+    return f1, SIG.fill_share(vals, pol.th_e)
+
+
 # ── Ciclo de vida con TP, rebalanceo y gas ─────────────────────────────
 def lifecycle(S, t, usd, v, hold):
     """dict o None (sin precio). Valores en % del nocional objetivo; sin entrada → todo 0."""
@@ -159,6 +192,16 @@ def lifecycle(S, t, usd, v, hold):
         hit = E._first(ex >= v.tp) if len(ex) else -1
         if hit >= 0:
             start = k_in + hit
+    if v.tp_floor is not None:                            # piloto LLM: basis paga y funding en el piso
+        i_in = int(np.searchsorted(S.f_ts, S.ts[k_in], "right"))
+        if i_in + v.floor_n - 1 < len(S.f_ts):
+            lo = max(k_in, int(np.searchsorted(S.ts, S.f_ts[i_in + v.floor_n - 1])))
+            hi = min(t + hold, S.n - 1)
+            if lo < hi:
+                c_x = S.a + S.b * usd * frac / max(1, n)
+                hit = E._first((S.ex("sell", c_x)[lo:hi] >= v.tp_floor) & floor_mask(S, v.floor_n)[lo:hi])
+                if hit >= 0:
+                    start = min(start, lo + hit)
     outs, left, st = [], 1.0, start
     for attempt in range(4):
         out = leg(S, st, "sell", left * frac * usd, v, force=attempt == 3 or not pol.wait)
@@ -257,7 +300,7 @@ def work(job):
         rng24 = float(np.nanmax(S.ph[t - 1440:t]) / np.nanmin(S.pl[t - 1440:t]) - 1) * 100
         rows.append((t, c.p_prod, c.daily_rate, vol7, rng24))
     out = []
-    holds = {}
+    holds, fills = {}, {}
     for t, pp, dr, vol7, rng24 in rows:
         for vi, v in enumerate(vs):
             key = (v.k_neg, v.min_days, v.cap_days)
@@ -270,7 +313,11 @@ def work(job):
                 r = lifecycle(S, t, usd, v, hold)
                 if r is None:
                     continue
+                if (t, usd) not in fills:
+                    fills[(t, usd)] = fill_shares(S, t, usd, v.pol)
+                f1m, fh = fills[(t, usd)]
                 out.append({"sym": sym, "vi": vi, "usd": usd, "t_ms": int(S.ts[t]), "p_prod": pp,
+                            "fill1m": f1m, "fillh": fh,
                             "daily": dr, "vol7": vol7, "rng24": rng24,
                             "in_ms": int(S.ts[r["t_in"]]), "out_ms": int(S.ts[min(r["t_out"], S.n - 1)]),
                             "a": S.a, "b": S.b, **{k: r[k] for k in ("net", "entry", "exit", "fund", "frac",
@@ -449,6 +496,173 @@ def stage2_report(vs, df):
     print("Reporte:", path)
 
 
+# ── Reglas del piloto LLM (reports/llm_policy_pilot_20261118.md) ───────
+# Criterio fijado antes de correr. Base = política de producción (3 pagos ≤ 0, θx 0.00 / 48 h).
+#  Salida X4 pasa si (a) gate() por operación a 1,000 y 2,100 USD, o (b) cartera a 5k y 10k (6 trayectorias):
+#  %/mes medio > base, p10 mensual ≥ base − 0.05 pp y utilización ≥ base − 1 pp; además (b) se sostiene sin
+#  operaciones > +20 % (mechas). Entrada E5 (filtro de candidatos, sin re-simular): mismo (b).
+SIG_SIZES = (500.0, 1000.0, 2100.0)
+SIG_CAPS = ((5_000, 500.0), (10_000, 1000.0))
+OUTLIER = 20.0
+
+
+def variants_signals():
+    P = replace(BASE_POL, th_x=0.0, win_x=2880)
+    vs = [Var("P0 prod (3 pagos ≤ 0, θx 0.00/48 h)", P, k_neg=3)]
+    for tp in (0.2, 0.3, 0.5):
+        for n in (1, 3):
+            vs.append(Var(f"X4 basis venta ≥ +{tp:.1f} y funding en el piso ({n} pago{'s' if n > 1 else ''})",
+                          P, k_neg=3, tp_floor=tp, floor_n=n))
+    return vs
+
+
+def port_traj(g, cap, gate_fn=None):
+    t0 = g.t_ms.min()
+    res = []
+    for off in range(6):
+        start = (pd.Timestamp(t0, unit="ms") + pd.DateOffset(months=off)).value // 1_000_000
+        p = portfolio(g[g.t_ms >= start], cap, SLOTS, 1.0, gate_fn)
+        if p:
+            res.append(p)
+    if not res:
+        return None
+    allm = pd.concat([r["monthly"] for r in res])
+    return {"mean": float(np.mean([r["mean_m"] for r in res])), "p10": float(allm.quantile(0.1)),
+            "util": float(np.mean([r["util"] for r in res])), "dd": max(r["dd"] for r in res),
+            "trades": float(np.mean([r["trades"] for r in res]))}
+
+
+def port_ok(p, b):
+    return bool(p and b and p["mean"] > b["mean"] and p["p10"] >= b["p10"] - 0.05 and p["util"] >= b["util"] - 1)
+
+
+def signals_study(workers, reuse):
+    vs = variants_signals()
+    out = ROOT / "cache" / "profit_study_signals.pkl"
+    if reuse and out.exists():
+        df = pd.read_pickle(out)
+    else:
+        df = run(vs, SIG_SIZES, workers)
+        df.to_pickle(out)
+    print(f"{len(df):,} filas", flush=True)
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    L = [f"# Reglas deterministas del piloto LLM — {today}", "",
+         f"Candidatos del modelo (`p_prod` > 0) en {df.sym.nunique()} tokens solo-Alpha con velas 1m, "
+         f"{pd.to_datetime(df.t_ms.min(), unit='ms'):%Y-%m-%d} → {pd.to_datetime(df.t_ms.max(), unit='ms'):%Y-%m-%d}. "
+         "Base = política de producción (salida al 3er pago ≤ 0, salida paciente θx 0.00 / 48 h, θe 0.25 / 6 h, "
+         "tramos cada 15 min, 1x). Reglas en `analysis/signals.py` (piso del funding 0.03 %/día + 0.005).", "",
+         "**Criterio (fijado antes de correr):** X4 (salida) pasa si (a) `gate()` por operación a 1,000 y 2,100 USD "
+         "(IC 95 % símbolo×semana > 0, Δp5 ≥ −0.25 pp, ≥ 80 % trimestres) o (b) cartera de 5 cupos a 5k y 10k USD "
+         "(6 trayectorias): %/mes medio > base, p10 mensual ≥ base − 0.05 pp, utilización ≥ base − 1 pp, y (b) se "
+         f"sostiene sin operaciones > +{OUTLIER:.0f} %. E5 (filtro de entrada) se evalúa con (b).", ""]
+
+    # 1. Por operación
+    L += ["## 1. Salida: por operación", "",
+          "| política | USD | n | media | mediana | p5 | salida | días | Δ media [IC 95 %] | Δp5 | trim. | pasa (a) |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    ok_a = {}
+    for vi, v in enumerate(vs):
+        for usd in (1000.0, 2100.0):
+            g = df[(df.vi == vi) & (df.usd == usd)]
+            if g.empty:
+                continue
+            s = trade_stats(g)
+            gt = gate(paired(df, vi, usd)) if vi else None
+            if gt:
+                ok_a.setdefault(vi, []).append(gt["ok"])
+            gtxt = (f"{gt['d']:+.2f} [{gt['lo']:+.2f}, {gt['hi']:+.2f}] | {gt['dp5']:+.2f} | {gt['wins']}/{gt['total']} | "
+                    f"{'sí' if gt['ok'] else 'no'}") if gt else "— | — | — | base"
+            L.append(f"| {v.name} | {usd:,.0f} | {s['n']} | {s['mean']:+.2f} | {fmt(s['med'])} | {s['p5']:+.2f} | "
+                     f"{fmt(s['exit'])} | {fmt(s['days'], 1)} | {gtxt} |")
+
+    # 2. Cartera
+    def port_rows(label, frames, tag):
+        rows, res = [], {}
+        for cap, usd in SIG_CAPS:
+            for clean in (False, True):
+                g = frames(usd)
+                if clean:
+                    g = g[g.net <= OUTLIER]
+                p = port_traj(g, cap)
+                res[(cap, clean)] = p
+                if p:
+                    rows.append(f"| {label} | {cap:,} | {'sí' if clean else 'no'} | {p['trades']:.0f} | {p['mean']:+.2f} % | "
+                                f"{p['p10']:+.2f} % | {p['util']:.0f} % | {p['dd']:.1f} | {tag(cap, clean, p)} |")
+        return rows, res
+
+    L += ["", "## 2. Salida: cartera (5 cupos, 1x, media de 6 trayectorias)", "",
+          "| política | capital | sin > +20 % | ops | %/mes | p10 mes | utilización | DD % | vs base |",
+          "|---|---|---|---|---|---|---|---|---|"]
+    base_res = {}
+    verdict = {}
+    for vi, v in enumerate(vs):
+        def frames(usd, vi=vi):
+            return df[(df.vi == vi) & (df.usd == usd)]
+        if vi == 0:
+            rows, base_res = port_rows(v.name, frames, lambda c, cl, p: "base")
+        else:
+            rows, res = port_rows(v.name, frames,
+                                  lambda c, cl, p: "ok" if port_ok(p, base_res.get((c, cl))) else "no")
+            ok_b = all(port_ok(res[k], base_res.get(k)) for k in res)
+            verdict[vi] = bool(all(ok_a.get(vi, [False])) or ok_b)
+        L += rows
+
+    # 3. Filtro de entrada
+    base = lambda usd: df[(df.vi == 0) & (df.usd == usd)]  # noqa: E731
+    b0 = base(1000.0)
+    rho = b0[["fill1m", "fillh"]].dropna().corr(method="spearman").iloc[0, 1] if len(b0) else np.nan
+    L += ["", "## 3. Entrada: filtro por fracción de las 24 h con basis ≥ θ (sobre P0 prod)", "",
+          f"Paridad muestreo horario (prod) vs velas 1m: ρ Spearman {rho:.2f} (n {b0[['fill1m', 'fillh']].dropna().shape[0]}).", "",
+          "| filtro | medición | % candidatos | entra % (kept) | entra % (excl.) | media kept | media excl. |",
+          "|---|---|---|---|---|---|---|"]
+    filt_res = {}
+    for col in ("fillh", "fill1m"):
+        for fm in (0.3, 0.5, 0.7):
+            m = b0[col].fillna(0) >= fm
+            k, x = b0[m], b0[~m]
+            L.append(f"| ≥ {fm:.0%} | {'horaria' if col == 'fillh' else '1m'} | {m.mean() * 100:.0f} | "
+                     f"{(k.frac > 0).mean() * 100:.0f} | {(x.frac > 0).mean() * 100 if len(x) else float('nan'):.0f} | "
+                     f"{k.net.mean():+.2f} | {fmt(x.net.mean() if len(x) else None)} |")
+    L += ["", "| filtro (horaria) | capital | sin > +20 % | ops | %/mes | p10 mes | utilización | DD % | vs base |",
+          "|---|---|---|---|---|---|---|---|---|"]
+    for fm in (0.3, 0.5, 0.7):
+        def frames(usd, fm=fm):
+            g = base(usd)
+            return g[g.fillh.fillna(0) >= fm]
+        rows, res = port_rows(f"E5 fill ≥ {fm:.0%}", frames,
+                              lambda c, cl, p: "ok" if port_ok(p, base_res.get((c, cl))) else "no")
+        filt_res[fm] = all(port_ok(res[k], base_res.get(k)) for k in res)
+        L += rows
+
+    # 4. Combinación: mejor X4 que pasa + mejor E5 que pasa
+    best_x = max((vi for vi in verdict if verdict[vi]), default=None,
+                 key=lambda vi: port_traj(df[(df.vi == vi) & (df.usd == 1000.0)], 10_000)["mean"])
+    best_e = max((fm for fm in filt_res if filt_res[fm]), default=None,
+                 key=lambda fm: port_traj(b0[b0.fillh.fillna(0) >= fm], 10_000)["mean"])
+    comb_ok = None
+    if best_x is not None and best_e is not None:
+        def frames(usd):
+            g = df[(df.vi == best_x) & (df.usd == usd)]
+            return g[g.fillh.fillna(0) >= best_e]
+        rows, res = port_rows(f"{vs[best_x].name} + E5 fill ≥ {best_e:.0%}", frames,
+                              lambda c, cl, p: "ok" if port_ok(p, base_res.get((c, cl))) else "no")
+        comb_ok = all(port_ok(res[k], base_res.get(k)) for k in res)
+        L += ["", "## 4. Combinación", "", "| política | capital | sin > +20 % | ops | %/mes | p10 mes | utilización | DD % | vs base |",
+              "|---|---|---|---|---|---|---|---|---|"] + rows
+
+    L += ["", "## 5. Veredicto", ""]
+    for vi, ok in verdict.items():
+        L.append(f"- {vs[vi].name}: **{'pasa' if ok else 'no pasa'}**")
+    for fm, ok in filt_res.items():
+        L.append(f"- E5 fill ≥ {fm:.0%} (horaria): **{'pasa' if ok else 'no pasa'}**")
+    if comb_ok is not None:
+        L.append(f"- Combinación: **{'pasa' if comb_ok else 'no pasa'}**")
+    path = ROOT / "reports" / f"signal_rules_study_{today}.md"
+    path.write_text("\n".join(L) + "\n", encoding="utf-8")
+    print("\n".join(L))
+    print("Reporte:", path)
+
+
 # ── Calibración contra trades reales ───────────────────────────────────
 def calibrate():
     """Basis de entrada y de salida del modelo (ejecución inmediata, 1 swap) vs exec_json real."""
@@ -507,8 +721,12 @@ def main():
     ap.add_argument("--calibrate", action="store_true")
     ap.add_argument("--reuse", action="store_true", help="usar cache/profit_study.pkl")
     ap.add_argument("--stage2", action="store_true", help="combinaciones × leverage × capital por usuario")
+    ap.add_argument("--signals", action="store_true", help="reglas del piloto LLM → signal_rules_study")
     a = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8")
+    if a.signals:
+        signals_study(a.workers, a.reuse)
+        return
     if a.stage2:
         stage2_report(*stage2(a.workers))
         return

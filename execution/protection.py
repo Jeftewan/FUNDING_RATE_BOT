@@ -212,6 +212,11 @@ class ProtectionWatcher:
         from exchanges import trade_executor as texec
         if not reb.enabled() or prot.get("status") != "active":
             return False
+        with self.app.app_context():
+            from core.db_models import UserConfig
+            cfg = UserConfig.query.filter_by(user_id=uid).first()
+            if cfg is not None and cfg.rebalance_paused:     # botón "Pausar rebalanceo" / Config
+                return False
         mark = texec.short_health(creds, pos).get("mark")
         if not reb.due(pos, prot, mark):
             return False

@@ -250,3 +250,17 @@ def test_transfer_erc20_encodes_call(monkeypatch):
     monkeypatch.setattr(ob, "wait_receipt", lambda h: {"status": "0x0"})
     with pytest.raises(RuntimeError):
         ob.transfer_erc20({}, ob.USDT, "0x" + "ab" * 20, 1)
+
+
+def test_watcher_skips_rebalance_when_user_paused(renv, monkeypatch):
+    app, runner, uid, ex, pos_id, _ = renv
+    _rally(ex)
+    from core import db_models as m
+    from execution.protection import ProtectionWatcher
+    with app.app_context():
+        db.session.add(m.UserConfig(user_id=uid, rebalance_paused=True))
+        db.session.commit()
+    submitted = []
+    monkeypatch.setattr(runner, "submit", lambda u, kind, p: submitted.append((kind, p)) or 5)
+    ProtectionWatcher(runner).tick()
+    assert not submitted

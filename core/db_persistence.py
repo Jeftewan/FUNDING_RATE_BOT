@@ -91,6 +91,8 @@ class DBPersistence:
             "capital_source": "real" if real is not None else "manual",
             "real_balances": real,
             "auto_transfer": bool(getattr(config, "auto_transfer", False)) if config else False,
+            "tg_actions_enabled": bool(getattr(config, "tg_actions_enabled", False)) if config else False,
+            "rebalance_paused": bool(getattr(config, "rebalance_paused", False)) if config else False,
             "min_volume": config.min_volume if config else 1000000,
             "min_apr": config.min_apr if config else 10,
             "min_score": config.min_score if config else 40,
@@ -125,7 +127,7 @@ class DBPersistence:
                      "min_score", "min_stability_days", "max_positions",
                      "alert_minutes_before", "email_enabled", "tg_chat_id",
                      "allowed_exchanges", "auto_transfer", "min_net_apr", "hide_negative",
-                     "min_confidence"):
+                     "min_confidence", "tg_actions_enabled", "rebalance_paused"):
             if key in data:
                 setattr(config, key, data[key])
 

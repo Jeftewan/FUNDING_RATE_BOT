@@ -151,6 +151,10 @@ def _run_migrations(db):
         # Informes mensuales: vínculo historial → posición (funding por fecha de pago).
         # La tabla user_capital_daily la crea create_all.
         "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS position_id INTEGER",
+        # Acciones por Telegram y pausa del rebalanceo. La tabla user_signals la crea create_all.
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS tg_actions_enabled BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS tg_webhook_secret_hash VARCHAR(64) DEFAULT ''",
+        "ALTER TABLE user_configs ADD COLUMN IF NOT EXISTS rebalance_paused BOOLEAN DEFAULT FALSE",
     ]
     for sql in migrations:
         try:
