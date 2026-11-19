@@ -34,3 +34,4 @@ cache/cross/
 
 # Filas intermedias de estudios locales (regenerables)
 cache/*.pkl
+cache/llm_policy/

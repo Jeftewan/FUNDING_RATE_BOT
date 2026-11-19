@@ -133,6 +133,8 @@ class ProtectionWatcher:
             return
         if prot.get("status") not in ("active", "runner"):
             return
+        if self._maybe_rebalance(uid, pos, prot, creds, token):
+            return
 
         changed = False
         spot = dict(prot.get("spot") or {})
@@ -201,6 +203,31 @@ class ProtectionWatcher:
                            f"take profit a {tp['price']:g}, SL {prot.get('sl_price'):g}; si no toca en "
                            f"{tp['max_secs'] // 60} min se recompra.", severity="WARNING",
                  typ="SPOT_TP_RUNNER")
+        return True
+
+    def _maybe_rebalance(self, uid, pos, prot, creds, token) -> bool:
+        """Mark a REBALANCE_FRACTION del camino ancla → SL: lanza el job de rebalanceo
+        spot → margen (execution/rebalance.py). Solo con REBALANCE_ENABLED=1."""
+        from execution import rebalance as reb
+        from exchanges import trade_executor as texec
+        if not reb.enabled() or prot.get("status") != "active":
+            return False
+        with self.app.app_context():
+            from core.db_models import UserConfig
+            cfg = UserConfig.query.filter_by(user_id=uid).first()
+            if cfg is not None and cfg.rebalance_paused:     # botón "Pausar rebalanceo" / Config
+                return False
+        mark = texec.short_health(creds, pos).get("mark")
+        if not reb.due(pos, prot, mark):
+            return False
+        r = self.runner
+        f = reb.fraction(pos, prot, mark)
+        r._save_protection(pos["id"], {**prot, "rebalance_at": time.time()})
+        with self.app.app_context():
+            jid = r.submit(uid, "rebalance", {"position_id": int(pos["id"]), "symbol": pos.get("symbol", ""),
+                                              "fraction": f, "mark": mark, "token": token or {},
+                                              "trigger": "rebalance"})
+        log.info(f"rebalance {pos.get('symbol')} pos={pos['id']}: mark {mark:g}, f={f:.3f} (job #{jid})")
         return True
 
     def _check_short(self, uid, pos, creds, token) -> bool:
