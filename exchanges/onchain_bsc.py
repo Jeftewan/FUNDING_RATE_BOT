@@ -140,8 +140,15 @@ def _gas_limit(sender: str, tx: dict, hint=None) -> int:
     El `gas` del agregador se queda corto en rutas multi-hop (caso real: límite
     250k, el swap necesitaba ~364k → revert por out-of-gas). La estimación además
     simula la tx: si revertiría, lanza y no se transmite (no se quema gas).
+    Un revert simulado es `SwapReverted` (BULLA #60, job #43: "Return amount is not
+    enough" en la simulación cortó la apertura en 1 de 3 tramos sin recotizar).
     """
-    est = _estimate_gas({"from": sender, "to": tx["to"], "data": tx["data"], "value": hex(tx["value"])})
+    try:
+        est = _estimate_gas({"from": sender, "to": tx["to"], "data": tx["data"], "value": hex(tx["value"])})
+    except RuntimeError as e:
+        if "execution reverted" in str(e).lower():
+            raise SwapReverted(f"simulación revertida: {e}") from e
+        raise
     return max(int(est * GAS_BUFFER), int(hint or 0))
 
 
