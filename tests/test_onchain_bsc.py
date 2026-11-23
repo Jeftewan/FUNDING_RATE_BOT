@@ -94,6 +94,24 @@ def test_onchain_open_hedges_received_amount(chain, perp):
     assert chain.sent[0].get("_swap") is None   # primero approve acotado, luego swap
 
 
+def test_onchain_open_recotizes_after_simulated_revert(chain, perp, monkeypatch):
+    # BULLA #60 (job #43): eth_estimateGas revirtió ("Return amount is not enough") y la
+    # apertura quedó en 1 de 3 tramos. Ahora el swap se recotiza y la apertura se completa.
+    send = ob._sign_and_send
+    fails = {"n": 0}
+
+    def flaky(wallet, tx, agg=None, **kw):
+        if tx.get("_swap") and fails["n"] == 0:
+            fails["n"] += 1
+            raise ob.SwapReverted("simulación revertida: execution reverted: Return amount is not enough")
+        return send(wallet, tx, agg, **kw)
+    monkeypatch.setattr(ob, "_sign_and_send", flaky)
+    monkeypatch.setattr(ob.time, "sleep", lambda s: None)
+    res = te.execute_open(CREDS, OPP, capital=150, leverage=2, spot_leg_factory=_factory(chain))
+    assert res["ok"] and not res.get("partial_note"), res
+    assert fails["n"] == 1 and perp.short == res["perp_qty"] > 0
+
+
 def test_onchain_buy_blocked_when_dex_far_above_perp(chain, perp):
     chain.price = 2.2   # DEX 10% por encima del perp
     res = te.execute_open(CREDS, OPP, capital=150, leverage=2, spot_leg_factory=_factory(chain))
@@ -139,8 +157,17 @@ def test_gas_limit_aborts_if_simulation_reverts(monkeypatch):
     def boom(tx):
         raise RuntimeError("RPC eth_estimateGas: execution reverted")
     monkeypatch.setattr(ob, "_estimate_gas", boom)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ob.SwapReverted):      # recotizable por _swap_retry
         ob._gas_limit(WALLET["address"], {"to": "0xr", "data": "0x", "value": 0}, 250_000)
+
+
+def test_gas_limit_other_rpc_errors_are_not_reverts(monkeypatch):
+    def boom(tx):
+        raise RuntimeError("RPC eth_estimateGas: timeout")
+    monkeypatch.setattr(ob, "_estimate_gas", boom)
+    with pytest.raises(RuntimeError) as ei:
+        ob._gas_limit(WALLET["address"], {"to": "0xr", "data": "0x", "value": 0}, 250_000)
+    assert not isinstance(ei.value, ob.SwapReverted)
 
 
 def test_sign_accepts_lowercase_to(monkeypatch):

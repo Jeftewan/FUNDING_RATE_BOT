@@ -1338,6 +1338,28 @@ async function autoExecuteOpen(oppId, idx) {
     previewFirst, 'open', `Apertura ${meta.symbol}`);
 }
 
+// Apertura parcial (falló un tramo o se canceló): suma a la misma posición con el mismo
+// leverage. Siempre simula primero; el capital restante es editable.
+async function autoExecuteTopup(posId) {
+  const p = (_lastPosData?.positions || []).find(x => String(x.id) === String(posId)) || {};
+  const raw = prompt(`Completar apertura de ${p.symbol} (x${p.leverage || 1}). Capital a sumar (USD):`,
+                     String(p.topup_capital || ''));
+  if (raw === null) return;
+  const cap = parseFloat(raw);
+  if (!cap || cap <= 0) { showToast('Capital inválido', 'warning'); return; }
+  const meta = {
+    symbol: p.symbol, mode: p.mode, exchange: p.exchange, spot_venue: p.spot_venue,
+    has_spot: p.spot_venue === 'bsc' ? false : true, capital: cap, leverage: p.leverage || 1,
+    topup: true,
+  };
+  const ans = await showExecConfirm('open', meta);
+  if (ans.choice === 'cancel') return;
+  const previewFirst = ans.choice === 'dry' || p.spot_venue === 'bsc';
+  await runExec('/api/execute_open',
+    { position_id: posId, capital: cap, leverage: meta.leverage, dry_run: previewFirst, twap: ans.twap },
+    previewFirst, 'open', `Completar ${p.symbol}`);
+}
+
 async function autoExecuteClose(posId, symbol) {
   const p = (_lastPosData?.positions || []).find(x => String(x.id) === String(posId)) || {};
   const meta = {
@@ -1389,7 +1411,9 @@ function showExecConfirm(kind, meta) {
       : `<li>Vender <strong>${_fmtQty(meta.spot_qty)} ${sym}</strong> ${meta.spot_venue === 'bsc' ? 'on-chain (BSC)' : 'spot (maker → market)'} </li>
          <li>Recomprar <strong>${_fmtQty(meta.perp_qty)}</strong> del short perp por cada fill · market reduceOnly</li>`;
   }
-  const head = kind === 'open'
+  const head = kind === 'open' && meta.topup
+    ? `Vas a completar la posición abierta de ${sym}: se suman <strong>$${meta.capital}</strong> con leverage <strong>x${meta.leverage}</strong> y los seguros se re-colocan sobre el total.`
+    : kind === 'open'
     ? `Vas a abrir una posición real con <strong>$${meta.capital}</strong> de capital y leverage <strong>x${meta.leverage}</strong> (margen aislado).`
     : `Vas a cerrar la posición real de ${sym} usando las cantidades registradas.`;
   // Sugerencia de capital por confianza (backtest: sizing 1.25×/0.75× por tier). Solo informativa.
@@ -1861,6 +1885,7 @@ function renderPositions(data) {
           ${protectionBadge(p.protection)}
         </div>
         <div class="pos-header-actions">
+          ${p.topup_capital ? `<button class="btn btn-exec" onclick="autoExecuteTopup('${posId}')" title="La apertura quedó parcial: faltan $${p.topup_capital} del capital pedido">Completar apertura</button>` : ''}
           ${posIsAutoClosable(p) ? `<button class="btn btn-exec" onclick="autoExecuteClose('${posId}','${p.symbol}')" title="Cerrar colocando órdenes reales">Cerrar (auto)</button>` : ''}
           <button class="btn btn-danger" onclick="closePos('${posId}','${p.symbol}')">Cerrar</button>
         </div>

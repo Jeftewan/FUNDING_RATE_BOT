@@ -108,6 +108,19 @@ recarga de margen (`reports/margin_topup_study_20261110_bsc.md`), ejecución aut
 `cache/real_exec.pkl`, que se extrae en solo lectura de prod): cuando haya ≥ 10 ejecuciones con tramos de 15 min,
 medir ρ real con `scripts/execution_decomp.py`. Si ρ ≈ 1, volver a 45 s.
 
+### BULLA #60: apertura parcial y «Completar apertura» (2026-11-23, rama `fix/bulla-partial-topup`)
+- Job #43 (1,205 USD, 1x, 3 tramos): tramo 1 OK (201 USDT → 7,645.5 BULLA + short 7,645); en el tramo 2
+  `eth_estimateGas` simuló `Return amount is not enough` (precio movido > 0.2 % de slippage). Era `RuntimeError`, no
+  `SwapReverted` → `_swap_retry` no recotizó y la apertura quedó en 33 % (`filled_ratio` 0.3345). Sin gas ni exposición.
+- Fix: `onchain_bsc._gas_limit` convierte un revert simulado en `SwapReverted` (se recotiza 2 veces).
+- **Completar apertura**: `/api/positions` expone `topup_capital` (capital pedido del job − `capital_used`, si
+  falta ≥ max(10 USD, 5 %)); botón en la tarjeta → `/api/execute_open` con `position_id` (mismo leverage, salta
+  el guard de "una posición por símbolo", misma espera de basis). `jobs._finish_topup` suma piernas/fees/capital,
+  promedia precios de entrada por cantidad (`payments_json` kind `topup`), cancela los seguros y los re-coloca
+  sobre el total (si alguno se llenó durante la ejecución, no los re-coloca y alerta). La reconciliación
+  automática no soporta top-ups. `_pos_to_dict` ahora incluye `job_id` (el fallback de `position_token` lo usaba).
+  Tests: `tests/test_topup.py`.
+
 ### ARIA #56: token Alpha offline y leverage Alpha 1x (2026-11-10)
 - SL disparado (trigger 0.21011, llenó +0.33 %) y venta Kyber llenada; el cierre del vigilante falló porque ARIA pasó a
   `offline`. Liquidada con `scripts/settle_position.py --pos N --railway [--apply]` → `user_history` #52: funding

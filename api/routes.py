@@ -12,6 +12,10 @@ from exchanges.net import egress_status
 
 log = logging.getLogger("bot")
 
+# «Completar apertura»: se ofrece si falta al menos esto del capital pedido.
+TOPUP_MIN_USD = 10.0
+TOPUP_MIN_FRAC = 0.05
+
 api = Blueprint("api", __name__)
 
 
@@ -370,6 +374,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 positions_list = []
                 summary = {"total": 1000, "used": 0, "available": 1000, "count": 0, "max_positions": 5}
                 real_by_sym, drift_by_pos = {}, {}
+            topup_left = _topup_left(positions_list)
 
             pdata = []
             now = time.time()
@@ -488,6 +493,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     # funding futuro esperado ya no compensa.
                     "outlook_net_apr": (outlook.get(f"{pos.get('symbol')}_{pos.get('exchange')}")
                                         or {}).get("pred"),
+                    "topup_capital": topup_left.get(str(pos.get("id"))),
                 })
 
             # Calculate total_earned from active positions
@@ -843,7 +849,9 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
     def api_execute_open():
         """Open a position by placing real orders (CEX perp + spot CEX/BSC).
 
-        Body: {opportunity_id, capital, leverage, dry_run?, twap?:{slices,duration_s}}.
+        Body: {opportunity_id, capital, leverage, dry_run?, twap?:{slices,duration_s},
+        position_id?}. Con position_id («Completar apertura»): suma a esa posición auto
+        (mismo símbolo y leverage) en vez de abrir otra.
         dry_run → simulación síncrona (rápida). Real → crea un ExecutionJob y
         devuelve {job_id}; el frontend hace polling de /api/exec/jobs/<id>.
         """
@@ -862,7 +870,16 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             return jsonify({"ok": False, "msg": "DB no disponible"}), 400
         dbp = get_db_persist()
 
-        opp = _find_opp(opp_id)
+        topup = None
+        if data.get("position_id") not in (None, ""):
+            topup, err = _topup_position(uid, dbp, data.get("position_id"))
+            if err:
+                return jsonify({"ok": False, "msg": err})
+            leverage = int(topup.get("leverage") or 1)   # margen aislado: un leverage por símbolo
+
+        opp = _find_opp(opp_id) if opp_id else None
+        if topup:
+            opp = _topup_opp(topup, opp)
         if not opp:
             return jsonify({"ok": False, "msg": "Oportunidad no encontrada"})
         mode = opp.get("mode", "spot_perp")
@@ -894,17 +911,24 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 return jsonify({"ok": False, "code": "NO_WALLET",
                                 "msg": "Este token solo tiene spot on-chain (BSC). Configura tu wallet "
                                        "BSC dedicada en Cuenta para operarlo."})
+            if topup and (spot_venue == "bsc") != (topup.get("spot_venue") == "bsc"):
+                return jsonify({"ok": False, "msg": "El spot de este par cambió de venue desde la apertura; "
+                                "no se puede completar sobre la misma posición."})
+            if topup and spot_venue == "bsc":
+                from execution.jobs import position_token
+                token = position_token(topup) or token
 
         user_state = dbp.load_user_state(uid)
         # Una posición basyo por símbolo en Binance (one-way aislado agrega por símbolo).
-        if is_binance_sp and any(
+        if is_binance_sp and not topup and any(
                 p.get("symbol") == opp.get("symbol") and (p.get("exchange") or "").lower() == "binance"
                 for p in user_state.get("positions", [])):
             return jsonify({"ok": False, "msg": f"Ya tienes una posición en {opp.get('symbol')} en "
                             "Binance; ciérrala antes de abrir otra en el mismo símbolo."})
         merged = {
             "total_capital": user_state.get("total_capital", 1000),
-            "max_positions": user_state.get("max_positions", 5),
+            # El top-up no abre una posición nueva: no cuenta contra el máximo.
+            "max_positions": 10 ** 9 if topup else user_state.get("max_positions", 5),
             "positions": user_state.get("positions", []),
             "history": user_state.get("history", []),
             "total_earned": user_state.get("total_earned", 0),
@@ -936,6 +960,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
         if job_runner.armed_open_for_symbol(uid, opp.get("symbol")):
             return jsonify({"ok": False, "msg": f"Ya hay una apertura de {opp.get('symbol')} esperando basis."})
+        if topup and job_runner.active_job_for_position(uid, topup["id"], include_armed=True):
+            return jsonify({"ok": False, "msg": "Esta posición ya tiene una ejecución en curso o en espera."})
 
         # Fondos en la wallet correcta (y transfer automático si está habilitado).
         if is_binance_sp:
@@ -951,11 +977,71 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         }
         if wait:
             params["wait"] = wait
+        if topup:
+            # position_id liga el job a la posición: un cierre o un seguro disparado lo cancela.
+            params.update(topup_of=int(topup["id"]), position_id=int(topup["id"]))
         jid = job_runner.submit_exclusive(uid, "open", params)
         if jid is None:
             return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
-        log.info(f"Exec job #{jid} open {opp.get('symbol')} user={uid} cap={capital} lev={leverage} twap={twap}")
+        log.info(f"Exec job #{jid} open {opp.get('symbol')} user={uid} cap={capital} lev={leverage} twap={twap}"
+                 + (f" topup_of={topup['id']}" if topup else ""))
         return jsonify({"ok": True, "job_id": jid})
+
+    def _topup_left(positions):
+        """{pos_id: USD} que faltan para el capital pedido en la apertura auto (una apertura
+        parcial: falló un tramo o se canceló). Alimenta «Completar apertura»."""
+        auto = {int(p["job_id"]): p for p in positions
+                if p.get("source") == "auto" and p.get("job_id") and p.get("mode") == "spot_perp"
+                and (p.get("exchange") or "").lower() == "binance"}
+        if not auto:
+            return {}
+        out = {}
+        try:
+            from core.db_models import ExecutionJob
+            for j in ExecutionJob.query.filter(ExecutionJob.id.in_(list(auto))).all():
+                p = auto[j.id]
+                asked = float((j.params_json or {}).get("capital") or 0)
+                left = asked - float(p.get("capital_used") or 0)
+                if left >= max(TOPUP_MIN_USD, asked * TOPUP_MIN_FRAC):
+                    out[str(p["id"])] = round(left, 2)
+        except Exception as e:
+            log.warning(f"topup_left: {e}")
+        return out
+
+    def _topup_position(uid, dbp, pos_id):
+        """(posición, error) para «Completar apertura»: solo una posición auto spot_perp de
+        Binance activa y con cantidades reales (las piernas se suman a ellas)."""
+        from core.db_models import UserPosition
+        try:
+            row = UserPosition.query.filter_by(id=int(pos_id), user_id=uid, status="active").first()
+        except (ValueError, TypeError):
+            row = None
+        if not row:
+            return None, "Posicion no encontrada"
+        pos = dbp._pos_to_dict(row)
+        if pos.get("source") != "auto" or pos.get("mode") != "spot_perp" \
+                or (pos.get("exchange") or "").lower() != "binance":
+            return None, "Solo se puede completar una posición spot_perp de Binance abierta en automático."
+        if not pos.get("spot_qty") or not pos.get("perp_qty"):
+            return None, "La posición no tiene cantidades reales registradas."
+        return pos, None
+
+    def _topup_opp(pos, opp):
+        """Oportunidad del top-up: la del último scan si es el mismo par; si el par ya no
+        sale en el scan, una mínima desde la posición (la ejecución solo usa símbolo,
+        exchange, modo y precio de referencia)."""
+        if opp and opp.get("symbol") == pos.get("symbol") \
+                and (opp.get("exchange") or "").lower() == (pos.get("exchange") or "").lower():
+            return opp
+        with state_manager.lock:
+            opp = next((dict(o) for o in state_manager.state.get("opportunities", [])
+                        if o.get("symbol") == pos.get("symbol") and o.get("mode") == "spot_perp"
+                        and (o.get("exchange") or "").lower() == (pos.get("exchange") or "").lower()), None)
+        if opp:
+            return opp
+        return {"symbol": pos["symbol"], "exchange": pos["exchange"], "mode": "spot_perp",
+                "price": pos.get("entry_price") or 0, "funding_rate": pos.get("entry_fr") or 0,
+                "interval_hours": pos.get("ih") or 8, "spot_venue": pos.get("spot_venue") or ""}
 
     def _wallet_check(uid, creds, capital, leverage, spot_venue, user_state, do_transfer=False):
         """Verifica USDT en spot (o wallet BSC) y margen en futuros; transfiere si procede."""
@@ -1068,7 +1154,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
         wait = _execution_wait(pos.get("spot_venue"), "sell")
         if job_runner.active_job_for_position(uid, db_pos_id, include_armed=True):
-            return jsonify({"ok": False, "msg": "Esta posición ya tiene un cierre en curso o en espera."})
+            return jsonify({"ok": False, "msg": "Esta posición ya tiene una ejecución (cierre o «Completar "
+                            "apertura») en curso o en espera; cancélala antes de cerrar."})
         if not wait and job_runner.active_job(uid):
             return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
         close_params = {"position_id": db_pos_id, "symbol": pos.get("symbol"), "twap": twap, "token": token}
