@@ -1,8 +1,56 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-11-17** (rentabilidad real, informes mensuales y revisión del modelo, rama `feat/returns-reports-model`).
+Estado del proyecto al **2026-11-24** (revisión de la operación real, rama `feat/ops-review`).
 
 ---
+
+## Revisión de la operación real (2026-11-24, rama `feat/ops-review`)
+
+`scripts/ops_review.py --fetch db|binance|chain [--railway]` (solo lectura: DB, `userTrades`/`income` de Binance con
+las keys de cada usuario, transferencias BEP-20 de las wallets manuales vía RPC NodeReal de chainlist en ventanas de
+±3 h; `OPS_MANUAL_WALLETS` en `.env`) → `cache/ops_review/` (privado, gitignored); `scripts/ops_review_report.py` →
+`reports/ops_review_20261124.md`. Usuarios 2 y 4 comparten la misma cuenta Binance.
+- **Cubrir con el mismo USDT (era manual) vs la misma cantidad (API): no cambiar.** Cantidad − USDT = −b₀·(r − 1):
+  solo un delta residual de b₀; ambas pagan igual la basis de entrada y de salida. 10 manuales reconstruidos:
+  delta −11.8 USD; backtest 25,855 operaciones: Δ +0.010 pp, 3/5 trimestres → no pasa. El bot de Binance cubre por
+  cantidad. El motor (`_exec_engine`) valúa como USDT igual; prod opera cantidad igual (indiferente).
+- **La basis en la era manual existía pero no se medía** (`price_pnl` vacío; funding de la DB estimado 411 vs 391
+  real). Costo de precio por operación similar en ambas eras (~0.6–0.8 % del nocional, sobre todo **basis de
+  salida**). La era manual rindió más (2.2 %/mes sin el trade afortunado ESPORTS #33) por **funding ~1.7× mayor**
+  (0.19 vs 0.11 %/día del nocional) y **tenencias el doble** (21 vs 10 d).
+- **caoviedor (user 5)**: funding +1.55 %/mes, fees −0.14, precio −0.87 → +0.53 %/mes; 62 % de la pérdida de precio
+  es el SL de ARIA a 2x. 3 %/mes no es alcanzable a 1x en este régimen.
+- **Espera de basis**: entre la lectura que dispara y el llenado la basis cae −0.37 pp (n=5); la basis horaria
+  revierte (≥ 0.25 % con media 0.65 → 0.38 la hora siguiente). Reloj del settlement: sin efecto (descartado).
+  Pendiente: registrar cada lectura del probe (hoy `progress_json` se pisa) y revisar `FIRE_BASIS_MARGIN`
+  (permite ejecutar hasta θ − 0.25). ρ sigue sin medirse (ningún tramo guardó `recovery` utilizable).
+- La caché de velas 1m (`cache/binance/klines1m`) ya no está en disco: `exec_study --fetch` la re-baja.
+- Tests: `tests/test_ops_review.py`.
+
+**Decisión (2026-11-24): sin cambios de estrategia.** Se mantienen la espera de entrada (θ 0.25 / 6 h) y de
+salida (θ 0 / 48 h), el leverage libre en Alpha (decisión del usuario) y los umbrales fijos (el perfil o umbral por
+token se descartó: el token mediano alcanza 0.25 % en 6 h el 79 % de las veces; los jobs reales dispararon en
+< 20 min; lo lento son las salidas). Sí se arreglaron dos bugs y se instrumentó la espera:
+- **El ticker de Binance futuros no trae bid/ask.** `trade_executor._top_of_book` caía a `last`, así que el
+  `BasisProbe` leía la basis sobre `last` y no sobre el bid/ask. En `BscSpotLeg`, además, `pb = 0` apagaba la guarda
+  por tramo `ONCHAIN_MAX_BASIS`, `_perp_ref` quedaba en `None` y `recovery_tick` guardaba `None` (ρ nunca se midió).
+  Ahora `trade_executor.book_bid_ask` (bookTicker → libro) da el bid/ask. Efecto: las lecturas del probe bajan
+  ~½ spread (más conservadoras) y la guarda por tramo vuelve a actuar.
+- **Lecturas de la espera**: `progress_json.reads` y, al disparar, `params.wait_reads` (últimas `MAX_WAIT_READS` =
+  500) + `params.first_read` (la lectura al pedir). `ops_review_report.jobs_table` las muestra (`at_request`,
+  `wait_max`); `execution_decomp` usa `perp_ref` por tramo.
+
+**Regla pre-registrada** (evaluar con ≥ 20 ejecuciones instrumentadas o el 2027-01-15, lo que ocurra primero;
+`ops_review --fetch db` + `execution_decomp.py` + informe):
+- Entradas: se mantiene la espera si la basis realizada de los jobs con espera supera a `first_read` menos la caída
+  media medida, con IC 95 % bootstrap > 0. Si no, se ejecuta al pedir. Si la caída disparo → primer tramo es
+  ≤ −0.15 pp en la mediana, `FIRE_BASIS_MARGIN` pasa de 0.25 a 0.10.
+- Salidas: se mantiene la espera de 48 h si la basis realizada supera en ≥ 0.10 pp a `first_read`, neta del funding
+  de la espera. Si no, la espera de salida se acorta a 6 h.
+- Pausa entre tramos: con ≥ 10 tramos con ρ medido se aplica la regla de "Metodología de ejecución" (ρ ≈ 1 → 45 s).
+
+**Modelo: no re-entrenar todavía.** Chequeo el **2026-12-02**: `binance_dataset.py`, `ml_health.py
+--refresh-cache`, `ml_v2.py --refresh`, `live_performance.py`. Se promueve solo si pasa el gate (WF y hold-out).
 
 ## Pérdida por operación y meta mensual (2026-11-17, rama `feat/profit-per-trade`)
 

@@ -453,3 +453,55 @@ def test_close_job_after_sl_resolves_offline_token(env, monkeypatch):  # noqa: F
     _run_sync(runner, app, uid, "close", {"position_id": pos_id, "symbol": "XYZ", "token": {},
                                           "twap": {"slices": 1, "duration_s": 0}, "trigger": "protection"})
     assert seen["token"]["address"] == TOKEN["address"]
+
+
+# ── ops_review 2026-11-24: el ticker de futuros de Binance no trae bid/ask ─────────
+def _binance_like_ticker(monkeypatch, perp):
+    monkeypatch.setattr(perp, "fetch_ticker", lambda s: {"bid": None, "ask": None, "last": 2.0})
+
+
+def test_top_of_book_uses_book_when_ticker_has_no_bid_ask(perp, monkeypatch):
+    _binance_like_ticker(monkeypatch, perp)
+    assert te._top_of_book(perp, "XYZ/USDT:USDT")[:2] == (2.0, 2.002)
+
+
+def test_buy_guard_uses_book_bid(chain, perp, monkeypatch):
+    """Con pb = 0 la guarda px > pb·(1+ONCHAIN_MAX_BASIS) no actuaba: el tramo compraba igual."""
+    _binance_like_ticker(monkeypatch, perp)
+    perp.book["XYZ/USDT:USDT"] = (1.0, 1.001)        # on-chain ~2.0 → muy sobre el perp
+    leg = _leg(chain, perp)
+    before = chain.bal[ob.USDT.lower()]
+    assert leg.trade("buy", 10, MagicMock(), None, True) == 0.0
+    assert chain.bal[ob.USDT.lower()] == before
+
+
+def test_recovery_reads_perp_from_book(chain, perp, monkeypatch):
+    _binance_like_ticker(monkeypatch, perp)
+    leg = _leg(chain, perp)
+    leg.swaps = [{"side": "buy", "perp_ref": 2.0}]
+    leg.recovery_tick(0)
+    mark = leg.swaps[0]["recovery"][0]
+    assert mark["perp"] == 2.0 and mark["mid"] is not None
+
+
+def test_armed_keeps_wait_reads(env, monkeypatch):  # noqa: F811
+    app, runner, _, uid = env
+    jid = _armed(app, uid)
+    monkeypatch.setattr(runner, "_make_probe", lambda job: Probe(-0.5, 0.1, 0.3))
+    monkeypatch.setattr(runner, "_run", MagicMock())
+    runner._watch_armed(jid)
+    _, params, _ = _status(app, jid)
+    assert [r["basis_pct"] for r in params["wait_reads"]] == [-0.5, 0.1, 0.3]
+    assert params["first_read"]["basis_pct"] == -0.5
+
+
+def test_wait_reads_are_capped(env, monkeypatch):  # noqa: F811
+    app, runner, _, uid = env
+    jid = _armed(app, uid)
+    monkeypatch.setattr(J, "MAX_WAIT_READS", 3)
+    monkeypatch.setattr(runner, "_make_probe", lambda job: Probe(-0.5, -0.4, -0.3, -0.2, 0.3))
+    monkeypatch.setattr(runner, "_run", MagicMock())
+    runner._watch_armed(jid)
+    _, params, _ = _status(app, jid)
+    assert [r["basis_pct"] for r in params["wait_reads"]] == [-0.3, -0.2, 0.3]
+    assert params["first_read"]["basis_pct"] == -0.5
