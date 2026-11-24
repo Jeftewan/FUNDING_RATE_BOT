@@ -487,10 +487,9 @@ class BscSpotLeg:
             return 0.0
         tok, dec = self.token["address"], self.token["decimals"]
         if side == "buy":
-            try:
-                pb = float(self.perp_cli.fetch_ticker(self.perp_sym).get("bid") or 0)
-            except Exception:
-                pb = 0
+            pb = self._perp_book()[0]
+            if not pb:
+                log.warning(f"on-chain {self.token['symbol']}: sin bid del perp, la guarda de basis no aplica")
             px = self.quote_price(target_base, "buy", ref_px=pb)
             if px and pb and px > pb * (1 + ONCHAIN_MAX_BASIS):
                 log.info(f"on-chain {self.token['symbol']} px {px:.6g} > perp bid {pb:.6g}·(1+{ONCHAIN_MAX_BASIS}) — no compra")
@@ -509,10 +508,7 @@ class BscSpotLeg:
         if amt <= 0:
             return 0.0
         if not self.naked:
-            try:
-                self._perp_ref = float(self.perp_cli.fetch_ticker(self.perp_sym).get("ask") or 0) or None
-            except Exception:
-                self._perp_ref = None
+            self._perp_ref = self._perp_book()[1] or None
             spent, got, txh = self._swap_retry(tok, dec, USDT, USDT_DECIMALS, amt)
             on_fill(txh, {"gross": spent, "cost": got, "avg": got / spent if spent else 0,
                           "fee_usd": 0.0, "fee_base": 0.0}, spent)
@@ -587,6 +583,11 @@ class BscSpotLeg:
         return {"slices": n, "duration_s": n * SLICE_GAP if n > 1 else 0, "suggest": n > 1,
                 "measured": imp is not None, "impact_pct": round(imp * 100, 4) if imp is not None else None}
 
+    def _perp_book(self):
+        """(bid, ask) del perp; (0, 0) si no se pudo leer. El ticker de futuros no trae bid/ask."""
+        from exchanges.trade_executor import book_bid_ask
+        return book_bid_ask(self.perp_cli, self.perp_sym)
+
     def recovery_tick(self, elapsed: float):
         """Durante la pausa entre tramos: mid y perp en RECOVERY_MARKS tras el último swap, para
         medir cuánto se recupera el pool (ρ). Solo auditoría: un fallo deja None y no interrumpe."""
@@ -598,8 +599,8 @@ class BscSpotLeg:
             return
         mid = perp = None
         try:
-            ticker = self.perp_cli.fetch_ticker(self.perp_sym)
-            perp = float(ticker.get("bid" if swap["side"] == "buy" else "ask") or 0) or None
+            bid, ask = self._perp_book()
+            perp = (bid if swap["side"] == "buy" else ask) or None
             mid = self.mid_price(perp or swap.get("perp_ref"))
         except Exception as e:
             log.info(f"recuperación {self.token.get('symbol')}: {e}")

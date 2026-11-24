@@ -35,6 +35,9 @@ PATIENT_EXIT_BASIS = 0.0
 # Guarda al ir a operar tras una espera: θ − margen. Con pausa de 15 min, θ entre 0 y 0.25 rinde
 # casi igual, así que solo se aborta si el basis cayó claramente por debajo de lo evaluado.
 FIRE_BASIS_MARGIN = 0.25
+# Lecturas de la espera que se guardan (progress_json y, al disparar, params): la primera (al pedir) y
+# las últimas N. Miden la caída lectura → llenado (reports/ops_review_20261124.md).
+MAX_WAIT_READS = 500
 
 
 def wait_params(side: str) -> dict:
@@ -141,10 +144,14 @@ class JobRunner:
     # ── Ejecución en espera de basis ───────────────────────────────────
     def _watch_armed(self, jid):
         probe = None
+        reads = first = None
         while True:
             job = self._load(jid)
             if not job or job["status"] != _ARMED:
                 return
+            if reads is None:
+                reads = list(job["params"].get("wait_reads") or [])
+                first = job["params"].get("first_read")
             try:
                 wait = job["params"]["wait"]
                 if self._cancelled(jid):
@@ -154,7 +161,7 @@ class JobRunner:
                         and not self._load_pos(job["params"]["position_id"]):
                     self._update(jid, status="cancelled", error="La posición ya no está activa")
                     return
-                if wait.get("force") and self._fire(job):
+                if wait.get("force") and self._fire(job, reads=reads, first=first):
                     return
                 if time.time() >= float(wait["deadline"]):
                     self._expire(job)
@@ -162,9 +169,15 @@ class JobRunner:
                 if not wait.get("force"):
                     probe = probe or self._make_probe(job)
                     read = probe.read()
+                    entry = {"ts": round(time.time()), "basis_pct": read.get("basis_pct"),
+                             "px": read.get("px"), "perp": read.get("perp")}
+                    first = first or entry
+                    reads = (reads + [entry])[-MAX_WAIT_READS:]
                     self._update(jid, progress_json={"phase": "armed", **read, "theta": wait["theta"],
-                                                     "deadline": wait["deadline"]})
-                    if read["basis_pct"] is not None and read["basis_pct"] >= wait["theta"] and self._fire(job, read):
+                                                     "deadline": wait["deadline"], "first_read": first,
+                                                     "reads": reads})
+                    if (read["basis_pct"] is not None and read["basis_pct"] >= wait["theta"]
+                            and self._fire(job, read, reads=reads, first=first)):
                         return
             except Exception as e:
                 log.warning(f"armed job {jid}: {e}")
@@ -185,9 +198,10 @@ class JobRunner:
         return texec.basis_probe(creds, pos["exchange"], pos["symbol"], factory, "sell",
                                  base=float(pos["spot_qty"]))
 
-    def _fire(self, job, read=None) -> bool:
+    def _fire(self, job, read=None, reads=None, first=None) -> bool:
         """Pasa a ejecución si el usuario no tiene otro job corriendo. False → sigue en espera.
-        `read`: lectura que disparó; queda en params para auditar contra lo ejecutado."""
+        `read`: lectura que disparó; `reads`/`first`: lecturas de la espera. Quedan en params para
+        auditar contra lo ejecutado."""
         jid = job["id"]
         with self._submit_lock:
             with self.app.app_context():
@@ -196,6 +210,10 @@ class JobRunner:
             params = {**job["params"], "fired_at": time.time()}
             if read:
                 params["fire_read"] = read
+            if reads:
+                params["wait_reads"] = reads
+            if first:
+                params["first_read"] = first
             self._update(jid, status="queued", params_json=params)
         threading.Thread(target=self._run, args=(jid,), daemon=True, name=f"job-{jid}").start()
         return True
