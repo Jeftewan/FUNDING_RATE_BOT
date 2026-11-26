@@ -68,6 +68,7 @@ _alpha_cache = {"ts": 0.0, "by_symbol": {}, "any_by_symbol": {}}
 _SEL_BALANCE_OF = "0x70a08231"
 _SEL_ALLOWANCE = "0xdd62ed3e"
 _SEL_APPROVE = "0x095ea7b3"
+_SEL_TRANSFER = "0xa9059cbb"
 
 
 def enabled() -> bool:
@@ -316,6 +317,17 @@ def _sign_and_send(wallet: dict, tx: dict, aggregator=None, allow_public: bool =
 
 def _approve_data(spender: str, amount: int) -> str:
     return _SEL_APPROVE + _addr_arg(spender) + hex(amount)[2:].rjust(64, "0")
+
+
+def transfer_erc20(wallet: dict, token: str, to: str, amount_wei: int) -> str:
+    """transfer(to, amount) firmado con la wallet dedicada; espera el receipt. Un envío a
+    una dirección propia no es sandwicheable: puede salir por el RPC público."""
+    data = _SEL_TRANSFER + _addr_arg(to) + hex(int(amount_wei))[2:].rjust(64, "0")
+    txh = _sign_and_send(wallet, {"to": token, "data": data, "value": 0})
+    rc = wait_receipt(txh)
+    if int(str(rc.get("status") or "0x0"), 16) != 1:
+        raise RuntimeError(f"transferencia {txh} revertida")
+    return txh
 
 
 # ── Pierna spot on-chain ────────────────────────────────────────────────────

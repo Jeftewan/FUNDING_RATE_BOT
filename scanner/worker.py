@@ -423,6 +423,9 @@ class ScannerWorker:
                 )
                 continue
 
+            actions = cfg.get("tg_actions_enabled") and self._flask_app
+            if actions:
+                self._tg_actions(uid, user_alerts, "attach")
             try:
                 sent_total += self.email_notifier.send_alerts(
                     user_alerts,
@@ -431,8 +434,25 @@ class ScannerWorker:
                 )
             except Exception as e:
                 log.error(f"Telegram send failed for user {uid}: {e}")
+            if actions:
+                self._tg_actions(uid, user_alerts, "record_sent")
 
         return sent_total
+
+    def _tg_actions(self, uid, alerts, step):
+        """Botones de Telegram (notifications/tg_actions.py): attach antes de enviar,
+        record_sent después. Un fallo solo deja la alerta sin botones."""
+        from notifications import tg_actions
+        fn = getattr(tg_actions, step)
+        for a in alerts:
+            if not (a.get("action") or a.get("type") in tg_actions.REBALANCE_TYPES):
+                continue
+            try:
+                with self._flask_app.app_context():
+                    fn(uid, a) if step == "attach" else fn(a)
+            except Exception as e:
+                log.warning(f"tg_actions.{step} {a.get('type')} user={uid}: {e}")
+                a.pop("reply_markup", None)
 
     def _load_user_telegram_config(self, user_id) -> dict:
         """Load a user's Telegram config from DB."""
@@ -448,6 +468,7 @@ class ScannerWorker:
                     "email_enabled": us.get("email_enabled", False),
                     "tg_chat_id": us.get("tg_chat_id", ""),
                     "tg_bot_token": us.get("tg_bot_token", ""),
+                    "tg_actions_enabled": us.get("tg_actions_enabled", False),
                 }
         except Exception as e:
             log.error(f"Failed to load Telegram config for user {user_id}: {e}")
@@ -1635,6 +1656,8 @@ class ScannerWorker:
                                     f"salida se pagan igual: cerrar ahora evita pagar funding."
                                     + pred_txt),
                     })
+                    if pos.get("source") in ("auto", "imported") and pid:
+                        alerts[-1]["action"] = {"kind": "CLOSE_SUGGESTED", "position_id": int(pid)}
             elif (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
                 key = f"RATE_REVERSAL_{sym}_{display_ex}_{uid}_{pid}"
                 active_keys.add(key)

@@ -921,12 +921,14 @@ def _protection_clients(creds_by_exchange, position):
 
 
 def place_protection(creds_by_exchange: dict, position: dict, ctx: ExecContext = None,
-                     wallet: dict = None, token: dict = None) -> dict:
+                     wallet: dict = None, token: dict = None, anchor: float = None) -> dict:
     """Coloca SL (STOP_MARKET closePosition, mark price) + venta límite del spot.
 
     Cada pierna es independiente: si una falla, la otra se conserva y el error
     queda en `errors`. Devuelve el dict a persistir en user_positions.protection_json
     (ok=False si no se pudo colocar ninguna).
+    `anchor`: precio desde el que se mide el camino a liquidación en vez de la entrada
+    (tras un rebalanceo spot→margen la liquidación se re-ancla al precio del rebalanceo).
     """
     ctx = ctx or ExecContext()
     try:
@@ -942,14 +944,17 @@ def place_protection(creds_by_exchange: dict, position: dict, ctx: ExecContext =
         _, mmr = binance_max_leverage(perp_cli, perp_sym)
         liq = liquidation_estimate(entry, position.get("leverage") or 1, mmr or 0.004)["liq_price"]
         liq_source = "estimate"
-    if not entry or not liq or liq <= entry:
-        return {"ok": False, "msg": f"No se pudo determinar entrada/liquidación (entry={entry}, liq={liq})"}
-    sl = float(perp_cli.price_to_precision(perp_sym, protection_price(entry, liq)))
+    base = float(anchor or 0) or entry
+    if not base or not liq or liq <= base:
+        return {"ok": False, "msg": f"No se pudo determinar entrada/liquidación (entry={base}, liq={liq})"}
+    sl = float(perp_cli.price_to_precision(perp_sym, protection_price(base, liq)))
     sp = protection_spot_price(sl)
     prot = {"status": "active", "sl_price": sl, "spot_price": sp, "liq_price": liq,
             "liq_source": liq_source, "entry_price": entry, "fraction": PROTECTION_LIQ_FRACTION,
             "spot_offset": PROTECTION_SPOT_OFFSET, "placed_at": time.time(),
             "perp": None, "spot": None, "errors": []}
+    if anchor:
+        prot["anchor"] = base
 
     try:
         params = {"closePosition": True, "workingType": "MARK_PRICE", "triggerPrice": sl}
@@ -1231,6 +1236,13 @@ def short_health(creds_by_exchange: dict, position: dict) -> dict:
             out["liq_distance_pct"] = round((out["liq"] - out["mark"]) / out["mark"] * 100, 2)
         break
     return out
+
+
+def add_isolated_margin(creds_by_exchange: dict, position: dict, amount: float) -> dict:
+    """Agrega `amount` USDT al margen aislado del short (/fapi/v1/positionMargin, type=1)."""
+    _, perp_cli, _, perp_sym = _protection_clients(creds_by_exchange, position)
+    params = {"positionSide": "SHORT"} if _is_hedged(perp_cli, perp_sym) is True else {}
+    return perp_cli.add_margin(perp_sym, float(amount), params)
 
 
 def cancel_protection(creds_by_exchange: dict, position: dict, wallet: dict = None) -> dict:
