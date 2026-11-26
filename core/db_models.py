@@ -334,6 +334,12 @@ class MarketFeatureSnapshot(db.Model):
     volatility_7d = db.Column(db.Float)          # std de 7 log-retornos diarios del perp
     spot_source = db.Column(db.String(8))        # "cex" (book Binance) | "alpha" (VWAP 5 velas 1m on-chain)
     alpha_liquidity_usd = db.Column(db.Float)    # liquidez del pool según la lista Alpha (solo online)
+    # Lo que la UI mostró esa hora (validación en vivo del consenso, scripts/consensus_live.py).
+    model_prediction = db.Column(db.Float)
+    rel_width = db.Column(db.Float)
+    consensus = db.Column(db.Float)              # 1–10
+    consensus_p = db.Column(db.Float)            # P(APR realizado ≥ predicho), tabla v2
+    consensus_version = db.Column(db.String(20))
     captured_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
                             nullable=False)
 

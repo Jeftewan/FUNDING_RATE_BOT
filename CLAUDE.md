@@ -1,8 +1,33 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-11-24** (revisión de la operación real, rama `feat/ops-review`).
+Estado del proyecto al **2026-11-26** (consenso calibrado contra el éxito real, rama `feat/consensus-calibrated`).
 
 ---
+
+## Consenso calibrado contra el éxito real (2026-11-26, rama `feat/consensus-calibrated`)
+
+Pedido: que consenso k signifique "en k×10 % de los casos parecidos se cumplió lo esperado". Éxito = APR neto
+realizado (salida al 3.er pago ≤ 0, tope 30 d; costo Alpha 0.41 % fees + 0.70 % precio real, CEX 0.30 %) ≥
+APR neto predicho. `scripts/consensus_study.py` → `reports/consensus_study_20261126.md` (+ `_cal180`): analistas
+por deciles → pool logit L2 → Venn-Abers inductivo (Satopää 2016; Vovk & Petej 2014), HistGB como techo,
+walk-forward mensual con purga 31 d, 12 meses, señales de 365 d (`signals_dataset.py --days 365`).
+- **No pasa → no se exporta tabla v2; el consenso vigente queda igual.** B peor que la tasa base (ΔBrier
+  +0.0064, ECE 0.116); con 180 d de calibración (post-hoc) +2.6 % BSS y falla con el motor.
+- **Causa**: el modelo está sobre-disperso (decil alto predice 45.7 % → rinde 31.1 %; bajo 1.2 % → 4.5 %), así
+  que cumplir lo predicho cae de 61 % a 29 % del quintil bajo al alto y depende del régimen del mes. Tasa base
+  44 %. El consenso vigente sí ordena cuánto rinde (APR real 7.0 → 20.8 %, gana 72 → 91 %) y su sizing gana
+  (32.4 vs 25.9 % anual). El consenso vigente **no** ordena la P de cumplir (su isotónica queda plana).
+- Descartados: `hit7` (acierto reciente del modelo) y Δmultitud 14 d — fuertes este año, nulos el anterior;
+  `basis_chg_24h` por paridad (ρ 0.59 en `signals_dataset --check`).
+- **Censura**: filas sin 30 d de horizonte observable se excluyen (sin eso el último mes da éxito 2 %); el mismo
+  sesgo afecta los hold-out de `ml_v2`/`confidence_study`.
+- **Registro en vivo** (nuevo): `market_feature_snapshots.model_prediction/rel_width/consensus/consensus_p/
+  consensus_version` = lo que la UI mostró esa hora (worker `_shown_values`, COALESCE en el upsert; 120 d);
+  `auto_open` guarda `entry_consensus`. `scripts/consensus_live.py` (solo lectura) → diagrama de confiabilidad
+  en vivo; primer chequeo ≈ 2027-01-05. (`score_snapshots` se recorta a 30 filas/par: no sirve para esto.)
+- Siguiente paso con potencial: recalibrar la cifra "APR esperado" (isotónica p_prod → APR real mediano con
+  costos reales) para que lo mostrado se cumpla ~50 % en todos los tramos.
+- Tests: `tests/test_consensus_calibration.py`, `tests/test_market_features.py::test_worker_guarda_lo_mostrado`.
 
 ## Revisión de la operación real (2026-11-24, rama `feat/ops-review`)
 

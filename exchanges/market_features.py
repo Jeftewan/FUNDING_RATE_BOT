@@ -39,6 +39,8 @@ FEATURE_COLUMNS = [
     "funding_interval_hours", "funding_cap", "funding_floor", "volatility_7d",
     "spot_source", "alpha_liquidity_usd",
 ]
+# Lo que la UI mostró esa hora (no son señales de mercado; los agrega el worker).
+DISPLAY_COLUMNS = ["model_prediction", "rel_width", "consensus", "consensus_p", "consensus_version"]
 # Tokens solo-Alpha (spot on-chain): el precio de la lista Alpha se desvía hasta ~3 % de
 # los trades on-chain y un trade suelto en un pool fino mete ruido → el spot es el VWAP de
 # las BASIS_BARS velas 1m on-chain que terminan en ts_hour, contra el VWAP del perp en las
@@ -318,11 +320,12 @@ def upsert_rows(db, rows) -> int:
         from sqlalchemy.dialects.sqlite import insert
     now = datetime.now(timezone.utc)
     # Dedup por clave: ON CONFLICT rechaza el lote si trae dos veces la misma.
-    by_key = {(r["symbol"], r["exchange"], r["ts_hour"]): {**r, "captured_at": now} for r in rows}
+    blank = {c: None for c in DISPLAY_COLUMNS}  # mismas claves en todas las filas del lote
+    by_key = {(r["symbol"], r["exchange"], r["ts_hour"]): {**blank, **r, "captured_at": now} for r in rows}
     stmt = insert(table).values(list(by_key.values()))
     stmt = stmt.on_conflict_do_update(
         index_elements=["symbol", "exchange", "ts_hour"],
-        set_={**{c: db.func.coalesce(stmt.excluded[c], table.c[c]) for c in FEATURE_COLUMNS},
+        set_={**{c: db.func.coalesce(stmt.excluded[c], table.c[c]) for c in FEATURE_COLUMNS + DISPLAY_COLUMNS},
               "captured_at": stmt.excluded.captured_at},
     )
     db.session.execute(stmt)

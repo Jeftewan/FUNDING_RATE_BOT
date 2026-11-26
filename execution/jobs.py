@@ -604,6 +604,7 @@ class JobRunner:
                 "entry_model_prediction": opp.get("model_prediction"),
                 "entry_score": opp.get("score"), "entry_score_heuristic": opp.get("score_heuristic"),
                 "entry_confidence": opp.get("confidence"),
+                "entry_consensus": opp.get("consensus"),
                 "entry_apr_p10": opp.get("apr_p10"), "entry_apr_p90": opp.get("apr_p90"),
                 "order_ids": fill.get("order_ids", []), "legs": fill.get("legs", []),
                 "note": "Auto-ejecutado" + (f" — {fill['partial_note']}" if fill.get("partial_note") else ""),
