@@ -444,6 +444,7 @@ class DBPersistence:
             "entry_basis_pct": getattr(pos, "entry_basis_pct", None),
             "entry_mode": getattr(pos, "entry_mode", "") or "",
             "source": getattr(pos, "source", "") or "manual",
+            "job_id": getattr(pos, "job_id", None),
             "earnings_source": getattr(pos, "earnings_source", "") or "estimated",
             "protection": getattr(pos, "protection_json", None) or None,
             "spot_entry_price": getattr(pos, "spot_entry_price", None),

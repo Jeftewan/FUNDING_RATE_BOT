@@ -35,3 +35,6 @@ cache/cross/
 # Filas intermedias de estudios locales (regenerables)
 cache/*.pkl
 cache/llm_policy/
+
+# Datos reales de cuentas (ops_review): privados
+cache/ops_review/

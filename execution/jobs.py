@@ -35,6 +35,9 @@ PATIENT_EXIT_BASIS = 0.0
 # Guarda al ir a operar tras una espera: θ − margen. Con pausa de 15 min, θ entre 0 y 0.25 rinde
 # casi igual, así que solo se aborta si el basis cayó claramente por debajo de lo evaluado.
 FIRE_BASIS_MARGIN = 0.25
+# Lecturas de la espera que se guardan (progress_json y, al disparar, params): la primera (al pedir) y
+# las últimas N. Miden la caída lectura → llenado (reports/ops_review_20261124.md).
+MAX_WAIT_READS = 500
 
 
 def wait_params(side: str) -> dict:
@@ -141,19 +144,24 @@ class JobRunner:
     # ── Ejecución en espera de basis ───────────────────────────────────
     def _watch_armed(self, jid):
         probe = None
+        reads = first = None
         while True:
             job = self._load(jid)
             if not job or job["status"] != _ARMED:
                 return
+            if reads is None:
+                reads = list(job["params"].get("wait_reads") or [])
+                first = job["params"].get("first_read")
             try:
                 wait = job["params"]["wait"]
                 if self._cancelled(jid):
                     self._update(jid, status="cancelled", error="Cancelado por el usuario")
                     return
-                if job["kind"] == "close" and not self._load_pos(job["params"]["position_id"]):
+                if (job["kind"] == "close" or job["params"].get("topup_of")) \
+                        and not self._load_pos(job["params"]["position_id"]):
                     self._update(jid, status="cancelled", error="La posición ya no está activa")
                     return
-                if wait.get("force") and self._fire(job):
+                if wait.get("force") and self._fire(job, reads=reads, first=first):
                     return
                 if time.time() >= float(wait["deadline"]):
                     self._expire(job)
@@ -161,9 +169,15 @@ class JobRunner:
                 if not wait.get("force"):
                     probe = probe or self._make_probe(job)
                     read = probe.read()
+                    entry = {"ts": round(time.time()), "basis_pct": read.get("basis_pct"),
+                             "px": read.get("px"), "perp": read.get("perp")}
+                    first = first or entry
+                    reads = (reads + [entry])[-MAX_WAIT_READS:]
                     self._update(jid, progress_json={"phase": "armed", **read, "theta": wait["theta"],
-                                                     "deadline": wait["deadline"]})
-                    if read["basis_pct"] is not None and read["basis_pct"] >= wait["theta"] and self._fire(job, read):
+                                                     "deadline": wait["deadline"], "first_read": first,
+                                                     "reads": reads})
+                    if (read["basis_pct"] is not None and read["basis_pct"] >= wait["theta"]
+                            and self._fire(job, read, reads=reads, first=first)):
                         return
             except Exception as e:
                 log.warning(f"armed job {jid}: {e}")
@@ -184,9 +198,10 @@ class JobRunner:
         return texec.basis_probe(creds, pos["exchange"], pos["symbol"], factory, "sell",
                                  base=float(pos["spot_qty"]))
 
-    def _fire(self, job, read=None) -> bool:
+    def _fire(self, job, read=None, reads=None, first=None) -> bool:
         """Pasa a ejecución si el usuario no tiene otro job corriendo. False → sigue en espera.
-        `read`: lectura que disparó; queda en params para auditar contra lo ejecutado."""
+        `read`: lectura que disparó; `reads`/`first`: lecturas de la espera. Quedan en params para
+        auditar contra lo ejecutado."""
         jid = job["id"]
         with self._submit_lock:
             with self.app.app_context():
@@ -195,6 +210,10 @@ class JobRunner:
             params = {**job["params"], "fired_at": time.time()}
             if read:
                 params["fire_read"] = read
+            if reads:
+                params["wait_reads"] = reads
+            if first:
+                params["first_read"] = first
             self._update(jid, status="queued", params_json=params)
         threading.Thread(target=self._run, args=(jid,), daemon=True, name=f"job-{jid}").start()
         return True
@@ -359,6 +378,10 @@ class JobRunner:
         jid, uid, p = job["id"], job["user_id"], job["params"]
         opp = p["opportunity"]
         mode = opp.get("mode", "spot_perp")
+        topup_of = p.get("topup_of")
+        if topup_of and not self._load_pos(topup_of):
+            self._update(jid, status="cancelled", error="La posición ya no está activa")
+            return
         creds = self._creds(uid, [opp.get("exchange", "")])
         ctx = self._ctx(jid)
         res = texec.execute_open(creds, opp, float(p["capital"]), int(p["leverage"]),
@@ -368,6 +391,8 @@ class JobRunner:
         if res.get("code") == "BASIS_GONE":
             return self._rearm(job, res)
         fill = res if res.get("ok") else res.get("partial")
+        if topup_of:
+            return self._finish_topup(job, res, fill, creds, ctx)
         pos_id = None
         if fill and (fill.get("perp_qty") or 0) > 0:
             # entry_time = inicio de la ejecución: el funding cobrado durante un TWAP largo
@@ -395,6 +420,90 @@ class JobRunner:
                         severity="INFO", typ="EXEC_DONE")
         elif "unwound" in res or res.get("code") == "HEDGE_FAILED":
             self._alert(uid, sym, f"Fallo al abrir {sym} (auto): {res.get('msg', '')}")
+
+    # ── «Completar apertura»: suma a una posición auto existente ──────
+    def _finish_topup(self, job, res, fill, creds, ctx):
+        """Las piernas nuevas se suman a la posición (BULLA #60: la apertura quedó en 1 de 3
+        tramos) y los seguros se re-colocan sobre el total: la venta límite spot solo cubría
+        la cantidad anterior y el SL se recalcula con la liquidación nueva."""
+        from exchanges import trade_executor as texec
+        jid, uid, p = job["id"], job["user_id"], job["params"]
+        pos_id = int(p["topup_of"])
+        sym = p.get("symbol", "")
+        added = bool(fill and (fill.get("perp_qty") or 0) > 0)
+        if added:
+            self._merge_topup(pos_id, jid, fill)
+            pos = self._load_pos(pos_id)
+            if pos and pos.get("protection"):
+                try:
+                    wallet, _ = self._bsc_args(uid, pos, p.get("token"))
+                    hit = texec.cancel_protection(creds, pos, wallet)
+                except Exception as e:
+                    log.exception(f"topup job {jid}: cancelar seguros pos={pos_id}: {e}")
+                    hit = None
+                    self._alert(uid, sym, f"Apertura de {sym} completada, pero los seguros previos no se "
+                                          f"pudieron reemplazar ({e}): la venta límite spot cubre solo la "
+                                          f"cantidad anterior. Revisa los seguros.", severity="WARNING")
+                if hit is not None:
+                    if any(float(hit.get(k) or 0) > 0 for k in ("perp_filled", "spot_filled")):
+                        # Un seguro se llenó durante la ejecución: el vigilante cierra la otra pierna.
+                        self._alert(uid, sym, f"Un seguro de {sym} se llenó mientras se completaba la "
+                                              f"apertura; no se re-colocan. Revisa la posición.")
+                    else:
+                        res["protection"] = self._protect(uid, pos_id, creds, ctx, token=p.get("token"))
+            elif pos:
+                res["protection"] = self._protect(uid, pos_id, creds, ctx, token=p.get("token"))
+        status = "done" if res.get("ok") else "failed"
+        self._update(jid, status=status, result_json=_jsonable(res), position_id=pos_id,
+                     error=None if res.get("ok") else res.get("msg"))
+        if res.get("ok"):
+            pos = self._load_pos(pos_id) or {}
+            self._alert(uid, sym, f"Apertura completada: +spot {res.get('spot_qty') or 0:g} / +short "
+                        f"{res.get('perp_qty') or 0:g} → total spot {pos.get('spot_qty') or 0:g} / short "
+                        f"{pos.get('perp_qty') or 0:g}. Fees ${res.get('entry_fees_usd', 0):.2f}"
+                        + (f". {res['partial_note']}" if res.get("partial_note") else ""),
+                        severity="INFO", typ="EXEC_DONE")
+        elif "unwound" in res or res.get("code") == "HEDGE_FAILED":
+            self._alert(uid, sym, f"Fallo al completar {sym} (auto): {res.get('msg', '')}"
+                        + (" Lo cubierto se sumó a la posición." if added else ""))
+
+    def _merge_topup(self, pos_id, jid, fill):
+        """Cantidades, capital y fees se suman; precios y basis de entrada se promedian por
+        cantidad (el PnL de precio del cierre usa spot_entry_price·qty y entry_price·qty)."""
+        from core.database import db
+        from core.db_models import UserPosition
+
+        def wavg(q0, p0, q1, p1):
+            if p0 is None or p1 is None or q0 + q1 <= 0:
+                return p0
+            return (q0 * float(p0) + q1 * float(p1)) / (q0 + q1)
+
+        with self.app.app_context():
+            row = UserPosition.query.get(int(pos_id))
+            sq0, pq0 = float(row.spot_qty or 0), float(row.perp_qty or 0)
+            sq1, pq1 = float(fill.get("spot_qty") or 0), float(fill.get("perp_qty") or 0)
+            exp0 = float(row.exposure or 0)
+            row.spot_entry_price = wavg(sq0, row.spot_entry_price, sq1,
+                                        fill.get("spot_avg_price_gross") or fill.get("spot_avg_price"))
+            row.entry_price = wavg(pq0, row.entry_price, pq1, fill.get("entry_price"))
+            row.entry_basis_pct = wavg(pq0, row.entry_basis_pct, pq1, fill.get("basis_pct"))
+            row.spot_qty, row.perp_qty = sq0 + sq1, pq0 + pq1
+            row.capital_used = round(float(row.capital_used or 0) + float(fill.get("capital_used") or 0), 4)
+            row.exposure = round(exp0 + float(fill.get("exposure") or 0), 4)
+            if exp0 > 0 and row.exit_fees_est:
+                row.exit_fees_est = float(row.exit_fees_est) * row.exposure / exp0
+            row.entry_fees_real = float(row.entry_fees_real or 0) + float(fill.get("entry_fees_usd") or 0)
+            slip = (fill.get("entry_slippage") or {}).get("total")
+            if slip is not None:
+                row.entry_slippage_usd = float(row.entry_slippage_usd or 0) + float(slip)
+            pj = list(row.payments_json or [])
+            pj.append({"ts": time.time(), "kind": "topup", "job_id": jid,
+                       "spot_qty": sq1, "perp_qty": pq1, "basis_pct": fill.get("basis_pct"),
+                       "order_ids": fill.get("order_ids", []), "legs": fill.get("legs", []),
+                       "note": "Apertura completada" + (f" — {fill['partial_note']}"
+                                                        if fill.get("partial_note") else "")})
+            row.payments_json = pj
+            db.session.commit()
 
     # ── Seguros (SL del short + venta límite del spot) ─────────────────
     def _save_protection(self, pos_id, prot):
@@ -730,6 +839,9 @@ class JobRunner:
         venue = p.get("spot_venue") or (pos or {}).get("spot_venue")
         if mode != "spot_perp" or venue == "bsc":
             raise RuntimeError("reconciliación automática solo para spot_perp en CEX")
+        if p.get("topup_of"):
+            # Guardaría una posición nueva en vez de sumar a la existente.
+            raise RuntimeError("reconciliación automática no soporta «Completar apertura»")
         creds = self._creds(uid, [exchange])[exchange.lower()]
         since_ms = int(job["created_at"].replace(tzinfo=timezone.utc).timestamp() * 1000) - 60_000 \
             if job["created_at"] else int((time.time() - 86400) * 1000)

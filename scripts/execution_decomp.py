@@ -59,7 +59,9 @@ def decompose(job):
         ts = block_time(s["tx"])
         rows.append({"ts": ts, "qty": qty, "px": usdt / qty,
                      "mid": quoted / (1 + s["impact"]) if buy else quoted / (1 - s["impact"]),
-                     "impact": s["impact"], "perp": perp_at(sym, ts)})
+                     # perp_ref: bid/ask del perp al operar el tramo (correcto desde 2026-11-24;
+                     # antes quedaba None porque el ticker de futuros no trae bid/ask)
+                     "impact": s["impact"], "perp": s.get("perp_ref") or perp_at(sym, ts)})
     if not rows or not ref:
         return None
     sign = 1 if buy else -1

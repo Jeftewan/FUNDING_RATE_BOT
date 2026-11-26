@@ -181,8 +181,31 @@ def _ensure_markets(client):
     _markets_src[key] = (client, time.time())
 
 
+def book_bid_ask(client, ccxt_symbol: str):
+    """(bid, ask) del mejor nivel: bookTicker y, si no, el libro. (0, 0) si no se pudo leer.
+    El ticker 24 h de Binance futuros NO trae bid/ask (verificado 2026-11-24)."""
+    try:
+        r = (client.fetch_bids_asks([ccxt_symbol]) or {}).get(ccxt_symbol) or {}
+        bid, ask = float(r.get("bid") or 0), float(r.get("ask") or 0)
+        if bid and ask:
+            return bid, ask
+    except Exception:
+        pass
+    try:
+        ob = client.fetch_order_book(ccxt_symbol, limit=5)
+        return float(ob["bids"][0][0]), float(ob["asks"][0][0])
+    except Exception as e:
+        log.warning(f"bid/ask {ccxt_symbol}: {e}")
+        return 0.0, 0.0
+
+
 def _top_of_book(client, ccxt_symbol: str, fallback: float = 0.0):
-    """(bid, ask, mid) desde el ticker. Cae al fallback si no hay bid/ask."""
+    """(bid, ask, mid). Contratos: bookTicker/libro (el ticker de futuros no trae bid/ask);
+    spot: ticker. Cae a `last` y luego al fallback."""
+    if ":" in ccxt_symbol:
+        bid, ask = book_bid_ask(client, ccxt_symbol)
+        if bid and ask:
+            return bid, ask, (bid + ask) / 2
     try:
         t = client.fetch_ticker(ccxt_symbol)
         bid = float(t.get("bid") or 0)
