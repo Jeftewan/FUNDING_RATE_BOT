@@ -25,8 +25,13 @@ walk-forward mensual con purga 31 d, 12 meses, señales de 365 d (`signals_datas
   consensus_version` = lo que la UI mostró esa hora (worker `_shown_values`, COALESCE en el upsert; 120 d);
   `auto_open` guarda `entry_consensus`. `scripts/consensus_live.py` (solo lectura) → diagrama de confiabilidad
   en vivo; primer chequeo ≈ 2027-01-05. (`score_snapshots` se recorta a 30 filas/par: no sirve para esto.)
-- Siguiente paso con potencial: recalibrar la cifra "APR esperado" (isotónica p_prod → APR real mediano con
-  costos reales) para que lo mostrado se cumpla ~50 % en todos los tramos.
+- **Recalibrar la cifra "APR esperado" tampoco pasa** (`scripts/apr_calibration_study.py` →
+  `reports/apr_calibration_20261126.md`; mapa monótono p_prod → mediana del APR real, 20 cuantiles + PAVA, WF
+  mensual 12 m). M2 (mapa por venue Alpha/CEX) pasa pinball (−0.31 [−0.42, −0.20], 5/5 trimestres) y calibración
+  (cumple 48.5 %, deciles 45–53 % vs 61 → 28 % del vigente), pero **falla con el motor**: en los 25 tokens Alpha
+  del motor lo mostrado se cumple 67 % (63 % aun con el costo fijo) → esos tokens líquidos rinden más que el Alpha
+  medio y el mapa los subestimaría. No se exporta; la UI sigue mostrando `model_prediction`. Hipótesis por
+  pre-registrar: mapa por venue × liquidez/costo del token.
 - Tests: `tests/test_consensus_calibration.py`, `tests/test_market_features.py::test_worker_guarda_lo_mostrado`.
 
 ## Revisión de la operación real (2026-11-24, rama `feat/ops-review`)

@@ -44,3 +44,16 @@ def test_tramo_table_flags_miscalibration():
     y = np.r_[np.ones(100), np.zeros(100)]
     r = cst.tramo_table(p, y, np.zeros(200))
     assert r[0]["tramo"] == 9 and not r[0]["ok"]
+
+
+def test_apr_map_monotone_and_flat_outside():
+    acs = pytest.importorskip("apr_calibration_study")
+    assert list(acs.pava([3, 1, 2, 5], [1, 1, 1, 1])) == [2, 2, 2, 5]
+    rng = np.random.default_rng(3)
+    x = rng.uniform(0, 60, 5000)
+    y = 0.6 * x + 4 + rng.normal(0, 10, 5000)          # sobre-disperso: pendiente < 1
+    k = acs.fit_map(x, y)
+    ky = np.array(k)[:, 1]
+    assert np.all(np.diff(ky) >= -1e-9)
+    out = acs.apply_map(k, [-10, 30, 1000])
+    assert out[0] == ky[0] and out[2] == ky[-1] and abs(out[1] - 22) < 3
