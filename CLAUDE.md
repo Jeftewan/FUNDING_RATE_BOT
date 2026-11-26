@@ -153,6 +153,11 @@ Variante R2 de `reports/profit_study_20261117.md` (eventos de SL 22 % → 1–4 
 - **Validación antes de habilitar**: `POST /api/positions/<id>/rebalance` `{fraction, confirm:true}` sobre una posición
   chica → medir latencia venta→margen. Si > 15 min no habilitar (el estudio pierde a 45 min). Alpha sigue en 1x hasta
   ≥ 5 rebalanceos reales.
+- **Reproducción con los SL reales (2026-11-26, velas MARK 1m, latencia 15 min)**: BULLA #61 (1x, SL a 0.06153 llenó
+  0.06304, precio −23.5 USD): un rebalanceo a las 12:15 UTC (MARK 0.0512, f 30 %, ~220 USD de spot) sube la liq de
+  0.0680 a 0.0763 **sin** el depósito y a 0.0975 con él (SL 0.0883) → el pico de 0.06416 no lo toca. ARIA #56 (2x):
+  3 rebalanceos (0.1886, 0.2274, 0.2741; f 17 % c/u) y sin SL hasta la MARK máx. 0.3206. La seguridad no depende de
+  la latencia (la recompra del short va con la venta); el depósito solo devuelve el capital al margen.
 
 ## ¿Umbrales fijos o adaptativos? (2026-11-10, rama `feat/adaptive-sizing`)
 
