@@ -60,6 +60,11 @@ class UserConfig(db.Model):
     min_confidence = db.Column(db.Float, default=0)
     # Auto-transfer USDT spot↔futuros (Binance) antes de abrir, si la key lo permite.
     auto_transfer = db.Column(db.Boolean, default=False)
+    # Botones de acción en Telegram (webhook del bot del usuario); hash sha256 del secret_token.
+    tg_actions_enabled = db.Column(db.Boolean, default=False)
+    tg_webhook_secret_hash = db.Column(db.String(64), default="")
+    # Rebalanceo spot→margen automático pausado por el usuario (botón de Telegram / Config).
+    rebalance_paused = db.Column(db.Boolean, default=False)
     # Legacy WhatsApp columns kept for migration; unused by new code.
     wa_phone = db.Column(db.String(20), default="")
     wa_apikey_encrypted = db.Column(db.String(512), default="")
@@ -189,6 +194,29 @@ class ExecutionJob(db.Model):
     cancel_requested = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class UserSignal(db.Model):
+    """Señal accionable enviada por Telegram con botones (salir/entrar ya, cierre sugerido).
+
+    También es el log para medir las reglas de analysis/signals.py contra el backtest.
+    status: pending | accepted | ignored | failed (pending con expires_at vencido = vencida).
+    """
+    __tablename__ = "user_signals"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    kind = db.Column(db.String(20), nullable=False)  # EXIT_NOW | ENTER_NOW | CLOSE_SUGGESTED
+    symbol = db.Column(db.String(32), default="")
+    position_id = db.Column(db.Integer, nullable=True)
+    payload_json = db.Column(db.JSON, default=dict)
+    status = db.Column(db.String(12), default="pending", index=True)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    tg_message_id = db.Column(db.BigInteger, nullable=True)
+    job_id = db.Column(db.Integer, nullable=True)
+    error = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    decided_at = db.Column(db.DateTime, nullable=True)
 
 
 class UserWallet(db.Model):
@@ -334,6 +362,12 @@ class MarketFeatureSnapshot(db.Model):
     volatility_7d = db.Column(db.Float)          # std de 7 log-retornos diarios del perp
     spot_source = db.Column(db.String(8))        # "cex" (book Binance) | "alpha" (VWAP 5 velas 1m on-chain)
     alpha_liquidity_usd = db.Column(db.Float)    # liquidez del pool según la lista Alpha (solo online)
+    # Lo que la UI mostró esa hora (validación en vivo del consenso, scripts/consensus_live.py).
+    model_prediction = db.Column(db.Float)
+    rel_width = db.Column(db.Float)
+    consensus = db.Column(db.Float)              # 1–10
+    consensus_p = db.Column(db.Float)            # P(APR realizado ≥ predicho), tabla v2
+    consensus_version = db.Column(db.String(20))
     captured_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
                             nullable=False)
 

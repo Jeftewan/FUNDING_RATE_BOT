@@ -124,6 +124,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                     "capital_source": us.get("capital_source", "manual"),
                     "real_balances": us.get("real_balances"),
                     "auto_transfer": us.get("auto_transfer", False),
+                    "tg_actions_enabled": us.get("tg_actions_enabled", False),
+                    "rebalance_paused": us.get("rebalance_paused", False),
                 })
             # Fallback defaults if no DB
             return jsonify({
@@ -168,8 +170,21 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
                 db_data["hide_negative"] = bool(data["hide_negative"])
             if "min_confidence" in data:
                 db_data["min_confidence"] = max(0.0, min(100.0, float(data["min_confidence"] or 0)))
+            if "tg_actions_enabled" in data:
+                db_data["tg_actions_enabled"] = bool(data["tg_actions_enabled"])
+            if "rebalance_paused" in data:
+                db_data["rebalance_paused"] = bool(data["rebalance_paused"])
 
             get_db_persist().save_user_config(uid, db_data)
+            # Webhook de los botones: (re)registrar al activarlos o al cambiar el token del bot.
+            tg_msg = None
+            if "tg_actions_enabled" in db_data or (
+                    "tg_bot_token" in db_data and get_db_persist().load_user_state(uid).get("tg_actions_enabled")):
+                from notifications import tg_actions
+                r = tg_actions.sync_webhook(uid)
+                tg_msg = r.get("msg")
+                if not r.get("ok"):
+                    return jsonify({"ok": False, "msg": f"Configuracion guardada, pero {tg_msg}"})
 
             # Sync Telegram settings to notifier state for current session
             with state_manager.lock:
@@ -182,7 +197,8 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             if scanner_worker.email_notifier:
                 scanner_worker.email_notifier._sync_from_state()
 
-        return jsonify({"ok": True, "msg": "Configuracion guardada"})
+        return jsonify({"ok": True, "msg": "Configuracion guardada" + (f" · {tg_msg}" if uid and get_db_persist()
+                                                                         and tg_msg else "")})
 
     # ── Opportunities ──────────────────────────────────────────
     @app.route("/api/opportunities")
@@ -1097,30 +1113,31 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
 
         Body: {position_id, dry_run?, twap?}.
         """
-        from exchanges import trade_executor as texec
         data = flask_req.json or {}
-        pos_id = data.get("position_id", "")
-        dry_run = bool(data.get("dry_run", False))
-        twap = _parse_twap(data.get("twap"))
-
         uid = get_current_user_id()
         if not uid or not get_db_persist():
             return jsonify({"ok": False, "msg": "DB no disponible"}), 400
-        dbp = get_db_persist()
+        out, code = _start_close(uid, data.get("position_id", ""), dry_run=bool(data.get("dry_run", False)),
+                                 twap=_parse_twap(data.get("twap")))
+        return jsonify(out), code
 
+    def _start_close(uid, pos_id, dry_run=False, twap=None):
+        """Cierre auto de una posición (ruta HTTP y botón de Telegram) → (dict, status)."""
+        from exchanges import trade_executor as texec
+        dbp = get_db_persist()
         try:
             db_pos_id = int(pos_id)
         except (ValueError, TypeError):
-            return jsonify({"ok": False, "msg": "Posicion no encontrada"})
+            return {"ok": False, "msg": "Posicion no encontrada"}, 200
 
         from core.db_models import UserPosition
         pos_row = UserPosition.query.filter_by(id=db_pos_id, user_id=uid, status="active").first()
         if not pos_row:
-            return jsonify({"ok": False, "msg": "Posicion no encontrada"})
+            return {"ok": False, "msg": "Posicion no encontrada"}, 200
         pos = dbp._pos_to_dict(pos_row)
         if pos.get("source") not in ("auto", "imported"):
-            return jsonify({"ok": False, "msg": "Solo las posiciones abiertas o importadas desde el "
-                            "exchange se pueden cerrar en automático."})
+            return {"ok": False, "msg": "Solo las posiciones abiertas o importadas desde el "
+                    "exchange se pueden cerrar en automático."}, 200
 
         mode = pos.get("mode", "spot_perp")
         needed = ([pos.get("exchange", "")] if mode == "spot_perp"
@@ -1128,10 +1145,10 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
         creds_by_exchange = {}
         for ex in needed:
             if not texec.is_cex(ex):
-                return jsonify({"ok": False, "msg": f"{ex} no soportado para auto-cierre"})
+                return {"ok": False, "msg": f"{ex} no soportado para auto-cierre"}, 200
             c = dbp.load_user_exchange_keys(uid, ex)
             if not c or not c.get("api_key"):
-                return jsonify({"ok": False, "msg": f"Sin API keys para {ex}"})
+                return {"ok": False, "msg": f"Sin API keys para {ex}"}, 200
             creds_by_exchange[ex.lower()] = c
 
         token = {}
@@ -1139,7 +1156,7 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             from execution.jobs import position_token
             token = position_token(pos) or {}
             if not token or not dbp.load_user_wallet(uid, "bsc"):
-                return jsonify({"ok": False, "msg": "Wallet BSC o token no disponible"})
+                return {"ok": False, "msg": "Wallet BSC o token no disponible"}, 200
 
         if dry_run:
             leg_factory = (_bsc_leg_factory(dbp.load_user_wallet(uid, "bsc"), token)
@@ -1147,24 +1164,79 @@ def init_routes(app, state_manager, scanner_worker, config, defi_manager=None, d
             exec_res = texec.execute_close(creds_by_exchange, pos, dry_run=True,
                                            spot_leg_factory=leg_factory)
             if not exec_res.get("ok"):
-                return jsonify({"ok": False, "msg": exec_res.get("msg", "Simulación fallida"), "exec": exec_res})
-            return jsonify({"ok": True, "dry_run": True, "exec": exec_res})
+                return {"ok": False, "msg": exec_res.get("msg", "Simulación fallida"), "exec": exec_res}, 200
+            return {"ok": True, "dry_run": True, "exec": exec_res}, 200
 
         if not job_runner:
-            return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
+            return {"ok": False, "msg": "Runner de ejecución no disponible"}, 503
         wait = _execution_wait(pos.get("spot_venue"), "sell")
         if job_runner.active_job_for_position(uid, db_pos_id, include_armed=True):
-            return jsonify({"ok": False, "msg": "Esta posición ya tiene una ejecución (cierre o «Completar "
-                            "apertura») en curso o en espera; cancélala antes de cerrar."})
+            return {"ok": False, "msg": "Esta posición ya tiene una ejecución (cierre o «Completar "
+                    "apertura») en curso o en espera; cancélala antes de cerrar."}, 200
         if not wait and job_runner.active_job(uid):
-            return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
+            return {"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."}, 200
         close_params = {"position_id": db_pos_id, "symbol": pos.get("symbol"), "twap": twap, "token": token}
         if wait:
             close_params["wait"] = wait
         jid = job_runner.submit_exclusive(uid, "close", close_params)
         if jid is None:
-            return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
+            return {"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."}, 200
         log.info(f"Exec job #{jid} close pos={db_pos_id} user={uid}")
+        return {"ok": True, "job_id": jid}, 200
+
+    # ── Telegram: webhook de botones (notifications/tg_actions.py) ──────
+    @app.route("/api/tg/hook/<int:hook_uid>", methods=["POST"])
+    def api_tg_hook(hook_uid):
+        """Callback de los botones inline del bot del usuario. Sin sesión: lo autentica el
+        secret_token del webhook (hash en user_configs) y el chat_id del usuario."""
+        if not db_enabled or not get_db_persist():
+            return jsonify({"ok": False}), 503
+        from notifications import tg_actions
+
+        def start_close(uid, pos_id):
+            out, _ = _start_close(uid, pos_id)
+            return bool(out.get("ok")), out.get("msg", ""), out.get("job_id")
+
+        code = tg_actions.handle_update(hook_uid, flask_req.get_json(silent=True) or {},
+                                        flask_req.headers.get("X-Telegram-Bot-Api-Secret-Token", ""),
+                                        start_close)
+        return jsonify({"ok": code == 200}), code
+
+    @app.route("/api/positions/<int:pos_id>/rebalance", methods=["POST"])
+    @auth_required
+    def api_position_rebalance(pos_id):
+        """Rebalanceo spot→margen manual (prueba con montos mínimos; mide la latencia real
+        del depósito). Body: {fraction: 0.01–0.5, confirm: true}. No depende de REBALANCE_ENABLED."""
+        from execution.jobs import position_token
+        data = flask_req.json or {}
+        if data.get("confirm") is not True:
+            return jsonify({"ok": False, "msg": "Falta confirm: true (vende spot, recompra short y mueve USDT)"}), 400
+        try:
+            frac = float(data.get("fraction"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "msg": "fraction inválida"}), 400
+        if not 0.01 <= frac <= 0.5:
+            return jsonify({"ok": False, "msg": "fraction debe estar entre 0.01 y 0.5"}), 400
+        uid = get_current_user_id()
+        dbp = get_db_persist()
+        if not uid or not dbp or not job_runner:
+            return jsonify({"ok": False, "msg": "Runner de ejecución no disponible"}), 503
+        from core.db_models import UserPosition
+        row = UserPosition.query.filter_by(id=pos_id, user_id=uid, status="active").first()
+        if not row:
+            return jsonify({"ok": False, "msg": "Posicion no encontrada"}), 404
+        pos = dbp._pos_to_dict(row)
+        if pos.get("source") not in ("auto", "imported") or (pos.get("protection") or {}).get("status") != "active":
+            return jsonify({"ok": False, "msg": "Solo posiciones auto/importadas con seguros activos"})
+        if job_runner.active_job_for_position(uid, pos_id, include_armed=True):
+            return jsonify({"ok": False, "msg": "La posición ya tiene un job en curso o en espera"})
+        token = (position_token(pos) or {}) if pos.get("spot_venue") == "bsc" else {}
+        jid = job_runner.submit_exclusive(uid, "rebalance", {
+            "position_id": pos_id, "symbol": pos.get("symbol"), "fraction": frac, "token": token,
+            "trigger": "manual"})
+        if jid is None:
+            return jsonify({"ok": False, "msg": "Ya hay una ejecución en curso; espera a que termine."})
+        log.info(f"Exec job #{jid} rebalance pos={pos_id} f={frac} user={uid}")
         return jsonify({"ok": True, "job_id": jid})
 
     # ── Execution jobs ─────────────────────────────────────────

@@ -68,6 +68,7 @@ _alpha_cache = {"ts": 0.0, "by_symbol": {}, "any_by_symbol": {}}
 _SEL_BALANCE_OF = "0x70a08231"
 _SEL_ALLOWANCE = "0xdd62ed3e"
 _SEL_APPROVE = "0x095ea7b3"
+_SEL_TRANSFER = "0xa9059cbb"
 
 
 def enabled() -> bool:
@@ -173,6 +174,33 @@ def to_wei(amount: float, decimals: int) -> int:
 
 def from_wei(amount: int, decimals: int) -> float:
     return amount / (10 ** decimals)
+
+
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def transfer_deltas(rc: dict, owner: str, tokens) -> dict:
+    """Movimiento neto (wei, + entra / − sale) de cada token para `owner` según los logs
+    Transfer del recibo. Un token sin logs para owner no aparece en el resultado.
+
+    Es lo que hizo ESTA tx: la diferencia de saldo de la wallet mezcla otras
+    transferencias del mismo intervalo (BULLA #61: la venta límite Kyber llenaba a la
+    vez y el swap quedó registrado 1,921 → 118.44 USDT cuando fue 1,105 → 68.46)."""
+    own = owner.lower().replace("0x", "")
+    want = {t.lower() for t in tokens}
+    out = {}
+    for lg in (rc or {}).get("logs") or []:
+        topics = lg.get("topics") or []
+        tok = (lg.get("address") or "").lower()
+        if tok not in want or len(topics) != 3 or topics[0].lower() != TRANSFER_TOPIC:
+            continue
+        frm, to = topics[1].lower()[-40:], topics[2].lower()[-40:]
+        amt = int(lg.get("data") or "0x0", 16)
+        if to == own:
+            out[tok] = out.get(tok, 0) + amt
+        if frm == own:
+            out[tok] = out.get(tok, 0) - amt
+    return out
 
 
 # ── Tokens Alpha (BSC) ──────────────────────────────────────────────────────
@@ -318,6 +346,17 @@ def _approve_data(spender: str, amount: int) -> str:
     return _SEL_APPROVE + _addr_arg(spender) + hex(amount)[2:].rjust(64, "0")
 
 
+def transfer_erc20(wallet: dict, token: str, to: str, amount_wei: int) -> str:
+    """transfer(to, amount) firmado con la wallet dedicada; espera el receipt. Un envío a
+    una dirección propia no es sandwicheable: puede salir por el RPC público."""
+    data = _SEL_TRANSFER + _addr_arg(to) + hex(int(amount_wei))[2:].rjust(64, "0")
+    txh = _sign_and_send(wallet, {"to": token, "data": data, "value": 0})
+    rc = wait_receipt(txh)
+    if int(str(rc.get("status") or "0x0"), 16) != 1:
+        raise RuntimeError(f"transferencia {txh} revertida")
+    return txh
+
+
 # ── Pierna spot on-chain ────────────────────────────────────────────────────
 class BscSpotLeg:
     """Pierna spot en BSC con la misma interfaz que trade_executor.CexSpotLeg.
@@ -429,10 +468,19 @@ class BscSpotLeg:
         self._gas_fee(rc)
         if int(rc.get("status", "0x0"), 16) != 1:
             raise SwapReverted(f"swap revertido ({txh})")
-        spent = from_wei(before_in - erc20_balance(src, self.address), src_dec)
-        got = from_wei(erc20_balance(dst, self.address) - before_out, dst_dec)
+        # Lo que movió esta tx (recibo); la diferencia de saldo solo si el recibo no lo trae.
+        d = transfer_deltas(rc, self.address, (src, dst))
+        if src.lower() in d and d[src.lower()] < 0:
+            spent = from_wei(-d[src.lower()], src_dec)
+        else:
+            spent = from_wei(before_in - erc20_balance(src, self.address), src_dec)
+        if dst.lower() in d and d[dst.lower()] > 0:
+            got = from_wei(d[dst.lower()], dst_dec)
+        else:
+            got = from_wei(erc20_balance(dst, self.address) - before_out, dst_dec)
         self.swaps.append({"tx": txh, "side": "sell" if dst.lower() == USDT.lower() else "buy",
                            "in": spent, "out": got, "impact": impact, "via": meta.get("via"),
+                           "measured": "receipt" if src.lower() in d and dst.lower() in d else "balance",
                            "quoted_out": from_wei(int(q["to_amount"]), dst_dec) if q.get("to_amount") else None,
                            "min_out": from_wei(int(q["min_out"]), dst_dec) if q.get("min_out") else None,
                            "slippage": self.max_slippage, "perp_ref": self._perp_ref, "ts": time.time()})
@@ -521,9 +569,25 @@ class BscSpotLeg:
                     break
                 time.sleep(EXIT_SLICE_GAP)
             part = amt - sold if i == n - 1 else amt / n
+            # Otra salida (la venta límite Kyber llenando tras cancelarla, BULLA #61) pudo
+            # vaciar la wallet: sin saldo vendible no hay nada más que hacer, no es error.
+            left = self.held_base()
+            if left < part * 0.999:
+                try:
+                    px = self.quote_price(left, "sell") if left > 0 else 0.0
+                except Exception:
+                    px = None
+                if left <= 0 or (px and left * px < 1.0):
+                    left = 0.0
+            if left <= 0:
+                log.info(f"spot desnudo {self.token['symbol']}: sin saldo vendible tras el tramo {i}; fin")
+                break
+            part = min(part, left)
             try:
                 spent, got, txh = self._swap(tok, dec, USDT, USDT_DECIMALS, part)
             except RuntimeError as e:
+                if "saldo insuficiente" in str(e):
+                    break        # se vació entre la lectura y el swap (misma causa)
                 if "revertido" not in str(e) or self.max_slippage >= NAKED_RETRY_SLIPPAGE:
                     raise
                 log.warning(f"tramo {i + 1}/{n} {self.token['symbol']} revertido con slippage "

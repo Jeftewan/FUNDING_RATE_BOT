@@ -921,12 +921,14 @@ def _protection_clients(creds_by_exchange, position):
 
 
 def place_protection(creds_by_exchange: dict, position: dict, ctx: ExecContext = None,
-                     wallet: dict = None, token: dict = None) -> dict:
+                     wallet: dict = None, token: dict = None, anchor: float = None) -> dict:
     """Coloca SL (STOP_MARKET closePosition, mark price) + venta límite del spot.
 
     Cada pierna es independiente: si una falla, la otra se conserva y el error
     queda en `errors`. Devuelve el dict a persistir en user_positions.protection_json
     (ok=False si no se pudo colocar ninguna).
+    `anchor`: precio desde el que se mide el camino a liquidación en vez de la entrada
+    (tras un rebalanceo spot→margen la liquidación se re-ancla al precio del rebalanceo).
     """
     ctx = ctx or ExecContext()
     try:
@@ -942,14 +944,17 @@ def place_protection(creds_by_exchange: dict, position: dict, ctx: ExecContext =
         _, mmr = binance_max_leverage(perp_cli, perp_sym)
         liq = liquidation_estimate(entry, position.get("leverage") or 1, mmr or 0.004)["liq_price"]
         liq_source = "estimate"
-    if not entry or not liq or liq <= entry:
-        return {"ok": False, "msg": f"No se pudo determinar entrada/liquidación (entry={entry}, liq={liq})"}
-    sl = float(perp_cli.price_to_precision(perp_sym, protection_price(entry, liq)))
+    base = float(anchor or 0) or entry
+    if not base or not liq or liq <= base:
+        return {"ok": False, "msg": f"No se pudo determinar entrada/liquidación (entry={base}, liq={liq})"}
+    sl = float(perp_cli.price_to_precision(perp_sym, protection_price(base, liq)))
     sp = protection_spot_price(sl)
     prot = {"status": "active", "sl_price": sl, "spot_price": sp, "liq_price": liq,
             "liq_source": liq_source, "entry_price": entry, "fraction": PROTECTION_LIQ_FRACTION,
             "spot_offset": PROTECTION_SPOT_OFFSET, "placed_at": time.time(),
             "perp": None, "spot": None, "errors": []}
+    if anchor:
+        prot["anchor"] = base
 
     try:
         params = {"closePosition": True, "workingType": "MARK_PRICE", "triggerPrice": sl}
@@ -1135,6 +1140,29 @@ def _cancel_bsc_limit(wallet, spot) -> tuple:
     return (alive, *_bsc_filled(spot, o))
 
 
+LO_SETTLE_MAX_WAIT = 180   # s: tope de espera a que venza la firma del operador Kyber
+
+
+def _bsc_final_fills(wallet, spot, max_wait: float = LO_SETTLE_MAX_WAIT):
+    """(base, USDT) llenados de la venta límite Kyber al terminar el cierre, o None.
+
+    Cancelada, Kyber la sigue llenando hasta `operatorSignatureExpiredAt` (BULLA #61:
+    13,073 de 14,191 BULLA llenados en los 20 s posteriores a la cancelación, que el
+    cierre registró como 0). Se espera a que venza la firma (acotado) y se relee."""
+    from exchanges import kyber_limit_order as klo
+    try:
+        o = klo.get_order(wallet["address"], spot["id"])
+        exp = float((o or {}).get("operatorSignatureExpiredAt") or 0)
+        wait = min(max_wait, exp + 5 - time.time())
+        if o is not None and wait > 0:
+            time.sleep(wait)
+            o = klo.get_order(wallet["address"], spot["id"]) or o
+        return _bsc_filled(spot, o) if o is not None else None
+    except Exception as e:
+        log.warning(f"relectura de la venta límite BSC {spot.get('id')}: {e}")
+        return None
+
+
 def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None) -> dict:
     """Cancela las órdenes de seguro vivas. Devuelve
     fees/qty de lo que ya se había llenado (para sumarlo al cierre)."""
@@ -1176,6 +1204,7 @@ def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wal
                 if bsc_alive:
                     alive.append(f"venta límite BSC {spot['id']}")
                 out["spot_filled"], out["spot_cost"] = filled, cost
+                out["bsc_lo"] = {"id": spot["id"], "qty": spot.get("qty")}   # releer al final
         else:
             o = None
             for attempt in range(3):
@@ -1231,6 +1260,13 @@ def short_health(creds_by_exchange: dict, position: dict) -> dict:
             out["liq_distance_pct"] = round((out["liq"] - out["mark"]) / out["mark"] * 100, 2)
         break
     return out
+
+
+def add_isolated_margin(creds_by_exchange: dict, position: dict, amount: float) -> dict:
+    """Agrega `amount` USDT al margen aislado del short (/fapi/v1/positionMargin, type=1)."""
+    _, perp_cli, _, perp_sym = _protection_clients(creds_by_exchange, position)
+    params = {"positionSide": "SHORT"} if _is_hedged(perp_cli, perp_sym) is True else {}
+    return perp_cli.add_margin(perp_sym, float(amount), params)
 
 
 def cancel_protection(creds_by_exchange: dict, position: dict, wallet: dict = None) -> dict:
@@ -1972,6 +2008,24 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     remaining = max(0.0, spot_to_sell - state["sold"])
     fully_sold = (spot_to_sell <= 0 or state["sold"] >= spot_to_sell * 0.999
                   or (not error and not ctx.cancelled() and _is_dust(leg, remaining, ref)))
+    if onchain and prot_fill.get("bsc_lo"):
+        # La límite cancelada pudo seguir llenando mientras se vendía (BULLA #61):
+        # lo llenado cuenta como salida y la wallet real dice si queda spot.
+        # Solo se espera a que venza la firma si la límite pudo estar llenando (short ya cerrado
+        # por el SL, o ya tenía fills): un cierre normal o un rebalanceo no deben quedar minutos
+        # sin seguros por una orden lejos de su precio.
+        hot = not actual_short or float(prot_fill.get("spot_filled") or 0) > 0
+        late = _bsc_final_fills(getattr(leg, "wallet", None) or {}, prot_fill["bsc_lo"],
+                                max_wait=LO_SETTLE_MAX_WAIT if hot else 0)
+        if late and late[0] > float(prot_fill.get("spot_filled") or 0):
+            prot_fill["spot_filled"], prot_fill["spot_cost"] = late
+            prot_fill["late_fill"] = True
+        try:
+            left = leg.held_base()
+        except Exception:
+            left = None
+        if left is not None and _is_dust(leg, left, ref):
+            fully_sold = True
     if hedger.failed is None:
         target = perp_to_close if fully_sold else state["sold"] * ratio
         hedger.target(target, force_all=fully_sold)
@@ -1993,7 +2047,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         "spot_sold": state["sold"], "perp_closed": hedger.hedged,
         "spot_exit_price": state["proceeds"] / state["sold"] if state["sold"] else None,
         "perp_exit_price": hedger.avg or None,
-        "remaining_spot": max(0.0, spot_qty - state["sold"]),
+        "remaining_spot": 0.0 if fully_sold else max(
+            0.0, spot_qty - state["sold"] - float(prot_fill.get("spot_filled") or 0)),
         "remaining_perp": max(0.0, perp_qty - hedger.hedged),
         "complete": fully_sold and hedger.hedged >= perp_to_close * 0.999,
         "order_ids": list(leg.order_ids) + hedger.order_ids,

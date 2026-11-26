@@ -423,6 +423,9 @@ class ScannerWorker:
                 )
                 continue
 
+            actions = cfg.get("tg_actions_enabled") and self._flask_app
+            if actions:
+                self._tg_actions(uid, user_alerts, "attach")
             try:
                 sent_total += self.email_notifier.send_alerts(
                     user_alerts,
@@ -431,8 +434,25 @@ class ScannerWorker:
                 )
             except Exception as e:
                 log.error(f"Telegram send failed for user {uid}: {e}")
+            if actions:
+                self._tg_actions(uid, user_alerts, "record_sent")
 
         return sent_total
+
+    def _tg_actions(self, uid, alerts, step):
+        """Botones de Telegram (notifications/tg_actions.py): attach antes de enviar,
+        record_sent después. Un fallo solo deja la alerta sin botones."""
+        from notifications import tg_actions
+        fn = getattr(tg_actions, step)
+        for a in alerts:
+            if not (a.get("action") or a.get("type") in tg_actions.REBALANCE_TYPES):
+                continue
+            try:
+                with self._flask_app.app_context():
+                    fn(uid, a) if step == "attach" else fn(a)
+            except Exception as e:
+                log.warning(f"tg_actions.{step} {a.get('type')} user={uid}: {e}")
+                a.pop("reply_markup", None)
 
     def _load_user_telegram_config(self, user_id) -> dict:
         """Load a user's Telegram config from DB."""
@@ -448,6 +468,7 @@ class ScannerWorker:
                     "email_enabled": us.get("email_enabled", False),
                     "tg_chat_id": us.get("tg_chat_id", ""),
                     "tg_bot_token": us.get("tg_bot_token", ""),
+                    "tg_actions_enabled": us.get("tg_actions_enabled", False),
                 }
         except Exception as e:
             log.error(f"Failed to load Telegram config for user {user_id}: {e}")
@@ -894,7 +915,7 @@ class ScannerWorker:
 
         # 10. Señales de mercado horarias (OI, ratios, basis…) de los candidatos
         # Binance spot_perp: una vez por hora UTC, la primera vez que escanea.
-        self._maybe_store_market_features(spot_perp_opps)
+        self._maybe_store_market_features(spot_perp_opps, opportunities)
 
     def _position_outlook(self, all_rates: dict, spot_perp_opps: list) -> dict:
         """{"SYM_Exchange": {pred, score, ts}} para las posiciones spot_perp activas."""
@@ -1036,16 +1057,30 @@ class ScannerWorker:
 
     # ── Market Feature Snapshots (señales horarias para el modelo) ──
 
-    def _maybe_store_market_features(self, spot_perp_opps: list):
+    @staticmethod
+    def _shown_values(opportunities: list) -> dict:
+        """{símbolo: lo que la UI muestra} de las spot_perp Binance (validación en vivo)."""
+        out = {}
+        for o in opportunities or []:
+            if o.get("mode") != "spot_perp" or o.get("exchange") != "Binance":
+                continue
+            out[o["symbol"]] = {"model_prediction": o.get("model_prediction"),
+                                "rel_width": o.get("rel_width"), "consensus": o.get("consensus"),
+                                "consensus_p": o.get("consensus_p"),
+                                "consensus_version": o.get("consensus_version")}
+        return out
+
+    def _maybe_store_market_features(self, spot_perp_opps: list, opportunities: list = None):
         symbols = sorted({o.symbol for o in spot_perp_opps if o.exchange == "Binance"})
         hour = int(time.time() // PERIODIC_SCAN_SECS)
         if not symbols or not self._flask_app or self._mf_hour == hour:
             return
         self._mf_hour = hour  # marca antes de lanzar: evita dos hilos en la misma hora
-        threading.Thread(target=self._store_market_features, args=(symbols, hour),
+        threading.Thread(target=self._store_market_features,
+                         args=(symbols, hour, self._shown_values(opportunities)),
                          daemon=True).start()
 
-    def _store_market_features(self, symbols: list, hour: int = None):
+    def _store_market_features(self, symbols: list, hour: int = None, shown: dict = None):
         """Recolecta y upsertea market_feature_snapshots. Nunca lanza."""
         try:
             from exchanges import market_features as mf
@@ -1053,6 +1088,8 @@ class ScannerWorker:
                 self._mf_collector = mf.MarketFeatureCollector(self.exchange_manager)
             t0 = time.time()
             rows = self._mf_collector.collect(symbols)
+            for r in rows:
+                r.update((shown or {}).get(r["symbol"], {}))
             with self._flask_app.app_context():
                 from core.database import db
                 n = mf.upsert_rows(db, rows)
@@ -1126,6 +1163,7 @@ class ScannerWorker:
                 if sm is not None:          # reemplaza el sizing por ancho relativo
                     o["size_mult"] = sm
                 o.update(consensus=ev["consensus"], consensus_label=ev["label"],
+                         consensus_version=str(tbl.get("version") or ""),
                          consensus_med_apr=cal.get("med"), consensus_reach=cal.get("reach5"),
                          consensus_votes=f"{sum(a['vote'] > 0 for a in voted)}/{len(voted)}")
         except Exception as e:
@@ -1635,6 +1673,8 @@ class ScannerWorker:
                                     f"salida se pagan igual: cerrar ahora evita pagar funding."
                                     + pred_txt),
                     })
+                    if pos.get("source") in ("auto", "imported") and pid:
+                        alerts[-1]["action"] = {"kind": "CLOSE_SUGGESTED", "position_id": int(pid)}
             elif (pos["entry_fr"] > 0 and cfr < 0) or (pos["entry_fr"] < 0 and cfr > 0):
                 key = f"RATE_REVERSAL_{sym}_{display_ex}_{uid}_{pid}"
                 active_keys.add(key)

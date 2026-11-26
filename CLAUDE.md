@@ -1,8 +1,38 @@
 # CLAUDE.md — Funding Rate Arbitrage Bot
 
-Estado del proyecto al **2026-11-24** (revisión de la operación real, rama `feat/ops-review`).
+Estado del proyecto al **2026-11-26** (rama `feat/unified-20261126`: rebalanceo spot→margen y botones de Telegram, BULLA #61 —fills tardíos de Kyber— y consenso calibrado).
 
 ---
+
+## Consenso calibrado contra el éxito real (2026-11-26, rama `feat/consensus-calibrated`)
+
+Pedido: que consenso k signifique "en k×10 % de los casos parecidos se cumplió lo esperado". Éxito = APR neto
+realizado (salida al 3.er pago ≤ 0, tope 30 d; costo Alpha 0.41 % fees + 0.70 % precio real, CEX 0.30 %) ≥
+APR neto predicho. `scripts/consensus_study.py` → `reports/consensus_study_20261126.md` (+ `_cal180`): analistas
+por deciles → pool logit L2 → Venn-Abers inductivo (Satopää 2016; Vovk & Petej 2014), HistGB como techo,
+walk-forward mensual con purga 31 d, 12 meses, señales de 365 d (`signals_dataset.py --days 365`).
+- **No pasa → no se exporta tabla v2; el consenso vigente queda igual.** B peor que la tasa base (ΔBrier
+  +0.0064, ECE 0.116); con 180 d de calibración (post-hoc) +2.6 % BSS y falla con el motor.
+- **Causa**: el modelo está sobre-disperso (decil alto predice 45.7 % → rinde 31.1 %; bajo 1.2 % → 4.5 %), así
+  que cumplir lo predicho cae de 61 % a 29 % del quintil bajo al alto y depende del régimen del mes. Tasa base
+  44 %. El consenso vigente sí ordena cuánto rinde (APR real 7.0 → 20.8 %, gana 72 → 91 %) y su sizing gana
+  (32.4 vs 25.9 % anual). El consenso vigente **no** ordena la P de cumplir (su isotónica queda plana).
+- Descartados: `hit7` (acierto reciente del modelo) y Δmultitud 14 d — fuertes este año, nulos el anterior;
+  `basis_chg_24h` por paridad (ρ 0.59 en `signals_dataset --check`).
+- **Censura**: filas sin 30 d de horizonte observable se excluyen (sin eso el último mes da éxito 2 %); el mismo
+  sesgo afecta los hold-out de `ml_v2`/`confidence_study`.
+- **Registro en vivo** (nuevo): `market_feature_snapshots.model_prediction/rel_width/consensus/consensus_p/
+  consensus_version` = lo que la UI mostró esa hora (worker `_shown_values`, COALESCE en el upsert; 120 d);
+  `auto_open` guarda `entry_consensus`. `scripts/consensus_live.py` (solo lectura) → diagrama de confiabilidad
+  en vivo; primer chequeo ≈ 2027-01-05. (`score_snapshots` se recorta a 30 filas/par: no sirve para esto.)
+- **Recalibrar la cifra "APR esperado" tampoco pasa** (`scripts/apr_calibration_study.py` →
+  `reports/apr_calibration_20261126.md`; mapa monótono p_prod → mediana del APR real, 20 cuantiles + PAVA, WF
+  mensual 12 m). M2 (mapa por venue Alpha/CEX) pasa pinball (−0.31 [−0.42, −0.20], 5/5 trimestres) y calibración
+  (cumple 48.5 %, deciles 45–53 % vs 61 → 28 % del vigente), pero **falla con el motor**: en los 25 tokens Alpha
+  del motor lo mostrado se cumple 67 % (63 % aun con el costo fijo) → esos tokens líquidos rinden más que el Alpha
+  medio y el mapa los subestimaría. No se exporta; la UI sigue mostrando `model_prediction`. Hipótesis por
+  pre-registrar: mapa por venue × liquidez/costo del token.
+- Tests: `tests/test_consensus_calibration.py`, `tests/test_market_features.py::test_worker_guarda_lo_mostrado`.
 
 ## Revisión de la operación real (2026-11-24, rama `feat/ops-review`)
 
@@ -74,6 +104,36 @@ y `_cartera.md`. Calibrado vs 10 trades reales (|error| basis 0.32 pp entrada, s
   queda en Binance al cerrar: volver a la wallet BSC requiere retiro (las keys no lo permiten → manual).
 - Meta: 2.5 % mensual sostenido no se alcanza a 1x (~2.0 %); 5 % no aparece en ninguna configuración.
 
+## Reglas del piloto LLM y botones de Telegram (2026-11-18, rama `feat/signals-telegram`)
+
+- **Reglas deterministas del LLM: no pasan** (`python -u scripts/profit_study.py --signals [--reuse]` →
+  `reports/signal_rules_study_20261118.md`, base = política de prod, 13 meses, criterio fijado antes). Salida X4
+  (basis de venta ≥ +0.2/+0.3/+0.5 y funding en el piso 1 o 3 pagos) pierde 0.8–1.6 pp por operación (0/5 trimestres):
+  corta posiciones que cobran hasta el tope de 30 d; la rotación no compensa. Filtro de entrada E5 (fracción de 24 h
+  con basis ≥ θ ≥ 30/50/70 %) separa candidatos (entran 96 % vs 69 %, +2.45 vs +1.32 %) pero no mejora la cartera.
+  Paridad horario (prod) vs 1m: ρ 0.87. Hipótesis abierta: usar la fracción para **ordenar** (pre-registrar criterio).
+  Reglas puras en `analysis/signals.py` (solo backtest; no usar en prod sin que una variante pase). El +0.1–0.4 pp/mes
+  del LLM sin la mecha de TA es consistente con ruido → **no LLM en prod**.
+- **Botones de Telegram** (`notifications/tg_actions.py`, opt-in `user_configs.tg_actions_enabled` en Config): al
+  activarlos se registra el webhook del bot del usuario en `PUBLIC_BASE_URL/api/tg/hook/<uid>` (secret_token
+  aleatorio; se guarda su sha256 en `tg_webhook_secret_hash`; `allowed_updates=callback_query`). El webhook valida
+  secreto + `chat.id`, y la señal (`user_signals`) pasa `pending → accepted` de forma atómica (doble clic = una
+  acción). `CLOSE_SUGGESTED` de posiciones auto/importadas lleva "Cerrar (espera basis ≥ 0)" (vence en 8 h) →
+  `routes._start_close` (mismo camino que el botón del dashboard: job `armed` con θx 0.00/48 h). Señal no enviada
+  (dedup) se borra. `_send_telegram` acepta `reply_markup` y devuelve `message_id`.
+- **Rebalanceo automático + aviso** (decisión del usuario: la latencia decide): `REBALANCED`/`REBALANCE_FAILED` llevan
+  botón "Pausar/Reanudar rebalanceo" → `user_configs.rebalance_paused` (también en Config); `_maybe_rebalance` lo
+  respeta. Sin aviso previo (sumaría latencia). Habilitar `REBALANCE_ENABLED=1` solo tras medir latencia ≤ 15 min.
+- Tests: `tests/test_tg_actions.py`, `tests/test_signals.py`, caso pausa en `tests/test_rebalance.py`.
+
+## Piloto Claude como decisor (2026-11-18, `scripts/llm_policy_study.py`, `reports/llm_policy_pilot_20261118.md`)
+
+Opus 5.5 vía `claude -p` (suscripción; `LLM_CLAUDE_BIN` = CLI ≥ 2.1.280; con Kaspersky usar su CA en
+`NODE_EXTRA_CA_CERTS`) decide entradas/tamaño/salidas cada día sobre el mismo motor; cortado en 64 días por límites
+de uso. Sin la mecha on-chain de TA (+348 USD de suerte): LLM +2.06 %/mes vs P0 +1.85 (Δ +0.10, IC [−0.41, +0.57]),
+vs P0d mismo reloj +0.39 (P 85 %); LLM+ML no mejora (p5 −1.06). Ventaja = rota más y sale cuando el basis de venta es
+favorable → **probar esa regla determinista en `profit_study` antes que un LLM en prod** (~0.06 USD/decisión API).
+
 ## Rentabilidad real e informes mensuales (2026-11-17, rama `feat/returns-reports-model`)
 
 - **Rentabilidad real sobre capital total** (`portfolio/returns.py`): `capital_used` = spot + margen (a 1x la mitad
@@ -102,6 +162,32 @@ fue flojo para la estrategia (sesgo: el label H30 del último mes solo incluye s
 APR sobre nocional) supera lo predicho (40.8 %)**; la brecha es de ejecución: PnL de precio −40 pp (KOMA, AIN, ARIA,
 ZEST: SL/basis/slippage). Top-decil del funding sin compresión (0.134 → 0.142 %/día); bajan los pares ≥ 0.03 %/día
 (266 → 213). Palanca: ejecución/basis de salida y riesgo de SL en Alpha, no el modelo. Re-correr ambos en ~15 d.
+
+## Rebalanceo spot → margen (2026-11-17, rama `feat/rebalance-margin`, flag apagado)
+
+Variante R2 de `reports/profit_study_20261117.md` (eventos de SL 22 % → 1–4 %, p5 −1.16 → 0.00; habilita 2x ≈ 2.3 %/mes).
+- **Disparo** (`execution/protection.py:_maybe_rebalance`, solo `REBALANCE_ENABLED=1`): mark ≥ ancla +
+  `REBALANCE_FRACTION` (0.6) · (SL − ancla); ancla = `protection_json.anchor` o la entrada. Cooldown 30 min
+  (`rebalance_at`), venta mínima 10 USD, f ≤ 0.5.
+- **Job `rebalance`** (`execution/rebalance.py`): (1) `execute_close` sobre la fracción f = 1 − ancla/mark (vende spot
+  y recompra el mismo tanto del short, pareado; la recompra ya aleja la liquidación) → `_apply_partial_close`;
+  (2) seguros con ancla = precio de recompra; (3) BSC: USDT de la wallet → dirección de depósito Binance
+  (`BinanceAccount.deposit_address/wait_deposit`, timeout 20 min); (4) spot→futuros (`transfer_usdt`) y
+  `add_isolated_margin`; (5) seguros re-anclados sobre la liquidación final. Agregar TODO lo vendido como margen
+  re-ancla la liquidación exacta del estudio: liq = p·(1 + 1/L)/(1 + mmr).
+- Fallo en (3)/(4): la posición queda más segura (short reducido) y el USDT en wallet/tránsito → alerta
+  `REBALANCE_FAILED` para terminar a mano. Cada intento queda en `payments_json` (`kind: "rebalance"`, tiempos por
+  etapa y `latency_s`). Tras reinicio no se repite (queued → cancelled, running → interrupted + alerta).
+- **No necesita IP fija**: depositar y Universal Transfer funcionan con la key sin IP restrict. La IP fija (Railway Pro,
+  decisión del usuario) solo hace falta para **retirar** de Binance a la wallet BSC (Fase B, pendiente).
+- **Validación antes de habilitar**: `POST /api/positions/<id>/rebalance` `{fraction, confirm:true}` sobre una posición
+  chica → medir latencia venta→margen. Si > 15 min no habilitar (el estudio pierde a 45 min). Alpha sigue en 1x hasta
+  ≥ 5 rebalanceos reales.
+- **Reproducción con los SL reales (2026-11-26, velas MARK 1m, latencia 15 min)**: BULLA #61 (1x, SL a 0.06153 llenó
+  0.06304, precio −23.5 USD): un rebalanceo a las 12:15 UTC (MARK 0.0512, f 30 %, ~220 USD de spot) sube la liq de
+  0.0680 a 0.0763 **sin** el depósito y a 0.0975 con él (SL 0.0883) → el pico de 0.06416 no lo toca. ARIA #56 (2x):
+  3 rebalanceos (0.1886, 0.2274, 0.2741; f 17 % c/u) y sin SL hasta la MARK máx. 0.3206. La seguridad no depende de
+  la latencia (la recompra del short va con la venta); el depósito solo devuelve el capital al margen.
 
 ## ¿Umbrales fijos o adaptativos? (2026-11-10, rama `feat/adaptive-sizing`)
 
@@ -155,6 +241,20 @@ recarga de margen (`reports/margin_topup_study_20261110_bsc.md`), ejecución aut
 **Re-evaluar** (`python -u scripts/exec_study.py --refresh-cost`, `--fetch`, luego sin flags; `--real` compara con
 `cache/real_exec.pkl`, que se extrae en solo lectura de prod): cuando haya ≥ 10 ejecuciones con tramos de 15 min,
 medir ρ real con `scripts/execution_decomp.py`. Si ρ ≈ 1, volver a 45 s.
+
+### BULLA #61: SL + fills tardíos de la límite Kyber (2026-11-26, rama `claude/caoviedor-positions-bulla-558b3d`)
+- SL (trigger 0.06153 sobre MARK) llenó 16:42:53 UTC a 0.06304 (+2.46 %) en un pico (+76 % en 18 h, 1x). La
+  liquidación (0.06799) no se tocó: MARK máx. 0.06416. La venta límite Kyber llenó 13,073 de 14,191 BULLA a 0.06122
+  **después** de que el cierre la cancelara (Kyber llena hasta `operatorSignatureExpiredAt`, ~2 min). Real: precio
+  −23.51, funding +6.41, fees 0.76 → neto −17.86. basyo registró −337.73 y 12,256 BULLA fantasma.
+- Salida por SL = pérdida estructural δ + slippage del SL: la límite Kyber llena exacto al precio (la mejora es del
+  taker) y el SL a mercado paga el pico. La palanca es el margen (rebalanceo spot→margen, PR #126), no δ.
+- Fixes: `onchain_bsc.transfer_deltas` (swap medido por los Transfer del recibo; la diferencia de saldo mezclaba los
+  fills de la límite), salida desnuda sin saldo = fin sin error, `trade_executor._bsc_final_fills` (relee la límite
+  al final del cierre, espera a que venza la firma ≤ 180 s) y completitud por saldo real de la wallet.
+- `scripts/settle_position.py --with-partials`: liquida una posición con cierres parciales mal medidos (rehace las
+  piernas desde `auto_open`: límite Kyber + swaps por recibo; reemplaza `realized_price_pnl`/`exit_fees_real`).
+  Tests: `tests/test_exec_safety.py` (`transfer_deltas`, `late_kyber`).
 
 ### BULLA #60: apertura parcial y «Completar apertura» (2026-11-23, rama `fix/bulla-partial-topup`)
 - Job #43 (1,205 USD, 1x, 3 tramos): tramo 1 OK (201 USDT → 7,645.5 BULLA + short 7,645); en el tramo 2
@@ -794,7 +894,8 @@ Modal de ejecución con TWAP, simulación con leverage/liquidación/basis/fondos
 - `notifications/email.py:build_alert_dedup_key(alert)` — única fuente de verdad para la dedup_key: `f"{type}:{user_id}:{symbol}:{exchange}:{bucket}"` donde `bucket` es `funding_ts` (ms o s) para alertas window-bound, o `_exc_bucket` (`YYYYMMDD`) para broadcasts diarios.
 - `notifications/email.py:valid_telegram_creds(chat_id, token)` — validación de formato barata antes de golpear la API (chat_id numérico ≥5 chars, token con `:` y ≥20 chars). Si falla, log único por usuario y skip.
 
-**Tipos de alerta:** `CLOSE_SUGGESTED` (dos settlements seguidos sin cobrar: último pago ≤0 y el próximo también), `RATE_REVERSAL` (informativa, una vez por posición), `NAKED_SPOT` (crítica: short desaparecido con spot en manos), `LIQUIDATION_RISK` (short a <20% de liquidación), `PRE_PAYMENT_UNFAVORABLE`, `SL_TP_REVIEW`, `EXCEPTIONAL_OPPORTUNITY`, `SWITCH_OPPORTUNITY`, `POSITION_CLOSED`, `SPOT_TP_RUNNER` (venta spot llenada: short suelto con TP; CEX −5 %/15 min, BSC −20 %/1 h), `EXCHANGE_GEOBLOCKED` (crítica, diaria por usuario: el sync de Binance recibe 451 geográfico).
+**Tipos de alerta:** `CLOSE_SUGGESTED` (dos settlements seguidos sin cobrar: último pago ≤0 y el próximo también), `RATE_REVERSAL` (informativa, una vez por posición), `NAKED_SPOT` (crítica: short desaparecido con spot en manos), `LIQUIDATION_RISK` (short a <20% de liquidación), `PRE_PAYMENT_UNFAVORABLE`, `SL_TP_REVIEW`, `EXCEPTIONAL_OPPORTUNITY`, `SWITCH_OPPORTUNITY`, `POSITION_CLOSED`, `SPOT_TP_RUNNER` (venta spot llenada: short suelto con TP; CEX −5 %/15 min, BSC −20 %/1 h), `EXCHANGE_GEOBLOCKED` (crítica, diaria por usuario: el sync de Binance recibe 451 geográfico), `REBALANCED` /
+`REBALANCE_FAILED` (rebalanceo spot→margen hecho / incompleto con USDT por mover a mano); con botón Pausar/Reanudar). Con `tg_actions_enabled`, `CLOSE_SUGGESTED` lleva botón "Cerrar".
 
 ---
 
@@ -902,6 +1003,9 @@ BSC_RPC_URL           # default https://bsc-dataseed.bnbchain.org
 BSC_MEV_PROTECTION    # default 1 (broadcast por mempool privada)
 BSC_PRIVATE_RPC_URL   # RPC anti-MEV de BSC para transmitir cuando el agregador no tiene broadcast (Kyber); vacío = RPC público
 EXCHANGE_PROXY_URL    # socks5h://user:pass@ip:puerto — salida a exchanges vía VPS (geobloqueo); vacío = directo
+REBALANCE_ENABLED     # =1 → el vigilante dispara el rebalanceo spot→margen (default apagado)
+REBALANCE_FRACTION    # fracción del camino ancla→SL que dispara el rebalanceo (default 0.6)
+PUBLIC_BASE_URL       # URL pública (https) para el webhook de botones de Telegram (default https://basyo.app)
 ```
 
 > Nota: las API keys globales de CEX (arriba) son para datos públicos del scanner. La **auto-ejecución** usa las keys *por usuario* guardadas en `user_exchange_keys` (tab Cuenta), no estas.
