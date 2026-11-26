@@ -57,3 +57,17 @@ def test_apr_map_monotone_and_flat_outside():
     assert np.all(np.diff(ky) >= -1e-9)
     out = acs.apply_map(k, [-10, 30, 1000])
     assert out[0] == ky[0] and out[2] == ky[-1] and abs(out[1] - 22) < 3
+
+
+def test_apr_map_por_liquidez_usa_cortes_del_train():
+    acs = pytest.importorskip("apr_calibration_study")
+    rng = np.random.default_rng(4)
+    n = 24000
+    tr = pd.DataFrame({"alpha": rng.integers(0, 2, n), "p_prod": rng.uniform(1, 50, n),
+                       "log_volume": rng.uniform(5, 8, n), "t": pd.Timestamp("2026-01-01", tz="UTC")})
+    tr["y_real"] = tr["p_prod"] * np.where(tr["log_volume"] > 7, 1.2, 0.5) + rng.normal(0, 3, n)
+    m = acs.fit_variant(tr, "M4")
+    assert set(m["cuts"]) == {"alpha", "cex"} and len(m["maps"]) == 6
+    te = pd.DataFrame({"alpha": [1, 1], "p_prod": [30.0, 30.0], "log_volume": [5.2, 7.8]})
+    lo, hi = acs.apply_variant(m, te)
+    assert hi > lo + 15

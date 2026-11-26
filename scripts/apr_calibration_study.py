@@ -13,6 +13,8 @@ Variantes (walk-forward mensual, 12 meses, purga 31 d):
   M1  mapa global, train expansivo
   M2  mapa por venue (Alpha / CEX), train expansivo
   M3  mapa por venue, train de los últimos 180 d (régimen)
+  M4  mapa por venue × tercil de volumen 24 h del perp (cortes del train)      [añadidas 2026-11-26,
+  M5  mapa por venue × tercil de OI USD (sin dato = grupo propio)               tras fallar M2/M3 en 3]
 Mapa: 20 cuantiles de p_prod en el train → (mediana p_prod, mediana y_real) por tramo, PAVA
 ponderado por n para hacerlo creciente, interpolación lineal y plano fuera del rango.
 
@@ -23,7 +25,9 @@ Criterio PRE-REGISTRADO (fijado antes de correr):
      mostrado con n ≥ 200 en 50 ± 10 pp.
   3. Confirmación con el motor de ejecución (cache/profit_study.pkl, 25 tokens Alpha):
      cumplimiento en 50 ± 10 pp y pinball < M0.
-  4. Entre las que pasan, la más simple (M1 < M2 < M3) salvo que otra baje el pinball ≥ 1 %.
+  4. Entre las que pasan, la más simple (M1 < M2 < M3 < M4 < M5) salvo que otra baje el pinball ≥ 1 %.
+  M4/M5 se evalúan con el mismo criterio 1–3, sin cambiarlo; solo usan variables con paridad en prod
+  (volume_24h de la oportunidad; OI de market_feature_snapshots).
 Si ninguna pasa, no se exporta y la UI sigue mostrando p_prod.
 
     python -u scripts/apr_calibration_study.py [--export]
@@ -48,7 +52,8 @@ N_Q = 20
 PURGE_DAYS = cst.PURGE_DAYS
 RECENT_DAYS = 180
 MIN_DEC_N = 200
-VARIANTS = ("M1", "M2", "M3")
+VARIANTS = ("M1", "M2", "M3", "M4", "M5")
+TIER_FEAT = {"M4": "log_volume", "M5": "log_oi_usd"}
 
 
 # ── Mapa monótono ───────────────────────────────────────────────────────────
@@ -89,7 +94,32 @@ def apply_map(knots, x):
     return np.interp(np.asarray(x, float), k[:, 0], k[:, 1])
 
 
+def _venue(d):
+    return np.where(d["alpha"] == 1, "alpha", "cex")
+
+
+def _groups(d, v, cuts):
+    ven = _venue(d)
+    if v not in TIER_FEAT:
+        return ven
+    x = d[TIER_FEAT[v]].to_numpy(float)
+    tier = np.full(len(d), "na", dtype=object)
+    for k in ("alpha", "cex"):
+        m = (ven == k) & ~np.isnan(x)
+        tier[m] = np.searchsorted(cuts[k], x[m], side="right").astype(str)
+    return np.char.add(np.char.add(ven.astype(str), "|"), tier.astype(str))
+
+
 def fit_variant(tr: pd.DataFrame, v: str) -> dict:
+    if v in TIER_FEAT:
+        f = TIER_FEAT[v]
+        cuts = {k: np.nanquantile(g[f], [1 / 3, 2 / 3]).round(4).tolist()
+                for k, g in tr.groupby(_venue(tr))}
+        gr = _groups(tr, v, cuts)
+        maps = {k: fit_map(tr.loc[gr == k, "p_prod"], tr.loc[gr == k, "y_real"])
+                for k in np.unique(gr) if (gr == k).sum() >= 2000}
+        return {"feature": f, "cuts": cuts, "maps": maps,
+                "fallback": {k: fit_map(g["p_prod"], g["y_real"]) for k, g in tr.groupby(_venue(tr))}}
     if v == "M3":
         tr = tr[tr["t"] >= tr["t"].max() - timedelta(days=RECENT_DAYS)]
     if v == "M1":
@@ -99,6 +129,14 @@ def fit_variant(tr: pd.DataFrame, v: str) -> dict:
 
 
 def apply_variant(maps: dict, d: pd.DataFrame) -> np.ndarray:
+    if "cuts" in maps:
+        v = next(k for k, f in TIER_FEAT.items() if f == maps["feature"])
+        gr, ven = _groups(d, v, maps["cuts"]), _venue(d)
+        out = apply_variant(maps["fallback"], d)
+        for k, kn in maps["maps"].items():
+            m = gr == k
+            out[m] = apply_map(kn, d.loc[m, "p_prod"])
+        return out
     if "all" in maps:
         return apply_map(maps["all"], d["p_prod"])
     out = np.full(len(d), np.nan)

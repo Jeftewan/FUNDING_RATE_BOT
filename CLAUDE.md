@@ -30,8 +30,11 @@ walk-forward mensual con purga 31 d, 12 meses, señales de 365 d (`signals_datas
   mensual 12 m). M2 (mapa por venue Alpha/CEX) pasa pinball (−0.31 [−0.42, −0.20], 5/5 trimestres) y calibración
   (cumple 48.5 %, deciles 45–53 % vs 61 → 28 % del vigente), pero **falla con el motor**: en los 25 tokens Alpha
   del motor lo mostrado se cumple 67 % (63 % aun con el costo fijo) → esos tokens líquidos rinden más que el Alpha
-  medio y el mapa los subestimaría. No se exporta; la UI sigue mostrando `model_prediction`. Hipótesis por
-  pre-registrar: mapa por venue × liquidez/costo del token.
+  medio y el mapa los subestimaría. M4/M5 (venue × tercil de volumen perp / OI) mejoran el histórico (M4 −0.35,
+  cumple 49.3 %) y fallan igual (67 %). **Causa: el conjunto del motor está seleccionado** (caché de estudios ∪
+  `PROD_SYMBOLS`, supervivientes): APR real mediano 20.2 % vs 10.9 % del resto de Alpha con `p_prod` parecido; no
+  lo separa el volumen ni el llenado de la espera. No se exporta; la UI sigue mostrando `model_prediction`. Lo
+  decide la validación en vivo (aplicar M2/M4 a lo registrado en `market_feature_snapshots`, ≈ 2027-01-05).
 - Tests: `tests/test_consensus_calibration.py`, `tests/test_market_features.py::test_worker_guarda_lo_mostrado`.
 
 ## Revisión de la operación real (2026-11-24, rama `feat/ops-review`)
