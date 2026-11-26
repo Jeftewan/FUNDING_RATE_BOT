@@ -915,7 +915,7 @@ class ScannerWorker:
 
         # 10. Señales de mercado horarias (OI, ratios, basis…) de los candidatos
         # Binance spot_perp: una vez por hora UTC, la primera vez que escanea.
-        self._maybe_store_market_features(spot_perp_opps)
+        self._maybe_store_market_features(spot_perp_opps, opportunities)
 
     def _position_outlook(self, all_rates: dict, spot_perp_opps: list) -> dict:
         """{"SYM_Exchange": {pred, score, ts}} para las posiciones spot_perp activas."""
@@ -1057,16 +1057,30 @@ class ScannerWorker:
 
     # ── Market Feature Snapshots (señales horarias para el modelo) ──
 
-    def _maybe_store_market_features(self, spot_perp_opps: list):
+    @staticmethod
+    def _shown_values(opportunities: list) -> dict:
+        """{símbolo: lo que la UI muestra} de las spot_perp Binance (validación en vivo)."""
+        out = {}
+        for o in opportunities or []:
+            if o.get("mode") != "spot_perp" or o.get("exchange") != "Binance":
+                continue
+            out[o["symbol"]] = {"model_prediction": o.get("model_prediction"),
+                                "rel_width": o.get("rel_width"), "consensus": o.get("consensus"),
+                                "consensus_p": o.get("consensus_p"),
+                                "consensus_version": o.get("consensus_version")}
+        return out
+
+    def _maybe_store_market_features(self, spot_perp_opps: list, opportunities: list = None):
         symbols = sorted({o.symbol for o in spot_perp_opps if o.exchange == "Binance"})
         hour = int(time.time() // PERIODIC_SCAN_SECS)
         if not symbols or not self._flask_app or self._mf_hour == hour:
             return
         self._mf_hour = hour  # marca antes de lanzar: evita dos hilos en la misma hora
-        threading.Thread(target=self._store_market_features, args=(symbols, hour),
+        threading.Thread(target=self._store_market_features,
+                         args=(symbols, hour, self._shown_values(opportunities)),
                          daemon=True).start()
 
-    def _store_market_features(self, symbols: list, hour: int = None):
+    def _store_market_features(self, symbols: list, hour: int = None, shown: dict = None):
         """Recolecta y upsertea market_feature_snapshots. Nunca lanza."""
         try:
             from exchanges import market_features as mf
@@ -1074,6 +1088,8 @@ class ScannerWorker:
                 self._mf_collector = mf.MarketFeatureCollector(self.exchange_manager)
             t0 = time.time()
             rows = self._mf_collector.collect(symbols)
+            for r in rows:
+                r.update((shown or {}).get(r["symbol"], {}))
             with self._flask_app.app_context():
                 from core.database import db
                 n = mf.upsert_rows(db, rows)
@@ -1147,6 +1163,7 @@ class ScannerWorker:
                 if sm is not None:          # reemplaza el sizing por ancho relativo
                     o["size_mult"] = sm
                 o.update(consensus=ev["consensus"], consensus_label=ev["label"],
+                         consensus_version=str(tbl.get("version") or ""),
                          consensus_med_apr=cal.get("med"), consensus_reach=cal.get("reach5"),
                          consensus_votes=f"{sum(a['vote'] > 0 for a in voted)}/{len(voted)}")
         except Exception as e:

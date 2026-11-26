@@ -148,6 +148,12 @@ def _run_migrations(db):
         "CREATE INDEX IF NOT EXISTS idx_mfs_ts_hour ON market_feature_snapshots (ts_hour)",
         "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS spot_source VARCHAR(8)",
         "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS alpha_liquidity_usd FLOAT",
+        # Validación en vivo del consenso: lo mostrado cada hora (scripts/consensus_live.py).
+        "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS model_prediction FLOAT",
+        "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS rel_width FLOAT",
+        "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS consensus FLOAT",
+        "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS consensus_p FLOAT",
+        "ALTER TABLE market_feature_snapshots ADD COLUMN IF NOT EXISTS consensus_version VARCHAR(20)",
         # Informes mensuales: vínculo historial → posición (funding por fecha de pago).
         # La tabla user_capital_daily la crea create_all.
         "ALTER TABLE user_history ADD COLUMN IF NOT EXISTS position_id INTEGER",

@@ -240,3 +240,22 @@ def test_alpha_leg_failure_keeps_row():
         alpha_loader=lambda: {"CCC": {"alpha_id": "ALPHA_9", "liquidity": 1.0}}, alpha_klines=boom)
     c = {r["symbol"]: r for r in col.collect(["CCC"], now=NOW)}["CCC"]
     assert c["spot_source"] == "alpha" and c["basis_pct"] is None and c["open_interest"] == 110.0
+
+
+def test_worker_guarda_lo_mostrado(app):
+    """model_prediction / consenso que mostró la UI quedan en la fila de la hora (validación en vivo)."""
+    from scanner.worker import ScannerWorker
+    w = ScannerWorker.__new__(ScannerWorker)
+    w._flask_app, w._mf_collector, w._mf_purge_day, w._mf_hour = app, _collector(FakeBinance()), None, None
+    shown = ScannerWorker._shown_values([
+        {"mode": "spot_perp", "exchange": "Binance", "symbol": "AAA", "model_prediction": 21.5,
+         "rel_width": 1.9, "consensus": 7.2, "consensus_version": "20261106"},
+        {"mode": "spot_perp", "exchange": "Bybit", "symbol": "BBB", "model_prediction": 9.0}])
+    assert set(shown) == {"AAA"}
+    w._store_market_features(["AAA", "BBB"], hour=1, shown=shown)
+    a, b = _rows()
+    assert (a.model_prediction, a.consensus, a.consensus_version) == (21.5, 7.2, "20261106")
+    assert b.model_prediction is None
+    # un re-scan sin esos valores no los pisa (COALESCE)
+    mf.upsert_rows(db, _collector(FakeBinance()).collect(["AAA"], now=a.ts_hour + 60))
+    assert _rows()[0].consensus == 7.2
