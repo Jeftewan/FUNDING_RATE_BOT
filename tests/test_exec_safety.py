@@ -627,3 +627,32 @@ def test_naked_close_counts_late_kyber_fills_and_receipt_amounts(bsc_env, klo, m
     assert sum(s["qty"] for s in res["exec"]["exit_swaps"]) == pytest.approx(300)
     assert res["remaining_spot"] == 0 and "partial_note" not in res
     assert ob.erc20_balance(tok, me) == 0
+
+
+def test_hedged_close_does_not_wait_for_kyber_signature(bsc_env, klo, monkeypatch):
+    """Con el short vivo y la límite sin fills (cierre normal o rebalanceo) no se espera a que
+    venza la firma del operador: serían minutos sin seguros."""
+    import time as _t
+    close, ex = bsc_env
+    klo(status="open", operatorSignatureExpiredAt=_t.time() + 120)
+    slept = []
+    monkeypatch.setattr(te.time, "sleep", lambda s: slept.append(s))
+    real_close = te.execute_close
+    monkeypatch.setattr(te, "execute_close", lambda creds, pos, **kw: real_close(
+        creds, {**pos, "protection": {"spot": dict(SPOT_LO)}}, **kw))
+    res = close(real_impact=0.0, oracle_impact=None, short=500, twap={"slices": 1, "duration_s": 0})
+    assert res["ok"] and res["complete"], res
+    assert not any(s >= 60 for s in slept), slept
+
+
+def test_bsc_final_fills_waits_until_signature_expires(klo, monkeypatch):
+    import time as _t
+    k = klo(status="cancelled", operatorSignatureExpiredAt=_t.time() + 30)
+    slept = []
+
+    def sleep(s):
+        slept.append(s)
+        k.order.update(filledMakingAmount=str(5 * 10 ** 20), filledTakingAmount=str(10 ** 21))
+    monkeypatch.setattr(te.time, "sleep", sleep)
+    assert te._bsc_final_fills(WALLET_BSC, SPOT_LO) == (pytest.approx(500.0), pytest.approx(1000.0))
+    assert slept and 30 <= slept[0] <= 36

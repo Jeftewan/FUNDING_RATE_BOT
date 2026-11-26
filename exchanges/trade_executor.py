@@ -1999,7 +1999,12 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     if onchain and prot_fill.get("bsc_lo"):
         # La límite cancelada pudo seguir llenando mientras se vendía (BULLA #61):
         # lo llenado cuenta como salida y la wallet real dice si queda spot.
-        late = _bsc_final_fills(getattr(leg, "wallet", None) or {}, prot_fill["bsc_lo"])
+        # Solo se espera a que venza la firma si la límite pudo estar llenando (short ya cerrado
+        # por el SL, o ya tenía fills): un cierre normal o un rebalanceo no deben quedar minutos
+        # sin seguros por una orden lejos de su precio.
+        hot = not actual_short or float(prot_fill.get("spot_filled") or 0) > 0
+        late = _bsc_final_fills(getattr(leg, "wallet", None) or {}, prot_fill["bsc_lo"],
+                                max_wait=LO_SETTLE_MAX_WAIT if hot else 0)
         if late and late[0] > float(prot_fill.get("spot_filled") or 0):
             prot_fill["spot_filled"], prot_fill["spot_cost"] = late
             prot_fill["late_fill"] = True
