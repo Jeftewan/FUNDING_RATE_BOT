@@ -72,7 +72,43 @@ def _ts(sec):
     return datetime.fromtimestamp(sec, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def settle(app, pos_id):
+def _open_qtys(pos):
+    """Cantidades de la apertura (entrada `auto_open`): la fila ya las descontó en los parciales."""
+    pj = pos.get("payments") or pos.get("payments_json") or []
+    if any(p.get("kind") == "topup" for p in pj if isinstance(p, dict)):
+        sys.exit("La posición tiene top-ups: --with-partials no los soporta")
+    for p in pj:
+        if isinstance(p, dict) and p.get("kind") == "auto_open":
+            legs = {lg.get("kind"): float(lg.get("amount") or 0) for lg in p.get("legs") or []}
+            if legs.get("spot") and legs.get("perp"):
+                return legs["spot"], legs["perp"]
+    sys.exit("Sin entrada auto_open con cantidades: no se pueden reconstruir las piernas")
+
+
+def _partial_swaps(pos, token, address):
+    """(base vendida, USDT, gas USD, txs) de los swaps de los cierres parciales ya registrados,
+    medidos por los Transfer de cada recibo (no por el saldo: BULLA #61)."""
+    from exchanges import onchain_bsc as ob
+    sold = usdt = fee = 0.0
+    txs = []
+    for p in pos.get("payments") or pos.get("payments_json") or []:
+        if not isinstance(p, dict) or p.get("kind") != "auto_close_partial":
+            continue
+        fee += sum(float(lg.get("fee_usd") or 0) for lg in p.get("legs") or [] if lg.get("kind") == "spot")
+        for h in p.get("order_ids") or []:
+            if not (isinstance(h, str) and h.startswith("0x") and len(h) == 66):
+                continue
+            rc = ob.wait_receipt(h)
+            if int(rc.get("status", "0x0"), 16) != 1:
+                continue
+            d = ob.transfer_deltas(rc, address, (token["address"], ob.USDT))
+            sold += ob.from_wei(-min(0, d.get(token["address"].lower(), 0)), int(token["decimals"]))
+            usdt += ob.from_wei(max(0, d.get(ob.USDT.lower(), 0)), ob.USDT_DECIMALS)
+            txs.append(h)
+    return sold, usdt, fee, txs
+
+
+def settle(app, pos_id, with_partials=False):
     """→ (pos, res, info) con los fills reales; aborta si no está liquidada en el exchange."""
     from core.db_models import UserPosition, UserWallet
     from core.db_persistence import DBPersistence
@@ -116,10 +152,15 @@ def settle(app, pos_id):
 
     # Pierna spot: la venta límite del seguro.
     spot = prot.get("spot") or {}
+    open_qty = _open_qtys(pos) if with_partials else None
+    swap_sold = swap_usdt = swap_fee = 0.0
+    swap_txs = []
     if spot.get("venue") == "bsc":
         from exchanges import kyber_limit_order as klo
         ko = klo.get_order(address, spot["id"])
         sold, usdt = te._bsc_filled(spot, ko)
+        if with_partials:
+            swap_sold, swap_usdt, swap_fee, swap_txs = _partial_swaps(pos, token, address)
         txs = (ko or {}).get("transactions") or []
         spot_ts = max(int(t.get("txTime") or 0) for t in txs) if txs else None
         spot_ids = [str(spot["id"])] + [t.get("txHash") for t in txs]
@@ -135,9 +176,13 @@ def settle(app, pos_id):
         sold, usdt, spot_fee = f["gross"], f["cost"], f["fee_usd"]
         spot_ts, spot_ids, left = None, [str(spot["id"])], None
 
-    spot_qty, perp_qty = float(pos["spot_qty"]), float(pos["perp_qty"])
+    lo_sold, lo_usdt = sold, usdt
+    sold, usdt, spot_fee = sold + swap_sold, usdt + swap_usdt, spot_fee + swap_fee
+    spot_qty, perp_qty = open_qty or (float(pos["spot_qty"]), float(pos["perp_qty"]))
     if pf["gross"] < perp_qty * 0.99 or sold < spot_qty * 0.99:
         sys.exit(f"Llenados incompletos: perp {pf['gross']:g}/{perp_qty:g}, spot {sold:g}/{spot_qty:g}")
+    if with_partials and left is not None and left * (usdt / sold) >= 1.0:
+        sys.exit(f"Queda spot en la wallet ({left:g}): no está liquidada")
 
     # Funding real del exchange desde la entrada.
     entry_ms = int(pos.get("entry_time") or 0)
@@ -154,18 +199,21 @@ def settle(app, pos_id):
         "exit_fees_usd": round(pf["fee_usd"] + spot_fee, 6),
         "protection_filled": {"perp_filled": pf["gross"], "perp_cost": pf["cost"],
                               "spot_filled": sold, "spot_cost": usdt},
-        "order_ids": [str(actual)] + spot_ids[:1],
+        "order_ids": [str(actual)] + spot_ids[:1] + swap_txs,
         "spot_exit_price": spot_px, "perp_exit_price": perp_px,
         "exec": {"spot_exit_price": spot_px, "perp_exit_price": perp_px,
                  "exit_basis_pct": round((spot_px / perp_px - 1) * 100, 4),
                  "spot_leg_pnl": round(spot_leg, 6), "perp_leg_pnl": round(perp_leg, 6),
                  "sl_trigger": prot.get("sl_price"), "sl_fill_ts": sl_ts, "spot_fill_ts": spot_ts,
                  "spot_fills": len(spot_ids) - 1, "spot_dust_left": left,
-                 "settled_by": "scripts/settle_position.py"},
+                 "limit_sold": lo_sold, "limit_usdt": lo_usdt, "swap_sold": swap_sold,
+                 "swap_usdt": swap_usdt, "swap_txs": swap_txs,
+                 "settled_by": "scripts/settle_position.py" + (" --with-partials" if with_partials else "")},
     }
     info = {"uid": uid, "funding_exchange": funding, "funding_db": float(pos.get("earned_real") or 0),
             "n_funding": len(income), "sl_ts": sl_ts, "spot_ts": spot_ts, "pf": pf, "sold": sold,
-            "usdt": usdt, "spot_leg": spot_leg, "perp_leg": perp_leg, "left": left}
+            "usdt": usdt, "spot_leg": spot_leg, "perp_leg": perp_leg, "left": left,
+            "lo_sold": lo_sold, "lo_usdt": lo_usdt, "swap_sold": swap_sold, "swap_usdt": swap_usdt}
     return pos, res, info
 
 
@@ -174,12 +222,16 @@ def main():
     ap.add_argument("--pos", type=int, required=True)
     ap.add_argument("--apply", action="store_true", help="escribe en la DB (por defecto dry-run)")
     ap.add_argument("--railway", action="store_true", help="toma FERNET_KEY de Railway (no se imprime)")
+    ap.add_argument("--with-partials", action="store_true",
+                    help="la posición ya tiene cierres parciales registrados (BULLA #61): rehace las "
+                         "piernas desde la apertura (límite Kyber + swaps medidos por recibo) y "
+                         "reemplaza el PnL de precio y las fees de salida ya registrados")
     args = ap.parse_args()
     _load_env()
     if args.railway:
         _railway_env()
     app = _app()
-    pos, res, info = settle(app, args.pos)
+    pos, res, info = settle(app, args.pos, with_partials=args.with_partials)
 
     entry_fees = float(pos.get("entry_fees_real") if pos.get("entry_fees_real") is not None
                        else pos.get("entry_fees") or 0)
@@ -195,6 +247,11 @@ def main():
     print(f"  Venta spot {_ts(info['spot_ts']) if info['spot_ts'] else '?'}: {info['sold']:g} → "
           f"{info['usdt']:.4f} USDT @ {res['spot_exit_price']:.6g} ({res['exec']['spot_fills']} llenados), "
           f"polvo {info['left']}")
+    if args.with_partials:
+        print(f"    límite Kyber {info['lo_sold']:g} → {info['lo_usdt']:.4f} | swaps del bot "
+              f"{info['swap_sold']:g} → {info['swap_usdt']:.4f} (por recibo)")
+        print(f"    registrado antes: realized_price_pnl {pos.get('realized_price_pnl')} "
+              f"exit_fees_real {pos.get('exit_fees_real')} (se reemplazan)")
     print(f"  Funding: exchange {funding:+.4f} ({info['n_funding']} pagos) | DB {info['funding_db']:+.4f}")
     print(f"  Precio: spot {info['spot_leg']:+.4f} perp {info['perp_leg']:+.4f} → {res['price_pnl']:+.4f} "
           f"(basis de salida {res['exec']['exit_basis_pct']:+.3f} %)")
@@ -211,7 +268,14 @@ def main():
         row = UserPosition.query.get(args.pos)
         if abs(funding - (row.earned_real or 0)) > 1e-6:
             row.earned_real = funding
-            db.session.commit()
+        old = None
+        if args.with_partials:
+            # res trae el PnL de precio y las fees de salida COMPLETOS: lo de los parciales
+            # (mal medido) no se suma encima.
+            old = (row.realized_price_pnl, row.exit_fees_real)
+            row.realized_price_pnl = 0.0
+            row.exit_fees_real = 0.0
+        db.session.commit()
     JobRunner(app, _Worker())._finalize_close(info["uid"], pos, res["exit_fees_usd"], res, "settle")
     with app.app_context():
         h = (UserHistory.query.filter_by(user_id=info["uid"], symbol=pos["symbol"])
@@ -223,6 +287,9 @@ def main():
             h.closed_at = p.closed_at = datetime.fromtimestamp(info["sl_ts"], timezone.utc)
         h.notes = (h.notes or "") + (f"Liquidada con scripts/settle_position.py: SL y venta límite del seguro "
                                      f"ya ejecutados en el exchange @ {datetime.now().isoformat()}\n")
+        if old:
+            h.notes += (f"--with-partials: reemplaza realized_price_pnl {old[0]} y exit_fees_real {old[1]} "
+                        f"registrados por el cierre parcial (fills tardíos de la límite Kyber)\n")
         db.session.commit()
         print(f"Escrito: user_history #{h.id} net {h.net_earned:+.4f} price_pnl {h.price_pnl:+.4f} "
               f"fees {h.fees:.4f}; posición {p.status}")

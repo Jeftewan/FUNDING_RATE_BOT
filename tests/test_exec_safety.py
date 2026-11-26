@@ -565,3 +565,65 @@ def test_real_net_breakdown_unknown_external_buyback_is_none():
     Row.payments_json = []
     assert real_net_breakdown(Row(), {"price_pnl": None, "price_pnl_unknown": "x"})["price_pnl"] is None
     assert real_net_breakdown(Row(), {"price_pnl": -380.9})["price_pnl"] == pytest.approx(57.54)
+
+
+# ── BULLA #61 (2026-11-26): la límite Kyber llenó tras cancelarla ─────────────
+def _transfer_log(token, frm, to, wei):
+    pad = lambda a: "0x" + "0" * 24 + a.lower().replace("0x", "")
+    return {"address": token, "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                                         pad(frm), pad(to)], "data": hex(wei)}
+
+
+def test_transfer_deltas_only_counts_owner_and_tokens():
+    from exchanges import onchain_bsc as ob
+    me, pool, other = "0x" + "cd" * 20, "0x" + "ee" * 20, "0x" + "99" * 20
+    tok = "0x" + "ab" * 20
+    rc = {"logs": [_transfer_log(tok, me, pool, 1105 * 10 ** 18),
+                   _transfer_log(ob.USDT, pool, me, 68 * 10 ** 18),
+                   _transfer_log(ob.USDT, pool, other, 5 * 10 ** 18),          # de otro
+                   _transfer_log("0x" + "77" * 20, pool, me, 10 ** 18)]}       # otro token
+    d = ob.transfer_deltas(rc, me, (tok, ob.USDT))
+    assert d == {tok: -1105 * 10 ** 18, ob.USDT.lower(): 68 * 10 ** 18}
+    assert ob.transfer_deltas({}, me, (tok,)) == {}
+
+
+def test_naked_close_counts_late_kyber_fills_and_receipt_amounts(bsc_env, klo, monkeypatch):
+    """La venta límite cancelada sigue llenando (700 de 1000) mientras el bot vende el
+    spot desnudo: el swap se mide por su recibo (no por el saldo), lo llenado por la
+    límite cuenta como salida y la wallet vacía cierra la posición sin error."""
+    from exchanges import onchain_bsc as ob
+    from tests import test_onchain_bsc as t
+    close, ex = bsc_env
+    c_send, k = ob._sign_and_send, klo(status="open")
+    tok, me = t.TOKEN["address"].lower(), t.WALLET["address"]
+    receipts = {}
+
+    def send(wallet, tx, agg=None, **kw):
+        bal = ob.erc20_balance
+        b0, u0 = bal(tok, me), bal(ob.USDT, me)
+        h = c_send(wallet, tx, agg)
+        receipts[h] = {"status": "0x1", "gasUsed": hex(150000), "effectiveGasPrice": hex(50_000_000),
+                       "logs": [_transfer_log(tok, me, "0x" + "ee" * 20, b0 - bal(tok, me)),
+                                _transfer_log(ob.USDT, "0x" + "ee" * 20, me, bal(ob.USDT, me) - u0)]}
+        if len(receipts) == 1:       # fills de la límite en el mismo intervalo (otra tx)
+            chain = close.box["agg"].c
+            chain.bal[tok] -= 700 * 10 ** 18
+            chain.bal[ob.USDT.lower()] += 1400 * 10 ** 18
+            k.order.update(filledMakingAmount=str(700 * 10 ** 18), filledTakingAmount=str(1400 * 10 ** 18))
+        return h
+    monkeypatch.setattr(ob, "_sign_and_send", send)
+    monkeypatch.setattr(ob, "wait_receipt", lambda h, timeout=0: receipts[h])
+    monkeypatch.setattr(ob.time, "sleep", lambda s: None)
+
+    real_close = te.execute_close
+    monkeypatch.setattr(te, "execute_close", lambda creds, pos, **kw: real_close(
+        creds, {**pos, "protection": {"spot": dict(SPOT_LO)}}, **kw))
+    res = close(real_impact=0.0, oracle_impact=None, short=0, qty=1000.0)
+
+    assert res["ok"] and res["complete"], res
+    assert res["protection_filled"]["spot_filled"] == pytest.approx(700)
+    assert res["protection_filled"]["spot_cost"] == pytest.approx(1400)
+    assert res["spot_sold"] == pytest.approx(300)                  # 250 + 50 (no 950)
+    assert sum(s["qty"] for s in res["exec"]["exit_swaps"]) == pytest.approx(300)
+    assert res["remaining_spot"] == 0 and "partial_note" not in res
+    assert ob.erc20_balance(tok, me) == 0

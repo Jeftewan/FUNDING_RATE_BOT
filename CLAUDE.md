@@ -156,6 +156,20 @@ recarga de margen (`reports/margin_topup_study_20261110_bsc.md`), ejecución aut
 `cache/real_exec.pkl`, que se extrae en solo lectura de prod): cuando haya ≥ 10 ejecuciones con tramos de 15 min,
 medir ρ real con `scripts/execution_decomp.py`. Si ρ ≈ 1, volver a 45 s.
 
+### BULLA #61: SL + fills tardíos de la límite Kyber (2026-11-26, rama `claude/caoviedor-positions-bulla-558b3d`)
+- SL (trigger 0.06153 sobre MARK) llenó 16:42:53 UTC a 0.06304 (+2.46 %) en un pico (+76 % en 18 h, 1x). La
+  liquidación (0.06799) no se tocó: MARK máx. 0.06416. La venta límite Kyber llenó 13,073 de 14,191 BULLA a 0.06122
+  **después** de que el cierre la cancelara (Kyber llena hasta `operatorSignatureExpiredAt`, ~2 min). Real: precio
+  −23.51, funding +6.41, fees 0.76 → neto −17.86. basyo registró −337.73 y 12,256 BULLA fantasma.
+- Salida por SL = pérdida estructural δ + slippage del SL: la límite Kyber llena exacto al precio (la mejora es del
+  taker) y el SL a mercado paga el pico. La palanca es el margen (rebalanceo spot→margen, PR #126), no δ.
+- Fixes: `onchain_bsc.transfer_deltas` (swap medido por los Transfer del recibo; la diferencia de saldo mezclaba los
+  fills de la límite), salida desnuda sin saldo = fin sin error, `trade_executor._bsc_final_fills` (relee la límite
+  al final del cierre, espera a que venza la firma ≤ 180 s) y completitud por saldo real de la wallet.
+- `scripts/settle_position.py --with-partials`: liquida una posición con cierres parciales mal medidos (rehace las
+  piernas desde `auto_open`: límite Kyber + swaps por recibo; reemplaza `realized_price_pnl`/`exit_fees_real`).
+  Tests: `tests/test_exec_safety.py` (`transfer_deltas`, `late_kyber`).
+
 ### BULLA #60: apertura parcial y «Completar apertura» (2026-11-23, rama `fix/bulla-partial-topup`)
 - Job #43 (1,205 USD, 1x, 3 tramos): tramo 1 OK (201 USDT → 7,645.5 BULLA + short 7,645); en el tramo 2
   `eth_estimateGas` simuló `Return amount is not enough` (precio movido > 0.2 % de slippage). Era `RuntimeError`, no

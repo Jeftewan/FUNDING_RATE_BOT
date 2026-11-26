@@ -1135,6 +1135,29 @@ def _cancel_bsc_limit(wallet, spot) -> tuple:
     return (alive, *_bsc_filled(spot, o))
 
 
+LO_SETTLE_MAX_WAIT = 180   # s: tope de espera a que venza la firma del operador Kyber
+
+
+def _bsc_final_fills(wallet, spot, max_wait: float = LO_SETTLE_MAX_WAIT):
+    """(base, USDT) llenados de la venta límite Kyber al terminar el cierre, o None.
+
+    Cancelada, Kyber la sigue llenando hasta `operatorSignatureExpiredAt` (BULLA #61:
+    13,073 de 14,191 BULLA llenados en los 20 s posteriores a la cancelación, que el
+    cierre registró como 0). Se espera a que venza la firma (acotado) y se relee."""
+    from exchanges import kyber_limit_order as klo
+    try:
+        o = klo.get_order(wallet["address"], spot["id"])
+        exp = float((o or {}).get("operatorSignatureExpiredAt") or 0)
+        wait = min(max_wait, exp + 5 - time.time())
+        if o is not None and wait > 0:
+            time.sleep(wait)
+            o = klo.get_order(wallet["address"], spot["id"]) or o
+        return _bsc_filled(spot, o) if o is not None else None
+    except Exception as e:
+        log.warning(f"relectura de la venta límite BSC {spot.get('id')}: {e}")
+        return None
+
+
 def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wallet=None) -> dict:
     """Cancela las órdenes de seguro vivas. Devuelve
     fees/qty de lo que ya se había llenado (para sumarlo al cierre)."""
@@ -1176,6 +1199,7 @@ def _cancel_protection_clients(spot_cli, perp_cli, spot_sym, perp_sym, prot, wal
                 if bsc_alive:
                     alive.append(f"venta límite BSC {spot['id']}")
                 out["spot_filled"], out["spot_cost"] = filled, cost
+                out["bsc_lo"] = {"id": spot["id"], "qty": spot.get("qty")}   # releer al final
         else:
             o = None
             for attempt in range(3):
@@ -1972,6 +1996,19 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
     remaining = max(0.0, spot_to_sell - state["sold"])
     fully_sold = (spot_to_sell <= 0 or state["sold"] >= spot_to_sell * 0.999
                   or (not error and not ctx.cancelled() and _is_dust(leg, remaining, ref)))
+    if onchain and prot_fill.get("bsc_lo"):
+        # La límite cancelada pudo seguir llenando mientras se vendía (BULLA #61):
+        # lo llenado cuenta como salida y la wallet real dice si queda spot.
+        late = _bsc_final_fills(getattr(leg, "wallet", None) or {}, prot_fill["bsc_lo"])
+        if late and late[0] > float(prot_fill.get("spot_filled") or 0):
+            prot_fill["spot_filled"], prot_fill["spot_cost"] = late
+            prot_fill["late_fill"] = True
+        try:
+            left = leg.held_base()
+        except Exception:
+            left = None
+        if left is not None and _is_dust(leg, left, ref):
+            fully_sold = True
     if hedger.failed is None:
         target = perp_to_close if fully_sold else state["sold"] * ratio
         hedger.target(target, force_all=fully_sold)
@@ -1993,7 +2030,8 @@ def _close_spot_perp(creds_by_exchange, position, dry_run, ctx, twap, spot_leg_f
         "spot_sold": state["sold"], "perp_closed": hedger.hedged,
         "spot_exit_price": state["proceeds"] / state["sold"] if state["sold"] else None,
         "perp_exit_price": hedger.avg or None,
-        "remaining_spot": max(0.0, spot_qty - state["sold"]),
+        "remaining_spot": 0.0 if fully_sold else max(
+            0.0, spot_qty - state["sold"] - float(prot_fill.get("spot_filled") or 0)),
         "remaining_perp": max(0.0, perp_qty - hedger.hedged),
         "complete": fully_sold and hedger.hedged >= perp_to_close * 0.999,
         "order_ids": list(leg.order_ids) + hedger.order_ids,
